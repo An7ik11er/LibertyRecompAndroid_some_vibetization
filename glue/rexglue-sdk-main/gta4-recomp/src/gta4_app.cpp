@@ -45,12 +45,20 @@
 #include <network/community_multiplayer.h>
 #include <network/gta4_voice_audio.h>
 
+#include "debug/frame_time_dialog.h"
+
+
+
 #if REX_PLATFORM_ANDROID
 #include <android/log.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <cctype>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <fstream>
@@ -210,8 +218,8 @@ REXCVAR_DEFINE_STRING(gta4_native_smaa_quality, "high", "GTA IV/Graphics/Anti-Al
                       "SMAA 1x preset: low, medium, high, or ultra")
     .allowed({"low", "medium", "high", "ultra"});
 REXCVAR_DEFINE_STRING(gta4_native_upscaler, "native", "GTA IV/Graphics/Upscaling",
-                      "Output upscaler: native, fsr1, MetalFX, FSR 3.1, or DLSS; temporal modes require backend support")
-    .allowed({"native", "fsr1", "metalfx", "fsr3", "dlss"})
+                      "Output upscaler: native, fsr1, sgsr, MetalFX, FSR 3.1, or DLSS; temporal modes require backend support")
+    .allowed({"native", "fsr1", "sgsr", "metalfx", "fsr3", "dlss"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(gta4_temporal_upscaler_quality, "quality", "GTA IV/Graphics/Upscaling",
                       "FSR 3.1/DLSS preset; dimensions come from the active provider")
@@ -225,6 +233,10 @@ REXCVAR_DEFINE_DOUBLE(gta4_fsr1_sharpness_reduction, 0.2, "GTA IV/Graphics/Upsca
                       "FSR 1 RCAS sharpness reduction in stops")
     .range(0.0, 2.0)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// SGSR: настройка резкости краёв (от 1.0 до 2.0)
+REXCVAR_DEFINE_DOUBLE(gta4_sgsr_sharpness, 2.0, "GTA IV/Graphics/Upscaling",
+                      "SGSR edge sharpness")
+    .range(1.0, 2.0);
 // Keep the authored resident LOD hierarchy by default. Forcing LOD0 at every
 // distance bypasses transitions as soon as a new drawable becomes resident.
 REXCVAR_DEFINE_BOOL(gta4_force_highest_lod, false, "GTA IV/Graphics/LOD",
@@ -753,6 +765,7 @@ void GTA4App::OnPreSetup(rex::RuntimeConfig& config) {
   const bool ssaa_active =
       rex::graphics::gta4_native::UsesSceneSupersampling(
           rex::graphics::gta4_native::GetActiveAntiAliasingMode());
+#if 0		  
   const bool fsr1_requested = REXCVAR_GET(gta4_native_upscaler) == "fsr1";
   const bool use_fsr1 = fsr1_requested && !ssaa_active;
   if (fsr1_requested && ssaa_active) {
@@ -760,7 +773,31 @@ void GTA4App::OnPreSetup(rex::RuntimeConfig& config) {
         "GTA4AAPolicy owner=startup event=reject-upscaler upscaler=fsr1 aa={} "
         "reason=ssaa-renders-above-output-resolution",
         rex::graphics::gta4_native::GetActiveAntiAliasingModeName());
+  }  
+  REXCVAR_SET(present_effect, use_fsr1 ? "fsr" : "bilinear");
+#endif
+//sgsr 
+  const bool fsr1_requested = REXCVAR_GET(gta4_native_upscaler) == "fsr1";
+  // SGSR: запрашиваем SGSR так же, как FSR1, но пока используем тот же путь
+  // снижения разрешения; сам SGSR-шейдер будет подключён на следующем этапе.
+  const bool sgsr_requested = REXCVAR_GET(gta4_native_upscaler) == "sgsr";
+  const bool use_fsr1 = fsr1_requested && !ssaa_active;
+  const bool use_sgsr = sgsr_requested && !ssaa_active;
+  if (fsr1_requested && ssaa_active) {
+    REXLOG_ERROR(
+        "GTA4AAPolicy owner=startup event=reject-upscaler upscaler=fsr1 aa={} "
+        "reason=ssaa-renders-above-output-resolution",
+        rex::graphics::gta4_native::GetActiveAntiAliasingModeName());
   }
+  if (sgsr_requested && ssaa_active) {
+    REXLOG_ERROR(
+        "GTA4AAPolicy owner=startup event=reject-upscaler upscaler=sgsr aa={} "
+        "reason=ssaa-renders-above-output-resolution",
+        rex::graphics::gta4_native::GetActiveAntiAliasingModeName());
+  }
+  // SGSR пока не имеет отдельного present_effect; оставляем bilinear,
+  // чтобы не затрагивать presenter.cpp. Нативный RecordPresent будет
+  // использовать SGSR позже.
   REXCVAR_SET(present_effect, use_fsr1 ? "fsr" : "bilinear");
   REXCVAR_SET(present_fsr_sharpness_reduction, REXCVAR_GET(gta4_fsr1_sharpness_reduction));
   REXLOG_INFO(
@@ -820,6 +857,9 @@ REXCVAR_DEFINE_BOOL(android_thermal_log, true, "GTA IV/Performance",
                     "Log the GPU thermal level, clocks and temperature and the CPU clock limits "
                     "every 5 seconds");
 
+REXCVAR_DEFINE_BOOL(gta4_frame_time_overlay, true, "GTA IV/Diagnostics",
+                    "FPS / frame-time overlay (drawn with each game frame)");
+
 namespace {
 
 // kgsl power control (KGSL_PROP_PWRCTRL through IOCTL_KGSL_SETPROPERTY): 0
@@ -848,6 +888,133 @@ void ApplyGpuTurbo(bool turbo) {
 // follows its clock ceiling, not the scene (seen in skate3-android). Logging
 // the kgsl and cpufreq state shows whether a slower session is the device
 // heating up rather than the game.
+//
+// 36: the clock limit alone hides part of the throttling: on the 29.10 Gen 5
+// trace the prime cores had a 4.6 GHz limit but ran at 2.3 GHz on average, and
+// the 888's prime averaged 1.65 GHz under a 1.8-1.9 GHz limit. The line now
+// also carries, per cpufreq policy, the time-weighted clock of the last 5 s
+// (stats/time_in_state deltas; the instantaneous scaling_cur_freq if the stats
+// are unreadable) and the hottest CPU and DDR thermal zones, so two runs can be
+// compared at the same thermal state. cpu-max-khz keeps its old meaning; on
+// devices with policies other than {0,4,7} it now lists their first CPUs.
+namespace thermal_log {
+
+struct CpuPolicy {
+  std::string dir;  // /sys/devices/system/cpu/cpufreq/policyN/
+  std::vector<std::pair<uint64_t, uint64_t>> last_time_in_state;  // (kHz, 10 ms units)
+  bool have_last = false;
+};
+
+inline std::string ReadLine(const std::string& path) {
+  std::ifstream file(path);
+  std::string value;
+  std::getline(file, value);
+  return value;
+}
+
+inline std::vector<CpuPolicy> DiscoverPolicies() {
+  std::vector<int> ids;
+  if (DIR* dir = opendir("/sys/devices/system/cpu/cpufreq")) {
+    while (const dirent* entry = readdir(dir)) {
+      if (std::strncmp(entry->d_name, "policy", 6) == 0) ids.push_back(std::atoi(entry->d_name + 6));
+    }
+    closedir(dir);
+  }
+  if (ids.empty()) ids = {0, 4, 7};  // no policy directories exposed: the old fixed CPUs
+  std::sort(ids.begin(), ids.end());
+  std::vector<CpuPolicy> policies;
+  for (int id : ids) {
+    CpuPolicy policy;
+    const std::string by_policy =
+        "/sys/devices/system/cpu/cpufreq/policy" + std::to_string(id) + "/";
+    policy.dir = access((by_policy + "scaling_max_freq").c_str(), R_OK) == 0
+                     ? by_policy
+                     : "/sys/devices/system/cpu/cpu" + std::to_string(id) + "/cpufreq/";
+    policies.push_back(std::move(policy));
+  }
+  return policies;
+}
+
+// Time-weighted average clock (MHz) since the previous call, or -1.
+inline long AverageMhz(CpuPolicy& policy) {
+  std::ifstream file(policy.dir + "stats/time_in_state");
+  std::vector<std::pair<uint64_t, uint64_t>> now;
+  uint64_t khz = 0, ticks = 0;
+  while (file >> khz >> ticks) now.emplace_back(khz, ticks);
+  if (now.empty()) {
+    const std::string cur = ReadLine(policy.dir + "scaling_cur_freq");
+    return cur.empty() ? -1 : std::atol(cur.c_str()) / 1000;
+  }
+  long result = -1;
+  if (policy.have_last && policy.last_time_in_state.size() == now.size()) {
+    long double weighted = 0, total = 0;
+    for (size_t i = 0; i < now.size(); ++i) {
+      if (now[i].first != policy.last_time_in_state[i].first ||
+          now[i].second < policy.last_time_in_state[i].second) {
+        total = 0;  // table changed or counters reset: skip this interval
+        break;
+      }
+      const uint64_t delta = now[i].second - policy.last_time_in_state[i].second;
+      weighted += static_cast<long double>(now[i].first) * delta;
+      total += delta;
+    }
+    if (total > 0) result = static_cast<long>(weighted / total / 1000);
+  }
+  if (result < 0) {
+    const std::string cur = ReadLine(policy.dir + "scaling_cur_freq");
+    if (!cur.empty()) result = std::atol(cur.c_str()) / 1000;
+  }
+  policy.last_time_in_state = std::move(now);
+  policy.have_last = true;
+  return result;
+}
+
+struct Zones {
+  std::vector<std::string> cpu;  // temp paths
+  std::vector<std::string> ddr;
+};
+
+inline Zones DiscoverZones() {
+  Zones zones;
+  if (DIR* dir = opendir("/sys/class/thermal")) {
+    while (const dirent* entry = readdir(dir)) {
+      if (std::strncmp(entry->d_name, "thermal_zone", 12) != 0) continue;
+      const std::string base = std::string("/sys/class/thermal/") + entry->d_name + "/";
+      std::string type = ReadLine(base + "type");
+      for (char& c : type) c = char(std::tolower(static_cast<unsigned char>(c)));
+      // Qualcomm also exposes limiters (cdev, freq, isolate, ...) as zones.
+      static const char* kSkip[] = {"cdev", "freq", "limit", "isolate", "hotplug", "lvl",
+                                    "socd", "ibat", "vbat", "vph", "bcl"};
+      bool skip = false;
+      for (const char* part : kSkip) skip = skip || type.find(part) != std::string::npos;
+      if (skip) continue;
+      if (type.rfind("cpu", 0) == 0 || type.find("cpuss") != std::string::npos) {
+        zones.cpu.push_back(base + "temp");
+      } else if (type.find("ddr") != std::string::npos) {
+        zones.ddr.push_back(base + "temp");
+      }
+    }
+    closedir(dir);
+  }
+  return zones;
+}
+
+// Hottest zone in degrees C, or NaN. Zones report millidegrees (most) or degrees.
+inline double MaxTemp(const std::vector<std::string>& paths) {
+  double best = NAN;
+  for (const std::string& path : paths) {
+    const std::string value = ReadLine(path);
+    if (value.empty()) continue;
+    double t = std::atof(value.c_str());
+    if (t > 1000.0) t /= 1000.0;
+    if (t <= -40.0 || t > 200.0) continue;
+    if (std::isnan(best) || t > best) best = t;
+  }
+  return best;
+}
+
+}  // namespace thermal_log
+
 void StartThermalLog() {
   std::thread([] {
     bool turbo = REXCVAR_GET(android_gpu_turbo);
@@ -858,6 +1025,9 @@ void StartThermalLog() {
       std::getline(file, value);
       return value.empty() ? std::string("?") : value;
     };
+    std::vector<thermal_log::CpuPolicy> policies = thermal_log::DiscoverPolicies();
+    const thermal_log::Zones zones = thermal_log::DiscoverZones();
+    for (auto& policy : policies) thermal_log::AverageMhz(policy);  // baseline for the 1st line
     for (;;) {
       std::this_thread::sleep_for(std::chrono::seconds(5));
       if (REXCVAR_GET(android_gpu_turbo) != turbo) {
@@ -866,106 +1036,32 @@ void StartThermalLog() {
       }
       if (!REXCVAR_GET(android_thermal_log)) continue;
       const std::string kgsl = "/sys/class/kgsl/kgsl-3d0/";
-      std::string cpu_limits;
-      for (int cpu : {0, 4, 7}) {
-        cpu_limits += read(("/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
-                            "/cpufreq/scaling_max_freq").c_str());
-        cpu_limits += cpu == 7 ? "" : "/";
+      std::string cpu_limits, cpu_average;
+      for (size_t i = 0; i < policies.size(); ++i) {
+        if (i) {
+          cpu_limits += '/';
+          cpu_average += '/';
+        }
+        cpu_limits += read((policies[i].dir + "scaling_max_freq").c_str());
+        const long mhz = thermal_log::AverageMhz(policies[i]);
+        cpu_average += mhz < 0 ? std::string("?") : std::to_string(mhz);
       }
+      char temps[48];
+      const double cpu_temp = thermal_log::MaxTemp(zones.cpu);
+      const double ddr_temp = thermal_log::MaxTemp(zones.ddr);
+      std::snprintf(temps, sizeof(temps), "cpu-temp=%.1f ddr-temp=%.1f", cpu_temp, ddr_temp);
       // Guest threads spinning on yields (pinyon-shift found a title loop that
       // gave up after 1000 of them, which return at once on the host).
       const std::string yields = rex::kernel::xboxkrnl::TakeYieldCountSummary(4);
       __android_log_print(ANDROID_LOG_WARN, "LibertyRecomp",
                           "thermal: gpu-level=%s gpu-max=%s gpu-clk=%s gpu-busy=%s gpu-temp=%s "
-                          "cpu-max-khz=%s yields/spins-5s=%s",
+                          "cpu-max-khz=%s cpu-avg-mhz=%s %s yields/spins-5s=%s",
                           read((kgsl + "thermal_pwrlevel").c_str()).c_str(),
                           read((kgsl + "max_gpuclk").c_str()).c_str(),
                           read((kgsl + "gpuclk").c_str()).c_str(),
                           read((kgsl + "gpu_busy_percentage").c_str()).c_str(),
                           read((kgsl + "temp").c_str()).c_str(), cpu_limits.c_str(),
-                          yields.empty() ? "none" : yields.c_str());
-    }
-  }).detach();
-}
-
-// The scheduler often places the renderer's pipeline stages and the game
-// threads on the little cores for a while, and the slowest stage holds up the
-// others. Once a second the busiest threads (at most one per big core) are
-// limited to the big cores; the rest keep every core.
-void StartHotThreadPinning() {
-  std::thread([] {
-    std::vector<uint64_t> max_frequency;
-    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
-      std::ifstream file("/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
-                         "/cpufreq/cpuinfo_max_freq");
-      uint64_t frequency = 0;
-      if (!(file >> frequency)) break;
-      max_frequency.push_back(frequency);
-    }
-    if (max_frequency.empty()) return;
-    const uint64_t slowest = *std::min_element(max_frequency.begin(), max_frequency.end());
-    cpu_set_t big{}, all{};
-    size_t big_count = 0;
-    for (size_t cpu = 0; cpu < max_frequency.size(); ++cpu) {
-      CPU_SET(cpu, &all);
-      if (max_frequency[cpu] > slowest) {
-        CPU_SET(cpu, &big);
-        ++big_count;
-      }
-    }
-    if (!big_count) return;  // No big.LITTLE.
-
-    // CPU ticks (100 Hz) per second a thread needs to be pinned, or to stay.
-    constexpr uint64_t kPinTicks = 30, kKeepTicks = 20;
-    std::unordered_map<pid_t, uint64_t> last_ticks;
-    std::unordered_set<pid_t> pinned;
-    const auto set_affinity = [](pid_t tid, const cpu_set_t& set) {
-      sched_setaffinity(tid, sizeof(set), &set);
-    };
-    for (;;) {
-      std::this_thread::sleep_for(std::chrono::seconds(1));
-      if (!REXCVAR_GET(android_pin_hot_threads)) {
-        for (pid_t tid : pinned) set_affinity(tid, all);
-        pinned.clear();
-        last_ticks.clear();
-        continue;
-      }
-      std::vector<std::pair<uint64_t, pid_t>> busy;
-      std::unordered_map<pid_t, uint64_t> ticks;
-      if (DIR* tasks = opendir("/proc/self/task")) {
-        while (const dirent* entry = readdir(tasks)) {
-          if (!std::isdigit(static_cast<unsigned char>(entry->d_name[0]))) continue;
-          const pid_t tid = pid_t(std::atoi(entry->d_name));
-          std::ifstream stat_file(std::string("/proc/self/task/") + entry->d_name + "/stat");
-          std::string stat((std::istreambuf_iterator<char>(stat_file)), {});
-          const size_t name_end = stat.rfind(')');
-          if (name_end == std::string::npos) continue;
-          // Fields after the name start at 3 (state); utime is 14, stime 15.
-          std::istringstream fields(stat.substr(name_end + 2));
-          std::string field;
-          uint64_t utime = 0, stime = 0;
-          for (int index = 3; index <= 15 && fields >> field; ++index) {
-            if (index == 14) utime = std::strtoull(field.c_str(), nullptr, 10);
-            if (index == 15) stime = std::strtoull(field.c_str(), nullptr, 10);
-          }
-          ticks[tid] = utime + stime;
-          const auto last = last_ticks.find(tid);
-          if (last != last_ticks.end()) busy.emplace_back(utime + stime - last->second, tid);
-        }
-        closedir(tasks);
-      }
-      last_ticks = std::move(ticks);
-      std::sort(busy.begin(), busy.end(), std::greater<>());
-      std::unordered_set<pid_t> hot;
-      for (const auto& [delta, tid] : busy) {
-        if (hot.size() == big_count) break;
-        if (delta >= kPinTicks || (delta >= kKeepTicks && pinned.contains(tid))) hot.insert(tid);
-      }
-      for (pid_t tid : pinned)
-        if (!hot.contains(tid) && last_ticks.contains(tid)) set_affinity(tid, all);
-      for (pid_t tid : hot)
-        if (!pinned.contains(tid)) set_affinity(tid, big);
-      pinned = std::move(hot);
+                          cpu_average.c_str(), temps, yields.empty() ? "none" : yields.c_str());
     }
   }).detach();
 }
@@ -1022,7 +1118,6 @@ void StartLiveCvarWatcher(std::filesystem::path path) {
 void GTA4App::OnPostSetup() {
 #if REX_PLATFORM_ANDROID
   StartLiveCvarWatcher(rex::filesystem::GetUserFolder() / "live_cvars.txt");
-  StartHotThreadPinning();
   StartThermalLog();
 #endif
   gta4::presentation::InitializeOptions();
@@ -1332,6 +1427,9 @@ void GTA4App::TitleProfileSyncWorkerMain() {
 
 void GTA4App::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
   gta4::game_center::Initialize();
+  // 30.10: in the 27.10 traces SDLThread presented 58 times a second for 24 game
+  // frames (the overlay is a UI drawer, present_ui_fps_limit=60).
+  if (REXCVAR_GET(gta4_frame_time_overlay)) new FrameTimeDialog(drawer);
   context_touch_overlay_ =
       std::make_unique<gta4::input::ContextTouchOverlay>(
           drawer, immediate_drawer(), native_config_path_.parent_path() / "touch-icons", window());

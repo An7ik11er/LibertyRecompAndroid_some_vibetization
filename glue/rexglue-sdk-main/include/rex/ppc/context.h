@@ -24,6 +24,11 @@
 #include <simde/x86/sse.h>
 #include <simde/x86/sse4.1.h>
 
+#include <atomic>
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
+
 //=============================================================================
 // PPCFunc Type Definition
 //=============================================================================
@@ -199,41 +204,97 @@ struct FPSCRRegister {
     return HostToGuest[(csr & RoundMaskVal) >> RoundShift];
   }
 
+  // Замер 27.10 окончен: за прогон < 1 млн записей FPCR (ни одной строки fpcr-writes).
+  static inline void countFpcrWrite() noexcept {}
+  
+    inline void storeFromGuest(uint32_t value) noexcept {
+    csr &= ~RoundMaskVal;
+    csr |= Platform::GuestToHost[value & kRoundMask];
+#if defined(REX_FPCR_STICKY_FLUSH)
+    csr |= FlushMask;  // rounding меняем, FZ не трогаем
+#endif
+    countFpcrWrite();
+    setcsr(csr);
+  }
+  
+#if 0
   inline void storeFromGuest(uint32_t value) noexcept {
     csr &= ~RoundMaskVal;
     csr |= Platform::GuestToHost[value & kRoundMask];
+    countFpcrWrite();
     setcsr(csr);
   }
-
+#endif
+#if 0
   inline void enableFlushModeUnconditional() noexcept {
     csr |= FlushMask;
+    countFpcrWrite();
     setcsr(csr);
+  }
+#endif
+//Unconditional enable — как conditional + sticky
+inline void enableFlushModeUnconditional() noexcept {
+#if defined(REX_FPCR_STICKY_FLUSH)
+    // FZ уже «липкий»: пишем только пока тень ещё без FlushMask
+    if ((csr & FlushMask) != FlushMask) [[unlikely]] {
+      csr |= FlushMask;
+      countFpcrWrite();
+      setcsr(csr);
+    }
+#else
+    csr |= FlushMask;
+    countFpcrWrite();
+    setcsr(csr);
+#endif
   }
 
   inline void disableFlushModeUnconditional() noexcept {
+#if defined(REX_FPCR_STICKY_FLUSH)
+    // эксперимент: режим flush остаётся включённым
+#else
     csr &= ~FlushMask;
+    countFpcrWrite();
     setcsr(csr);
+#endif
   }
 
   inline void enableFlushMode() noexcept {
     if ((csr & FlushMask) != FlushMask) [[unlikely]] {
       csr |= FlushMask;
+      countFpcrWrite();
       setcsr(csr);
     }
   }
 
   inline void disableFlushMode() noexcept {
+#if defined(REX_FPCR_STICKY_FLUSH)
+    // эксперимент: режим flush остаётся включённым
+#else
     if ((csr & FlushMask) != 0) [[unlikely]] {
       csr &= ~FlushMask;
+      countFpcrWrite();
       setcsr(csr);
     }
+#endif
   }
-
+  
+  inline void InitHost() noexcept {
+    csr = getcsr();
+    Platform::InitHostExceptions(csr);
+#if defined(REX_FPCR_STICKY_FLUSH)
+    csr |= FlushMask;  // FZ/FZ16 на весь срок жизни потока
+#endif
+    countFpcrWrite();
+    setcsr(csr);
+  }  
+  
+#if 0
   inline void InitHost() noexcept {
     csr = getcsr();
     Platform::InitHostExceptions(csr);
     setcsr(csr);
   }
+#endif
 };
 
 }  // namespace rex::ppc

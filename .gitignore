@@ -794,3 +794,42 @@ CMakeUserPresets.json
 !/tools/tests/test_metal_shader_archive.py
 !/tools/vulkan/*.py
 !/glue/rexglue-sdk-main/cmake/fidelityfx_shader_compiler.py
+
+# Local development dumps, logs, traces, and artifacts
+/*.txt
+/*.csv
+/*.diff
+/*.apk
+/*.zip
+/*.pbtxt
+/*.pbtx
+/*.log
+*.diff
+*.zip
+*.pbtxt
+*.pbtx
+*_bac
+*_copy*
+*— копия*
+traces/
+scratch/
+shit_control/
+out/
+glue/affinity_live.txt
+glue/logcat_affinity.txt
+glue/rexglue-sdk-main/src/graphics/gta4_native/menu_search.txt
+glue/rexglue-sdk-main/src/graphics/gta4_native/spin_clock.h.h
+glue/rexglue-sdk-main/src/kernel/spin_clock.h.h
+glue/rexglue-sdk-main/src/graphics/gta4_native/graphics_system_before gegemi patch.cpp
+glue/rexglue-sdk-main/gta4-recomp/src/gta4_draw_distance_guest.inc2
+glue/rexglue-sdk-main/gta4-recomp/src/gta4_draw_distance_guest.in.md
+glue/rexglue-sdk-main/src/core/memory.txt
+glue/rexglue-sdk-main/src/core/memory_android.txt
+glue/rexglue-sdk-main/gta4-recomp/gta4-recomp.txt
+os/android/launcher_preview.html
+Outsider_memory/
+_nonarg49_backup/
+export_for_direct_record/
+audit_changes.ps1
+tools/direct_calls_hooked_used_49.txt
+tools/optimize_generated_report.txt

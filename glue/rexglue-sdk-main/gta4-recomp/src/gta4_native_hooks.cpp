@@ -2613,6 +2613,27 @@ bool IsNativeMode() {
   return GetNativeGraphicsSystem() != nullptr;
 }
 
+// 56: with gta4_native_capture_thread the renderer captures a draw on GtaCapture, after
+// RenderGuest has returned from it: it reads the draw's buffers / textures / surfaces later than
+// before. The title changes a resource only after Lock and frees it in Release; both wait here
+// until every recorded draw that referenced the resource has been captured, as D3D's Lock waits
+// for the GPU on the console. Must match native_capture_thread.inc. A renderer without
+// GtaCapture answers state 0 and is not asked again.
+constexpr uint32_t kCaptureBarrierAbi = 0x43425231;  // 'CBR1'
+std::atomic<int> g_capture_barrier_state{-1};          // 0: GtaCapture not configured
+
+// kind: 1 Lock, 2 Release that destroys the object (57).
+void WaitForDeferredCapture(uint32_t resource, uint32_t kind) {
+  if (!resource || g_capture_barrier_state.load(std::memory_order_relaxed) == 0) return;
+  auto* graphics = GetNativeGraphicsSystem();
+  if (!graphics) return;
+  uint32_t state = 0;  // bit 0: GtaCapture runs, bit 1: it is configured
+  const uint32_t request[2] = {resource, kind};
+  graphics->ExecuteTitleCommand(kTitleId, kCaptureBarrierAbi, request, sizeof(request), &state,
+                                sizeof(state));
+  if (!(state & 2u)) g_capture_barrier_state.store(0, std::memory_order_relaxed);
+}
+
 bool ShouldLogNativeHookCall(uint64_t call_count);
 
 template <typename Command>
@@ -2892,7 +2913,7 @@ NativeResolutionOverride GetNativeResolutionOverride(uint32_t requested_width,
     }
   }
   g_native_supersampling_effective_factor.store(effective_ssaa_factor, std::memory_order_release);
-
+#if 0
   const bool ssaa_active = requested_ssaa_factor > 1u;
   const bool fsr1_requested = REXCVAR_GET(gta4_native_upscaler) == "fsr1";
   const bool metalfx_requested=REXCVAR_GET(gta4_native_upscaler)=="metalfx";
@@ -2907,6 +2928,29 @@ NativeResolutionOverride GetNativeResolutionOverride(uint32_t requested_width,
           fsr1_requested, REXCVAR_GET(gta4_fsr1_quality), ssaa_active, hdr_requested, perceptual_before_hdr);
   result.width = upscaling.width; result.height = upscaling.height;
   result.fsr1_active = fsr1_requested&&upscaling.active();
+#endif
+//начало
+ const bool ssaa_active = requested_ssaa_factor > 1u;
+  const bool fsr1_requested = REXCVAR_GET(gta4_native_upscaler) == "fsr1";
+  // SGSR использует ту же политику разрешения, что и FSR1, но пока
+  // помечается отдельно, чтобы не смешивать с fsr1_active.
+  const bool sgsr_requested = REXCVAR_GET(gta4_native_upscaler) == "sgsr";
+  const bool spatial_upscaler_requested = fsr1_requested || sgsr_requested;
+  const bool metalfx_requested=REXCVAR_GET(gta4_native_upscaler)=="metalfx";
+  const bool hdr_requested = rex::cvar::Query<bool>("vulkan_hdr");
+  DeviceCapabilitiesResult upscaling_capabilities{};
+  const bool perceptual_before_hdr = spatial_upscaler_requested && hdr_requested &&
+      QueryNativeDeviceCapabilities(upscaling_capabilities) &&
+      (upscaling_capabilities.capabilities & kCapabilityPerceptualPresentationBeforeHdr);
+  const auto upscaling = metalfx_requested
+      ? SelectMetalFxRenderExtent(result.display_width,result.display_height,true,REXCVAR_GET(gta4_fsr1_quality),ssaa_active)
+      : SelectFsr1RenderExtent(result.display_width, result.display_height,
+          spatial_upscaler_requested, REXCVAR_GET(gta4_fsr1_quality), ssaa_active, hdr_requested, perceptual_before_hdr);
+  result.width = upscaling.width; result.height = upscaling.height;
+  // SGSR: пока используем fsr1_active как признак активного пространственного
+  // апскейлера; в будущем можно добавить отдельное поле sgsr_active.
+  result.fsr1_active = spatial_upscaler_requested && upscaling.active();
+//конец
   const auto selected_upscaler = REXCVAR_GET(gta4_native_upscaler);
   if (selected_upscaler == "fsr3" || selected_upscaler == "dlss") {
     TemporalUpscalerResult temporal;
@@ -5345,7 +5389,7 @@ std::string ShadowTargetFetch(uint8_t* base, uint32_t texture) {
 bool ShadowTraceActive(uint8_t* base) {
   const uint32_t frames = REXCVAR_GET(gta4_trace_shadow_targets);
   static std::atomic<uint32_t> heartbeat{0};
-  if ((heartbeat.fetch_add(1, std::memory_order_relaxed) & 0x3FFF) == 0) {
+  if (frames && (heartbeat.fetch_add(1, std::memory_order_relaxed) & 0x3FFF) == 0) {
     SHADOW_TRACE("shadow-trace: heartbeat value={} frame={}", frames,
                  GetNativeLightSubmittedFrame(base));
   }
@@ -5576,6 +5620,13 @@ extern "C" void sub_82A441F8(PPCContext& ctx, uint8_t* base) {
 extern "C" void D3DResource_Release(PPCContext& ctx, uint8_t* base) {
   const bool native_mode = IsNativeMode();
   const uint32_t resource = ctx.r3.u32;
+  // 56: the destructor may free the object and its data: not while a recorded draw that
+  // references it is still to be captured. 57: only the Release that destroys it (reference
+  // count, +4, is 1; D3DResource_Release decrements it and destroys at 0). Batch 56: every
+  // Release asked, ~95 per frame, all on RenderGuest via sub_828D8FB0 -> sub_828BEC10; 18 of
+  // them waited for GtaCapture to drain the ring (10.6 ms of RenderGuest per frame).
+  if (native_mode && resource && LoadU32(base, resource + 4) <= 1)
+    WaitForDeferredCapture(resource, 2);
   __imp__D3DResource_Release(ctx, base);
 
   // The generated implementation returns zero only after the guest reference
@@ -5605,6 +5656,8 @@ extern "C" void sub_82A4A3C8(PPCContext& ctx, uint8_t* base) {
     ctx.r3.u32 = 0;
     return;
   }
+  // 56: the title writes the resource after this returns.
+  WaitForDeferredCapture(resource, 1);
   const uint32_t secondary_selector = ctx.r5.u32;
   const uint32_t primary_base = ctx.r6.u32;
   const uint32_t secondary_base = ctx.r7.u32;

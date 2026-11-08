@@ -264,17 +264,43 @@ void ForEachDirtyElement(const NativeDirtyWords& dirty_words, const DirtyCompone
   for (const DirtyBitSpan& span : layout.spans) {
     uint64_t bits =
         (dirty_words[span.dirty_word] >> span.first_dirty_bit) & LowBitMask(span.bit_count);
-    while (bits) {
-      const uint32_t bit = static_cast<uint32_t>(std::countr_zero(bits));
-      const uint32_t element_bit = span.reverse_bits ? uint32_t(span.bit_count - 1) - bit : bit;
-      callback(span.first_element + element_bit);
-      bits &= bits - 1;
+    if (span.reverse_bits) {
+      // Обходим биты от старшего (MSB) к младшему (LSB), чтобы element рос строго по возрастанию!
+      while (bits) {
+        const uint32_t lz = static_cast<uint32_t>(std::countl_zero(bits));
+        const uint32_t bit = 63u - lz;
+        const uint32_t element_bit = uint32_t(span.bit_count - 1) - bit;
+        callback(span.first_element + element_bit);
+        bits &= ~(uint64_t{1} << bit);
+      }
+    } else {
+      while (bits) {
+        const uint32_t bit = static_cast<uint32_t>(std::countr_zero(bits));
+        callback(span.first_element + bit);
+        bits &= bits - 1;
+      }
     }
   }
 }
 
 inline void BuildRangeSet(const NativeDirtyWords& dirty_words, const DirtyComponentLayout& layout,
                           DirtyRangeSet& result, DirtyDeltaScratch& scratch) {
+  result.ranges.clear();
+  if (layout.spans.size() <= 1) {
+    // Быстрый путь (99.9% вызовов): один спан уже даёт строго возрастающие элементы без сортировки!
+    ForEachDirtyElement(dirty_words, layout, [&](uint32_t element) {
+      if (!result.ranges.empty()) {
+        DirtyElementRange& previous = result.ranges.back();
+        if (element == previous.first + previous.count) {
+          ++previous.count;
+          return;
+        }
+      }
+      result.ranges.push_back({element, 1});
+    });
+    return;
+  }
+
   std::vector<uint32_t>& dirty_elements = scratch.dirty_elements;
   dirty_elements.clear();
   ForEachDirtyElement(dirty_words, layout,
@@ -283,7 +309,6 @@ inline void BuildRangeSet(const NativeDirtyWords& dirty_words, const DirtyCompon
   dirty_elements.erase(std::unique(dirty_elements.begin(), dirty_elements.end()),
                        dirty_elements.end());
 
-  result.ranges.clear();
   for (uint32_t element : dirty_elements) {
     if (!result.ranges.empty()) {
       DirtyElementRange& previous = result.ranges.back();
@@ -299,6 +324,13 @@ inline void BuildRangeSet(const NativeDirtyWords& dirty_words, const DirtyCompon
 inline void BuildElementMask(const NativeDirtyWords& dirty_words,
                              const DirtyComponentLayout& layout, DirtyElementMask& result) {
   result.element_count = layout.element_count;
+  if (layout.element_count == 1 && layout.spans.size() == 1) {
+    const DirtyBitSpan& span = layout.spans[0];
+    const uint64_t raw = (dirty_words[span.dirty_word] >> span.first_dirty_bit) &
+                         LowBitMask(span.bit_count);
+    result.words.assign(1, raw != 0 ? 1ull : 0ull);
+    return;
+  }
   const uint32_t bits_per_word = std::numeric_limits<uint64_t>::digits;
   result.words.assign(
       layout.element_count / bits_per_word + (layout.element_count % bits_per_word != 0), 0);
@@ -346,23 +378,66 @@ inline DirtyLayoutValidationResult BuildDirtyStateDelta(const NativeDirtyWords& 
 inline void BuildDirtyStateDeltaUnchecked(const NativeDirtyWords& dirty_words,
                                           const DirtyStateLayout& layout,
                                           DirtyStateDelta& delta, DirtyDeltaScratch& scratch) {
-
-  dirty_state_delta_internal::BuildRangeSet(dirty_words, layout.vertex_constants,
-                                            delta.vertex_constant_ranges, scratch);
-  dirty_state_delta_internal::BuildRangeSet(dirty_words, layout.pixel_constants,
-                                            delta.pixel_constant_ranges, scratch);
-  dirty_state_delta_internal::BuildRangeSet(dirty_words, layout.texture_fetch_stages,
-                                            delta.texture_fetch_stage_ranges, scratch);
-  dirty_state_delta_internal::BuildRangeSet(dirty_words, layout.sampler_stages,
-                                            delta.sampler_stage_ranges, scratch);
-  dirty_state_delta_internal::BuildElementMask(dirty_words, layout.boolean_constants,
-                                               delta.boolean_constant_mask);
-  dirty_state_delta_internal::BuildElementMask(dirty_words, layout.integer_constants,
-                                               delta.integer_constant_mask);
-  dirty_state_delta_internal::BuildElementMask(dirty_words, layout.fixed_state,
-                                               delta.fixed_state_mask);
-  dirty_state_delta_internal::BuildElementMask(dirty_words, layout.dynamic_state,
-                                               delta.dynamic_state_mask);
+  if (dirty_words[0]) {
+    dirty_state_delta_internal::BuildRangeSet(dirty_words, layout.vertex_constants,
+                                              delta.vertex_constant_ranges, scratch);
+  } else {
+    delta.vertex_constant_ranges.ranges.clear();
+  }
+  
+  if (dirty_words[1]) {
+    dirty_state_delta_internal::BuildRangeSet(dirty_words, layout.pixel_constants,
+                                              delta.pixel_constant_ranges, scratch);
+  } else {
+    delta.pixel_constant_ranges.ranges.clear();
+  }
+  
+  if (!layout.texture_fetch_stages.spans.empty()) {
+    dirty_state_delta_internal::BuildRangeSet(dirty_words, layout.texture_fetch_stages,
+                                              delta.texture_fetch_stage_ranges, scratch);
+  } else {
+    delta.texture_fetch_stage_ranges.ranges.clear();
+  }
+  
+  if (!layout.sampler_stages.spans.empty()) {
+    dirty_state_delta_internal::BuildRangeSet(dirty_words, layout.sampler_stages,
+                                              delta.sampler_stage_ranges, scratch);
+  } else {
+    delta.sampler_stage_ranges.ranges.clear();
+  }
+  
+  // ВОТ ЗДЕСЬ БЫЛИ ПРОПУЩЕНЫ ОЧИСТКИ:
+  if (!layout.boolean_constants.spans.empty()) {
+    dirty_state_delta_internal::BuildElementMask(dirty_words, layout.boolean_constants,
+                                                 delta.boolean_constant_mask);
+  } else {
+    delta.boolean_constant_mask.element_count = 0;
+    delta.boolean_constant_mask.words.clear();
+  }
+  
+  if (!layout.integer_constants.spans.empty()) {
+    dirty_state_delta_internal::BuildElementMask(dirty_words, layout.integer_constants,
+                                                 delta.integer_constant_mask);
+  } else {
+    delta.integer_constant_mask.element_count = 0;
+    delta.integer_constant_mask.words.clear();
+  }
+  
+  if (!layout.fixed_state.spans.empty()) {
+    dirty_state_delta_internal::BuildElementMask(dirty_words, layout.fixed_state,
+                                                 delta.fixed_state_mask);
+  } else {
+    delta.fixed_state_mask.element_count = 0;
+    delta.fixed_state_mask.words.clear();
+  }
+  
+  if (!layout.dynamic_state.spans.empty()) {
+    dirty_state_delta_internal::BuildElementMask(dirty_words, layout.dynamic_state,
+                                                 delta.dynamic_state_mask);
+  } else {
+    delta.dynamic_state_mask.element_count = 0;
+    delta.dynamic_state_mask.words.clear();
+  }
 }
 
 inline DirtyDeltaBuildResult BuildDirtyStateDelta(const NativeDirtyWords& dirty_words,

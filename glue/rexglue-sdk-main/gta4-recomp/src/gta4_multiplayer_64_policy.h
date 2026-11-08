@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -1184,12 +1185,20 @@ class PlayerInfoRegistry {
       return false;
     }
     std::scoped_lock lock(mutex_);
+    if (entries_[peer_id].guest_player_info == 0) {
+      occupied_.fetch_add(1, std::memory_order_release);
+    }
     entries_[peer_id] = entry;
     return true;
   }
 
   PlayerInfoEntry Get(uint8_t peer_id) const {
     if (ClassifyPeerId(peer_id) != PeerIdClass::kExtended) {
+      return {};
+    }
+    // 37: no extended player registered (single player, or a session of 16 or
+    // fewer): every entry is empty, no lock needed.
+    if (occupied_.load(std::memory_order_acquire) == 0) {
       return {};
     }
     std::scoped_lock lock(mutex_);
@@ -1202,8 +1211,17 @@ class PlayerInfoRegistry {
     }
     std::scoped_lock lock(mutex_);
     const PlayerInfoEntry entry = entries_[peer_id];
+    if (entry.guest_player_info != 0) {
+      occupied_.fetch_sub(1, std::memory_order_release);
+    }
     entries_[peer_id] = {};
     return entry;
+  }
+
+  // 37: true when at least one extended player (16..63) is registered. The
+  // retry-for-every-extended-player hooks check this first.
+  bool HasExtended() const noexcept {
+    return occupied_.load(std::memory_order_acquire) != 0;
   }
 
   std::array<PlayerInfoEntry, kExtendedPeerCapacity> Snapshot() const {
@@ -1221,6 +1239,8 @@ class PlayerInfoRegistry {
  private:
   mutable std::mutex mutex_;
   std::array<PlayerInfoEntry, kExtendedPeerCapacity> entries_{};
+  // Number of non-empty extended entries; changed only under mutex_.
+  std::atomic<uint32_t> occupied_{0};
 };
 
 class NetworkEndpointRegistry {

@@ -33,9 +33,32 @@
 REXCVAR_DECLARE(bool, gta4_touch_trace);
 
 namespace gta4::input {
+
+// Добавляем кеш-переменные и функцию прямо сюда
+namespace {
+std::atomic<bool> g_cached_touch_visible{false};
+std::atomic<uint64_t> g_last_touch_visible_check{0};
+
+// Переносим MonotonicNanoseconds наверх, чтобы она была видна
+uint64_t MonotonicNanoseconds() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+} // namespace
+
 bool ContextTouchHudLayoutActive() noexcept {
-  return GamepadTouchOverlayVisible() || GetContextTouchDrawableOverlaySnapshot().visible ||
-         GetContextTouchOverlaySnapshot().visible || IsContextTouchEditorActive();
+  uint64_t now = MonotonicNanoseconds();
+  uint64_t last = g_last_touch_visible_check.load(std::memory_order_relaxed);
+  
+  if (now - last > 100000000) { // 100 мс
+    bool visible = GamepadTouchOverlayVisible() || 
+                   rex::input::TouchControlsVisible() || 
+                   IsContextTouchEditorActive();
+    g_cached_touch_visible.store(visible, std::memory_order_relaxed);
+    g_last_touch_visible_check.store(now, std::memory_order_relaxed);
+  }
+  
+  return g_cached_touch_visible.load(std::memory_order_relaxed);
 }
 
 namespace {
@@ -204,11 +227,6 @@ RuntimeState g_runtime;
 std::atomic<uint64_t> g_presentation_revision{0};
 
 ContextTouchOverlaySnapshot BuildOverlaySnapshotLocked();
-
-uint64_t MonotonicNanoseconds() {
-  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-      std::chrono::steady_clock::now().time_since_epoch()).count());
-}
 
 void FinishEditorFadeLocked(uint64_t monotonic_ns) {
   monotonic_ns = std::max(monotonic_ns, g_runtime.last_drawable_ns);

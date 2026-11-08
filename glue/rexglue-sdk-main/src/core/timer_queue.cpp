@@ -16,6 +16,7 @@
 #include <disruptorplus/ring_buffer.hpp>
 #include <disruptorplus/sequence_barrier.hpp>
 #include <disruptorplus/spin_wait_strategy.hpp>
+#include <disruptorplus/blocking_wait_strategy.hpp>
 
 #include <rex/assert.h>
 #include <rex/thread.h>
@@ -55,7 +56,7 @@ class TimerQueue {
     // std::jthread auto-joins on destruction
   }
 
-  void TimerThreadMain(std::stop_token stop_token) {
+void TimerThreadMain(std::stop_token stop_token) {
     dp::sequence_t next_sequence = 0;
     const auto comp = [](const std::shared_ptr<WaitItem>& left,
                          const std::shared_ptr<WaitItem>& right) {
@@ -64,7 +65,7 @@ class TimerQueue {
 
     set_current_thread_name("rex::thread::TimerQueue");
 
-    while (!stop_token.stop_requested()) {
+while (!stop_token.stop_requested()) {
       {
         // Consume new wait items and add them to sorted wait queue
         dp::sequence_t available = claim_strategy_.wait_until_published(
@@ -122,7 +123,7 @@ class TimerQueue {
       }
     }
   }
-
+  
   std::weak_ptr<WaitItem> QueueTimer(std::shared_ptr<WaitItem> wait_item) {
     auto wait_item_weak = std::weak_ptr<WaitItem>(wait_item);
 
@@ -139,12 +140,14 @@ class TimerQueue {
   std::jthread::id dispatch_thread_id() const { return dispatch_thread_.get_id(); }
 
  private:
-  // This ring buffer will be used to introduce timers queued by the public API
-  static constexpr size_t kWaitCount = 512;
+ // This ring buffer will be used to introduce timers queued by the public API
+ static constexpr size_t kWaitCount = 512;
   dp::ring_buffer<std::shared_ptr<WaitItem>> buffer_;
-  dp::spin_wait_strategy wait_strategy_;
-  dp::multi_threaded_claim_strategy<dp::spin_wait_strategy> claim_strategy_;
-  dp::sequence_barrier<dp::spin_wait_strategy> consumed_;
+  // ИСПОЛЬЗУЕМ БЛОКИРУЮЩУЮ СТРАТЕГИЮ ВМЕСТО SPIN_WAIT. 
+  // Это уберет sched_yield и заставит поток спать на condition_variable.
+  dp::blocking_wait_strategy wait_strategy_;
+  dp::multi_threaded_claim_strategy<dp::blocking_wait_strategy> claim_strategy_;
+  dp::sequence_barrier<dp::blocking_wait_strategy> consumed_;
 
   // This is a _sorted_ (ascending due_) list of active timers managed by a
   // dedicated thread

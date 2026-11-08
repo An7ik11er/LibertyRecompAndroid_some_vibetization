@@ -1,6 +1,6 @@
 // Inside BindCommonDrawState, after the actual immutable constants are uploaded.
 // Byte comparisons use mapped upload memory, not a substitute calculated buffer.
-if (!EmissionTraceConfig().pipeline && EmissionTraceActive(diagnostic_submitted_frame_) && command.pipeline_state &&
+if (REXCVAR_GET(gta4_trace_native_renderer) && !EmissionTraceConfig().pipeline && EmissionTraceActive(diagnostic_submitted_frame_) && command.pipeline_state &&
     command.pipeline_state->pixel_shader_resource &&
     IsEmissionShader(command.pipeline_state->pixel_shader_resource->filename)) {
   const auto& ps = *command.pipeline_state->pixel_shader_resource;

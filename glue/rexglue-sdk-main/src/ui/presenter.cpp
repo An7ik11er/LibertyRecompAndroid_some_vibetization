@@ -13,6 +13,7 @@
 #include <chrono>
 #include <atomic>
 #include <cctype>
+#include <thread>
 #include <utility>
 
 #include <rex/assert.h>
@@ -30,6 +31,22 @@
 
 REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                     "Allow presentation from non-UI thread");
+
+REXCVAR_DEFINE_INT32(present_ui_fps_limit, 60, "UI/Presenter",
+                     "Maximum frame rate for UI-only repaints on non-Win32 platforms (0 = uncapped)")
+    .range(0, 240);
+
+// 39: while the title publishes frames, a UI-only repaint (touch input, ImGui
+// animation, drawer changes) is not presented by itself: the UI is drawn with
+// the next guest frame, which comes within this many milliseconds anyway. On
+// the 888 (30.10, driving with touch controls) the presenter otherwise ran at
+// the display rate: 63 presents a second for 24.6 game frames, each a full
+// output pass plus a full-screen GPU composition in SurfaceFlinger.
+// 0 = old behaviour (every UI request presents).
+REXCVAR_DEFINE_INT32(present_ui_follows_guest_ms, 100, "UI/Presenter",
+                     "While the game publishes frames at least this often (ms), UI-only "
+                     "repaints wait for the next game frame (0 = present UI-only repaints)")
+    .range(0, 1000);
 
 REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
                     "Enable letterboxing for non-native aspect ratios");
@@ -281,6 +298,44 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
 
 }  // namespace
 
+// Frame clock for the FPS overlay: one steady_clock timestamp per published
+// guest frame. Single writer (the publishing thread), lock-free readers.
+namespace {
+constexpr uint32_t kOverlayFrameClockSize = 512;
+std::atomic<uint64_t> g_overlay_frame_count{0};
+std::atomic<uint64_t> g_overlay_frame_ns[kOverlayFrameClockSize];
+
+// 30.10: non-Win32 counterpart of dxgi_ui_tick_force_requested_. Set when a
+// paint is requested for a newly published guest frame (or another forced
+// paint), consumed by the next UI tick wait, which then does not sleep.
+std::atomic<bool> g_ui_tick_force_requested{false};
+
+void NoteOverlayFramePublished() {
+  const uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+  const uint64_t index = g_overlay_frame_count.load(std::memory_order_relaxed);
+  g_overlay_frame_ns[index % kOverlayFrameClockSize].store(now, std::memory_order_relaxed);
+  g_overlay_frame_count.store(index + 1, std::memory_order_release);
+}
+}  // namespace
+
+// Copies the newest min(count - first, capacity, 511) timestamps, oldest
+// first, and returns the number of frames published so far.
+extern "C" __attribute__((visibility("default"), used)) uint64_t rex_overlay_frame_clock_read(
+    uint64_t first, uint64_t* out_ns, uint32_t capacity, uint32_t* out_written) {
+  const uint64_t count = g_overlay_frame_count.load(std::memory_order_acquire);
+  uint64_t begin = first > count ? count : first;
+  const uint64_t limit = std::min<uint64_t>(capacity, kOverlayFrameClockSize - 1);
+  if (count - begin > limit) begin = count - limit;
+  for (uint64_t index = begin; index < count; ++index) {
+    out_ns[index - begin] =
+        g_overlay_frame_ns[index % kOverlayFrameClockSize].load(std::memory_order_relaxed);
+  }
+  if (out_written) *out_written = uint32_t(count - begin);
+  return count;
+}
+
 namespace rex {
 namespace ui {
 
@@ -459,6 +514,17 @@ void Presenter::PaintFromUIThread(bool force_paint) {
   PaintFromUIThreadImpl(force_paint, false);
 }
 
+bool Presenter::UIPaintFollowsGuestOutput() const {
+  const int32_t window_ms = REXCVAR_GET(present_ui_follows_guest_ms);
+  if (window_ms <= 0) return false;
+  const uint64_t last = last_guest_publication_ns_.load(std::memory_order_relaxed);
+  if (!last) return false;
+  const uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+  return now >= last && now - last < uint64_t(window_ms) * 1'000'000ull;
+}
+
 void Presenter::PaintFromUIThreadImpl(bool force_paint, bool display_opportunity) {
   // If there is no surface, this will be a no-op, nothing outdated, nothing to
   // paint. However, an explicit monitor check is needed because UI framerate
@@ -488,7 +554,11 @@ void Presenter::PaintFromUIThreadImpl(bool force_paint, bool display_opportunity
   // reconnect).
   bool draw_ui = !ui_drawers_.empty();
   const bool explicit_demand = UsesExplicitPaintDemand();
-  bool do_paint = ui_paint_pending_ || (explicit_demand && publication_progress_.pending()) ||
+  // 39: a pending UI-only repaint is carried to the next guest frame while the
+  // title keeps publishing (ui_paint_pending_ stays set, so that frame draws it).
+  const bool ui_follows_guest = !force_paint && UIPaintFollowsGuestOutput();
+  const bool ui_paint_due = ui_paint_pending_ && !ui_follows_guest;
+  bool do_paint = ui_paint_due || (explicit_demand && publication_progress_.pending()) ||
       (!display_opportunity && (force_paint || (!explicit_demand && draw_ui)));
   // Reset ui_thread_paint_requested_ unconditionally also, regardless of
   // whether the UI needs to be drawn - the flag may be set to try reconnecting,
@@ -596,7 +666,13 @@ void Presenter::PaintFromUIThreadImpl(bool force_paint, bool display_opportunity
       request_repaint_immediately = true;
     }
     if (request_ui_paint_after_current_ui_thread_paint_ && !ui_drawers_.empty()) {
-      request_repaint_at_tick = true;
+      // 39: drawers ask for another frame from inside the paint (ImGui input
+      // queue, animations). While guest frames flow, the next one draws it.
+      if (ui_follows_guest) {
+        ui_paint_pending_ = true;
+      } else {
+        request_repaint_at_tick = true;
+      }
     }
   }
   if (request_repaint_at_tick || request_repaint_immediately) {
@@ -663,10 +739,23 @@ bool Presenter::RefreshGuestOutput(
   }
 
   const bool paired_presentation = is_active && writable_properties.provenance.paired_presentation;
+  // На экранах загрузки/меню (< 64 команд) при выключенном капе ограничиваем 60 FPS,
+  // чтобы не молотить 1200+ FPS впустую и не греть CPU до начала игры.
+  uint32_t effective_fps_limit = provenance.frame_rate_limit;
+  if (effective_fps_limit == 0 && provenance.native_command_count < 64) {
+    effective_fps_limit = 60;
+  }
+  if (is_active) {
+    last_guest_publication_ns_.store(
+        uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::steady_clock::now().time_since_epoch())
+                     .count()),
+        std::memory_order_relaxed);
+  }
   const uint64_t publication_serial = frame_publication_gate_.Publish(
-      is_active ? provenance.frame_rate_limit : 0, paired_presentation);
+      (is_active && paired_presentation) ? effective_fps_limit : 0, paired_presentation);
   writable_properties.provenance.publication_serial = publication_serial;
-  host_frame_rate_limit_.store(is_active ? provenance.frame_rate_limit : 0,
+  host_frame_rate_limit_.store((is_active && paired_presentation) ? effective_fps_limit : 0,
                                std::memory_order_relaxed);
 
   // Make the new image the next to present on the host (the "ready" one),
@@ -727,6 +816,7 @@ bool Presenter::RefreshGuestOutput(
                 probe.guest_image, probe.guest_version, published_mailbox_index, probe.native_submission);
   }
   publication_progress_.Publish(publication_serial);
+  NoteOverlayFramePublished();
   // Trigger the presentation on the host.
   PaintResult paint_result = PaintResult::kNotPresented;
   PaintMode paint_mode_snapshot = PaintMode::kNone;
@@ -869,12 +959,31 @@ bool Presenter::RefreshGuestOutput(
         paint_result_name(paint_result));
   }
   }
-  if (is_active && provenance.producer_backpressure && (provenance.frame_rate_limit || paired_presentation) &&
+  if (is_active && provenance.producer_backpressure && (effective_fps_limit || paired_presentation) &&
       std::this_thread::get_id() != ui_thread_id_ &&
       paint_result != PaintResult::kGpuLostResponsible &&
       paint_result != PaintResult::kGpuLostExternally) {
     const uint64_t begin = FramePacerNowNs();
-    const bool accepted = frame_publication_gate_.Wait(publication_serial);
+    bool accepted = true;
+    if (paired_presentation) {
+      accepted = frame_publication_gate_.Wait(publication_serial);
+    } else if (effective_fps_limit > 0) {
+      // Мягкий пейсер без провала в 2x слот (66.6 мс): если кадр уже опоздал
+      // (now >= next_deadline_ns), отпускаем сразу без штрафа ожидания.
+      static std::atomic<uint64_t> s_next_deadline_ns{0};
+      const uint64_t period_ns = 1'000'000'000ull / effective_fps_limit;
+      uint64_t deadline = s_next_deadline_ns.load(std::memory_order_relaxed);
+      if (begin + period_ns < deadline || begin >= deadline + period_ns) {
+        deadline = begin;
+      }
+      if (begin < deadline) {
+        std::this_thread::sleep_for(std::chrono::nanoseconds(deadline - begin));
+        s_next_deadline_ns.store(deadline + period_ns, std::memory_order_relaxed);
+      } else {
+        // Кадр уже >= 33.3 мс: не ждём следующий слот 66.6 мс, отпускаем мгновенно!
+        s_next_deadline_ns.store(begin + period_ns, std::memory_order_relaxed);
+      }
+    }
     if (rex::diagnostics::IsEnabled(rex::diagnostics::Category::kPresenter)) {
       REXLOG_INFO("FramePacer point=handoff serial={} frame={} released={} wait-ns={}",
                   publication_serial, provenance.submitted_frame, accepted, FramePacerNowNs()-begin);
@@ -1806,7 +1915,7 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
   PollPresentationTiming();
   const auto display_target = DisplayLinkTargetNs();
   if (display_target && !*display_target) return PaintResult::kNotPresented;
-  pacing_attempt_ = display_target
+ pacing_attempt_ = display_target
       ? frame_pacer_.PlanForDisplay(FramePacerNowNs(), *display_target)
       : frame_pacer_.Plan(FramePacerNowNs());
   if (pacing_attempt_.delay_ns) {
@@ -2009,6 +2118,22 @@ void Presenter::WaitForUITickFromUIThread() {
     }
     dxgi_ui_tick_signal_condition_.wait(dxgi_ui_tick_lock);
   }
+#else
+  // 30.10: as on Win32 (dxgi_ui_tick_force_requested_), a paint that carries a
+  // newly published guest frame does not wait for the UI tick. The limit is for
+  // UI-only repaints; before, a game frame published right after a UI repaint
+  // slept up to 1/present_ui_fps_limit s on the UI thread before its present.
+  const int32_t fps_limit = REXCVAR_GET(present_ui_fps_limit);
+  static auto last_ui_paint_time = std::chrono::steady_clock::now();
+  const bool forced = g_ui_tick_force_requested.exchange(false, std::memory_order_acq_rel);
+  if (fps_limit > 0 && !forced) {
+    const auto min_interval = std::chrono::microseconds(1'000'000 / fps_limit);
+    const auto elapsed = std::chrono::steady_clock::now() - last_ui_paint_time;
+    if (elapsed < min_interval) {
+      std::this_thread::sleep_for(min_interval - elapsed);
+    }
+  }
+  last_ui_paint_time = std::chrono::steady_clock::now();
 #endif  // XE_PLATFORM
 }
 
@@ -2016,6 +2141,8 @@ void Presenter::ForceUIThreadPaintTick() {
 #if REX_PLATFORM_WIN32
   std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
   dxgi_ui_tick_force_requested_ = true;
+#else
+  g_ui_tick_force_requested.store(true, std::memory_order_release);
 #endif  // XE_PLATFORM
 }
 
@@ -2071,4 +2198,5 @@ void Presenter::DXGIUITickThread() {
 #endif  // XE_PLATFORM
 
 }  // namespace ui
+
 }  // namespace rex

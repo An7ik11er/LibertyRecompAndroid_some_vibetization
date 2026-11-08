@@ -1,4 +1,5 @@
 #include "gta4_aspect_hooks.h"
+#include "gta4_dc_address_bits.h"  // 51
 #include "gta4_frontend_hooks.h"
 
 #include <atomic>
@@ -175,6 +176,15 @@ std::unordered_map<uint32_t, DcLayout> dc_layouts;
 std::deque<std::pair<uint32_t, uint64_t>> dc_order;
 uint64_t next_dc_serial = 0;
 constexpr size_t kMaximumDcLayouts = 32768;
+// 37: dc_layouts.size(), stored under dc_mutex after every change and read
+// without it. Lets FinalizeDc / DcContext skip the guest-range check (a
+// BaseHeap::QueryRangeAccess under the global recursive mutex) and dc_mutex
+// when there is nothing to look up or invalidate.
+std::atomic<size_t> dc_layout_count{0};
+// 51: dc_layouts' keys as bits (gta4_dc_address_bits.h), changed under dc_mutex together
+// with the map and read without it: a world command whose address holds no layout returns
+// from FinalizeDc / DcContext without dc_mutex and the map lookup.
+DcAddressBits dc_layout_bits;
 
 bool LayoutDc(uint32_t vtable) {
   return HasUiDrawExecutor(vtable);
@@ -182,6 +192,11 @@ bool LayoutDc(uint32_t vtable) {
 
 UiContext DcContext(PPCContext& ctx, uint8_t* base) {
   const uint32_t dc = ctx.r3.u32;
+  // 37: no layouts recorded -> the lookup below cannot find one.
+  if (dc_layout_count.load(std::memory_order_acquire) == 0)
+    return ui_context;
+  if (!dc_layout_bits.Test(dc))  // 51: no layout at this address
+    return ui_context;
   if (!Span(base, dc, 8))
     return ui_context;
   const uint32_t vtable = Read(base, dc), token = StableDcToken(Read(base, dc + 4));
@@ -373,24 +388,52 @@ Scope::~Scope() {
 DcScope::DcScope(PPCContext& ctx, uint8_t* base) : scope_(DcContext(ctx, base)) {}
 
 void FinalizeDc(uint8_t* base, uint32_t dc) {
+  // 37: most publications come from the game thread outside any UI scope
+  // (world commands). For those this only has to drop a stale layout of the
+  // same address, which needs neither the guest-range check (QueryRangeAccess
+  // under the global recursive mutex, ~1.7 % of Main XThread on the 888) nor
+  // the output state: an entry only exists once the output is ready, and the
+  // dc is just a key here. Same result as the full path below, which used to
+  // erase and then return on !ui_context.active.
+  if (!ui_context.active) {
+    if (!dc || dc_layout_count.load(std::memory_order_acquire) == 0)
+      return;
+    // 51: while the HUD keeps layouts alive this used to lock and erase for every world
+    // command; nearly none of their addresses holds a layout.
+    if (!dc_layout_bits.Test(dc))
+      return;
+    std::lock_guard lock(dc_mutex);
+    if (dc_layouts.erase(dc)) {
+      dc_layout_bits.Clear(dc);
+      dc_layout_count.store(dc_layouts.size(), std::memory_order_release);
+    }
+    return;
+  }
   if (!Output().ready || !Span(base, dc, 8))
     return;
   const uint32_t vtable = Read(base, dc), token = StableDcToken(Read(base, dc + 4));
   std::lock_guard lock(dc_mutex);
   // Invalidate on every publication, including reuse by a non-UI command.
-  dc_layouts.erase(dc);
-  if (!LayoutDc(vtable) || !ui_context.active)
+  if (dc_layouts.erase(dc))
+    dc_layout_bits.Clear(dc);  // 51
+  if (!LayoutDc(vtable)) {
+    dc_layout_count.store(dc_layouts.size(), std::memory_order_release);
     return;
+  }
   const uint64_t serial = ++next_dc_serial;
   dc_layouts.emplace(dc, DcLayout{token, vtable, serial, ui_context});
+  dc_layout_bits.Set(dc);  // 51
   dc_order.emplace_back(dc, serial);
   // Both containers are bounded. Token + vtable prevents address-reuse contamination.
   for (; dc_order.size() > kMaximumDcLayouts; dc_order.pop_front()) {
     const auto [old_dc, old_serial] = dc_order.front();
     const auto it = dc_layouts.find(old_dc);
-    if (it != dc_layouts.end() && it->second.serial == old_serial)
+    if (it != dc_layouts.end() && it->second.serial == old_serial) {
       dc_layouts.erase(it);
+      dc_layout_bits.Clear(old_dc);  // 51
+    }
   }
+  dc_layout_count.store(dc_layouts.size(), std::memory_order_release);
 }
 void PrepareViewport(PPCContext& ctx, uint8_t* base) {
   const uint32_t viewport = ctx.r3.u32;

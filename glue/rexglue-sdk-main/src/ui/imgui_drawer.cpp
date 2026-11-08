@@ -696,8 +696,13 @@ void ImGuiDrawer::ClearInput() {
 }
 
 void ImGuiDrawer::OnKey(KeyEvent& e, bool is_down) {
-  RequestInputPaint();
   auto& io = GetIO();
+  // Gamepad and hotkeys drive the game; repaint only when an ImGui window
+  // navigates or takes text. Otherwise each button edge re-presented the
+  // same guest frame from the UI thread.
+  if (io.NavActive || io.WantCaptureKeyboard || io.WantTextInput) {
+    RequestInputPaint();
+  }
   const VirtualKey virtual_key = e.virtual_key();
   if (auto imGuiKey = VirtualKeyToImGuiKey(virtual_key); imGuiKey) {
     io.AddKeyEvent(*imGuiKey, is_down);

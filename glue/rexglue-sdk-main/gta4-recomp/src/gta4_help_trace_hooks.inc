@@ -106,6 +106,12 @@ struct HelpExecution {
 };
 thread_local HelpCall* g_help_call = nullptr;
 thread_local HelpExecution* g_help_execution = nullptr;
+// 56: threads inside a help execution (HelpExecute / HelpImmediate). GTA4_HelpTraceNativeSubmission
+// runs for every native command; in this dlopen'ed library each read of the thread_local above
+// is a TLS resolver call: 0.70 ms of RenderGuest per frame (888, batch 54 P1). While no thread
+// is inside a help execution it returns before touching it. Relaxed: only the thread's own
+// increment matters to it.
+std::atomic<int> g_help_executions{0};
 std::atomic<uint64_t> g_help_calls{0}, g_help_backgrounds{0};
 std::atomic<uint32_t> g_help_incomplete{0};
 std::mutex g_help_dc_mutex;
@@ -189,6 +195,7 @@ void HelpExecute(PPCContext& ctx, uint8_t* base, uint32_t expected_vtable,
   HelpExecution execution{bg, base};
   auto* previous = g_help_execution;
   g_help_execution = &execution;
+  g_help_executions.fetch_add(1, std::memory_order_relaxed);  // 56
   if (bg.sampled)
     REXLOG_INFO("gta4-help-trace: point=background-execute call={} bg={} "
                 "build-frame={} execute-frame={} dc={:08X} kind={} origin={} "
@@ -197,6 +204,7 @@ void HelpExecute(PPCContext& ctx, uint8_t* base, uint32_t expected_vtable,
                 bg.kind, bg.origin, bg.color, bg.color >> 24, bg.finalized);
   original(ctx, base);
   g_help_execution = previous;
+  g_help_executions.fetch_sub(1, std::memory_order_relaxed);  // 56
   if (bg.sampled)
     REXLOG_INFO("gta4-help-trace: point=background-execute-end call={} bg={} "
                 "native-accepted={} native-captured={} native-rejected={} gpu-verified=false",
@@ -210,6 +218,7 @@ void HelpImmediate(PPCContext& ctx, uint8_t* base, const char* kind, uint32_t co
   execution.background.color = color;
   auto* previous = g_help_execution;
   g_help_execution = &execution;
+  g_help_executions.fetch_add(1, std::memory_order_relaxed);  // 56
   const auto& bg = execution.background;
   if (bg.sampled)
     REXLOG_INFO("gta4-help-trace: point=background-immediate call={} bg={} frame={} "
@@ -217,6 +226,7 @@ void HelpImmediate(PPCContext& ctx, uint8_t* base, const char* kind, uint32_t co
                 bg.call, bg.id, bg.frame, kind, bg.origin, bg.caller, color, color >> 24);
   original(ctx, base);
   g_help_execution = previous;
+  g_help_executions.fetch_sub(1, std::memory_order_relaxed);  // 56
   if (bg.sampled)
     REXLOG_INFO("gta4-help-trace: point=background-execute-end call={} bg={} "
                 "native-accepted={} native-captured={} native-rejected={} gpu-verified=false",
@@ -241,8 +251,18 @@ void GTA4_HelpTraceFinalize(uint8_t* base, uint32_t dc, uint32_t caller) {
                 bg.call, bg.id, GetNativeLightSubmittedFrame(base), dc, caller);
 }
 
+// 57: the body is a separate, never-inlined function. In 56 the compiler hoisted the
+// thread_local address (the TLS resolver call) above the counter check, so the fast path still
+// paid for it (batch 56 Q2: 0.72 ms of RenderGuest per frame, as before).
+[[gnu::noinline]] static void HelpTraceNativeSubmissionTraced(uint32_t type, uint32_t device,
+                                                              bool accepted, bool captured);
 void GTA4_HelpTraceNativeSubmission(uint32_t type, uint32_t device,
                                   bool accepted, bool captured) {
+  if (g_help_executions.load(std::memory_order_relaxed) == 0) return;  // 56
+  HelpTraceNativeSubmissionTraced(type, device, accepted, captured);
+}
+[[gnu::noinline]] static void HelpTraceNativeSubmissionTraced(uint32_t type, uint32_t device,
+                                                              bool accepted, bool captured) {
   if (!g_help_execution) return;
   using T = rex::graphics::gta4_native::CommandType;
   if (type != uint32_t(T::kDrawPrimitive) && type != uint32_t(T::kDrawPrimitiveUp) &&

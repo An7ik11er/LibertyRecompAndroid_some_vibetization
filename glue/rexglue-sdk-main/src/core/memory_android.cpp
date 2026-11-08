@@ -178,6 +178,15 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
                  PageAccess access) {
   const uint32_t prot_requested = ToPosixProtectFlags(access);
 
+  // Быстрый путь для kCommit по уже зарезервированной памяти:
+  // mprotect сам атомарно вернёт ошибку (ENOMEM), если страницы ещё не замаплены,
+  // без открытия и парсинга многотысячного /proc/self/maps!
+  if (base_address && allocation_type == AllocationType::kCommit) {
+    if (mprotect(base_address, length, static_cast<int>(prot_requested)) == 0) {
+      return base_address;
+    }
+  }
+
   int prot_initial = 0;
   switch (allocation_type) {
     case AllocationType::kReserve:
@@ -199,19 +208,20 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
 
   void* result = mmap(base_address, length, prot_initial, flags, -1, 0);
   if (result != MAP_FAILED) {
+    if (base_address && result != base_address) {
+      // Защита для старых ядер (< 4.17), которые игнорируют MAP_FIXED_NOREPLACE
+      munmap(result, length);
+      return nullptr;
+    }
     return result;
   }
 
 #if defined(MAP_FIXED_NOREPLACE)
-  // Commit-on-reservation path: a prior Reserve already holds this VA as
-  // PROT_NONE; upgrade it with mprotect.
   if (errno == EEXIST && base_address &&
       (allocation_type == AllocationType::kCommit ||
        allocation_type == AllocationType::kReserveCommit)) {
-    if (IsRangeFullyMapped(base_address, length)) {
-      if (mprotect(base_address, length, static_cast<int>(prot_requested)) == 0) {
-        return base_address;
-      }
+    if (mprotect(base_address, length, static_cast<int>(prot_requested)) == 0) {
+      return base_address;
     }
   }
 #endif

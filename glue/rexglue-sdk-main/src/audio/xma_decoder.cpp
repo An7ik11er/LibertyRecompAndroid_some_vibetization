@@ -15,7 +15,9 @@
 #include <cerrno>
 #include <unistd.h>
 #endif
+#include <atomic>
 #include <bit>
+#include <thread>
 
 #include <rex/audio/xma/context.h>
 #include <rex/audio/handoff_trace.h>
@@ -37,6 +39,16 @@ extern "C" {
 }  // extern "C"
 
 REXCVAR_DEFINE_BOOL(ffmpeg_verbose, false, "Audio", "Verbose FFmpeg output (debug and above)");
+REXCVAR_DEFINE_BOOL(xma_inline_kick, true, "Audio",
+                    "Decode a kicked XMA context on the thread that kicks it instead of "
+                    "waking the XMA Decoder thread and waiting for it (the kick blocks "
+                    "until the decode is done either way)");
+
+namespace {
+// 36: kicks being decoded on the kicking thread (see WriteRegister). Pause()
+// waits for them, as it waits for the worker. One XmaDecoder per process.
+std::atomic<uint32_t> g_inline_kicks_in_flight{0};
+}  // namespace
 
 // As with normal Microsoft, there are like twelve different ways to access
 // the audio APIs. Early games use XMA*() methods almost exclusively to touch
@@ -343,14 +355,56 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
         diagnostics::gta4_transition::EventType::kXmaKick, 0, 0, 0,
         diagnostics::gta4_transition::kFlagBefore, ready_word, kicked_value,
         base_context_id);
-    ready_context_words_[ready_word].fetch_or(kicked_value, std::memory_order_release);
-    // Signal the decoder thread to start processing.
-    work_event_->Set();
-    // Block until the worker finishes, so the game sees updated context data.
-    for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
-      if (kicked_value & 1) {
-        uint32_t context_id = base_context_id + i;
-        contexts_[context_id].WaitForWorkDone();
+    // 36: the kick blocks until the decode is done (the game reads the context
+    // right after), so handing it to the worker thread bought no parallelism:
+    // it cost two futex round trips per kick (~2000 a second on the 888,
+    // 29.10), the guest audio thread asleep or waiting for a core ~19 % of its
+    // time, and an XMA Decoder wake at nice -16 on the big cores each time
+    // (a third of GtaRenderWork's and RenderGuest's preemptions). Decode here
+    // instead; Work() takes the context lock as on the worker. While paused, or
+    // with xma_inline_kick off, the worker path below is used unchanged.
+    bool decoded_inline = false;
+    if (REXCVAR_GET(xma_inline_kick) && !paused_) {
+      g_inline_kicks_in_flight.fetch_add(1, std::memory_order_seq_cst);
+      if (!paused_) {
+        decoded_inline = true;
+        diagnostics::gta4_transition::Record(
+            diagnostics::gta4_transition::EventSource::kXma,
+            diagnostics::gta4_transition::EventType::kXmaWorkerBegin, 0, 0, 0,
+            diagnostics::gta4_transition::kFlagBefore, ready_word, kicked_value);
+        for (uint32_t pending = kicked_value; pending; pending &= pending - 1) {
+          const uint32_t bit_index = static_cast<uint32_t>(std::countr_zero(pending));
+          const uint32_t context_index = base_context_id + bit_index;
+          XmaContext& context = contexts_[context_index];
+          diagnostics::gta4_transition::Record(
+              diagnostics::gta4_transition::EventSource::kXma,
+              diagnostics::gta4_transition::EventType::kXmaContextBegin, 0, 0, 0,
+              diagnostics::gta4_transition::kFlagBefore, context_index, context.guest_ptr(),
+              ready_word);
+          const bool worked = context.Work();
+          if (worked) {
+            PROFILE_XMA_FRAME_DECODED();
+          }
+          diagnostics::gta4_transition::Record(
+              diagnostics::gta4_transition::EventSource::kXma,
+              diagnostics::gta4_transition::EventType::kXmaContextEnd, 0, 0, 0,
+              worked ? diagnostics::gta4_transition::kFlagAfter
+                     : diagnostics::gta4_transition::kFlagError,
+              context_index, context.guest_ptr(), ready_word);
+        }
+      }
+      g_inline_kicks_in_flight.fetch_sub(1, std::memory_order_seq_cst);
+    }
+    if (!decoded_inline) {
+      ready_context_words_[ready_word].fetch_or(kicked_value, std::memory_order_release);
+      // Signal the decoder thread to start processing.
+      work_event_->Set();
+      // Block until the worker finishes, so the game sees updated context data.
+      for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
+        if (kicked_value & 1) {
+          uint32_t context_id = base_context_id + i;
+          contexts_[context_id].WaitForWorkDone();
+        }
       }
     }
     diagnostics::gta4_transition::Record(
@@ -431,6 +485,13 @@ void XmaDecoder::Pause() {
     work_event_->Set();
   }
   pause_fence_.Wait();
+  // 36: kicks that saw paused_ == false before it was set are decoded on their
+  // own threads; wait for them like for the worker. New kicks take the worker
+  // path, which is paused.
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  while (g_inline_kicks_in_flight.load(std::memory_order_seq_cst)) {
+    std::this_thread::yield();
+  }
 }
 
 void XmaDecoder::Resume() {

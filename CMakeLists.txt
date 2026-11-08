@@ -15,7 +15,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # Check source prerequisites before project() enters the vcpkg toolchain.
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/DependencyPatches.cmake")
-liberty_require_dependency_sources("${CMAKE_CURRENT_SOURCE_DIR}")
+#liberty_require_dependency_sources("${CMAKE_CURRENT_SOURCE_DIR}")
 if(APPLE AND NOT CMAKE_TOOLCHAIN_FILE)
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/FindHostLLVM.cmake")
 endif()

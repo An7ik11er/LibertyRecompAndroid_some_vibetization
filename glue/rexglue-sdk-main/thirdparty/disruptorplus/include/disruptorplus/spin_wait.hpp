@@ -54,7 +54,8 @@ namespace disruptorplus
         /// Reset the spin_wait back to its original state.
         void reset()
         {
-            m_value = std::thread::hardware_concurrency() > 1 ? 0 : 10;
+           static const bool is_multiprocessor = std::thread::hardware_concurrency() > 1;
+           m_value = is_multiprocessor ? 0 : 10;
         }
         
         /// \brief

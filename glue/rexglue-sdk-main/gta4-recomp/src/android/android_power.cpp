@@ -176,12 +176,13 @@ void PowerLoop() {
     next_tick += kPeriod;
     if (next_tick < now) next_tick = now + kPeriod;  // fell behind (suspended): resynchronize
 
+      //  const bool enabled = manager && true;  // TEST: force ADPF on
     const bool enabled = manager && REXCVAR_GET(android_perf_hint);
     if (!enabled && session) {
       api.close_session(session);
       session = nullptr;
     }
-
+	if (!enabled && !REXCVAR_GET(android_thermal_guard)) continue;
     if (now >= next_rank) {
       next_rank = now + kRankInterval;
       const std::vector<pid_t> busiest = BusiestThreads(rank_times, 4);

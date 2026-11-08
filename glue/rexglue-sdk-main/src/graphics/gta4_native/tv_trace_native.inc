@@ -21,7 +21,7 @@ void Gta4NativeGraphicsSystem::TraceTvNativeCommand(const NativeCommand& command
   const auto role = TvCommandRole(command);
   if (!role) return;
   const auto& c = *command.tv_trace;
-  const auto& f = command.fixed_function_state;
+  const auto& f = *command.fixed_function_state;
   const auto* state = command.pipeline_state.get();
   const auto* ps = state ? state->pixel_shader_resource : nullptr;
   const auto* vs = state ? state->vertex_shader_resource : nullptr;

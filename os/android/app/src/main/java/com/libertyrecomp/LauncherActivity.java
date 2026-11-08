@@ -68,6 +68,11 @@ import java.util.zip.ZipInputStream;
  */
 public class LauncherActivity extends Activity {
 
+    private String tr(String key, String fallbackEn) {
+        return LauncherI18n.tr(this, key, fallbackEn);
+    }
+
+
     private static final String TAG = "LibertyLauncher";
     private static final int REQUEST_DRIVER_ZIP = 1;
     private static final String GAME_PROCESS_SUFFIX = ":game";
@@ -119,7 +124,7 @@ public class LauncherActivity extends Activity {
         }, "InstallerLoad").start();
         // `am start ... --ez play true` (the development scripts) goes
         // straight into the game with the current driver choice.
-        if (savedInstanceState == null && getIntent().getBooleanExtra("play", false)) play(false);
+        if (savedInstanceState == null && getIntent().getBooleanExtra("play", false)) play(getIntent().getBooleanExtra("debug_log", false));
     }
 
     @Override
@@ -156,7 +161,7 @@ public class LauncherActivity extends Activity {
         return false;
     }
 
-    /** A small GitHub mark and the author's name, opening the project page. */
+    /** A small GitHub mark and the author's name (static footer, no link). */
     private View buildGithubFooter() {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
@@ -165,21 +170,11 @@ public class LauncherActivity extends Activity {
         ImageView mark = new ImageView(this);
         mark.setImageResource(R.drawable.ic_github);
         row.addView(mark, new LinearLayout.LayoutParams(dp(16), dp(16)));
-        TextView name = text("vaduur", 13, R.color.picker_muted);
+        TextView name = text("vaduur | ViBetimized by Gemini & GVINDOLIN", 13, R.color.picker_muted);
         LinearLayout.LayoutParams nameParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         nameParams.leftMargin = dp(6);
         row.addView(name, nameParams);
-        row.setFocusable(true);
-        row.setBackground(focusBackground(Color.TRANSPARENT));
-        row.setOnClickListener(v -> {
-            try {
-                startActivity(new Intent(Intent.ACTION_VIEW,
-                        Uri.parse("https://github.com/vaduur/LibertyRecompAndroid")));
-            } catch (Exception e) {
-                toast("github.com/vaduur/LibertyRecompAndroid");
-            }
-        });
         LinearLayout wrapper = new LinearLayout(this);
         wrapper.setGravity(Gravity.CENTER);
         wrapper.addView(row, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -249,32 +244,41 @@ public class LauncherActivity extends Activity {
         mPlay.setScaleType(ImageView.ScaleType.FIT_CENTER);
         mPlay.setPadding(dp(14), dp(18), dp(14), dp(18));
         mPlay.setBackground(focusBackground(0xFFE6E6E6));
-        mPlay.setContentDescription("Play");
+        mPlay.setContentDescription(tr("btn_play", "Play"));
         mPlay.setFocusable(true);
         mPlay.setOnClickListener(v -> play(false));
         LinearLayout.LayoutParams playParams = new LinearLayout.LayoutParams(dp(260), dp(72));
         playParams.topMargin = dp(18);
         left.addView(mPlay, playParams);
 
-        Button debugPlay = button("Play (Debug Log)", false);
+        Button debugPlay = button(tr("btn_play_debug", "Play (Debug Log)"), false);
         debugPlay.setOnClickListener(v -> play(true));
         LinearLayout.LayoutParams debugParams = new LinearLayout.LayoutParams(dp(260), dp(44));
         debugParams.topMargin = dp(10);
         left.addView(debugPlay, debugParams);
 
-        Button perfTest = button("Performance test settings", false);
+        Button perfTest = button(tr("btn_perf_settings", "Performance test settings"), false);
         perfTest.setOnClickListener(v -> showPerformanceTestSettings());
         LinearLayout.LayoutParams perfParams = new LinearLayout.LayoutParams(dp(260), dp(44));
         perfParams.topMargin = dp(10);
         left.addView(perfTest, perfParams);
 
-        TextView debugNote = text("The debug log is saved to Android/data/" + getPackageName()
-                + "/files/" + DebugLog.DIRECTORY + "/. Attach the newest one when you open an issue "
-                + "on GitHub.", 11, R.color.picker_muted);
+        Button langToggle = button(LauncherI18n.getLanguageButtonLabel(this), false);
+        langToggle.setOnClickListener(v -> {
+            LauncherI18n.toggleLang(this);
+            recreate();
+        });
+        LinearLayout.LayoutParams langParams = new LinearLayout.LayoutParams(dp(260), dp(44));
+        langParams.topMargin = dp(10);
+        left.addView(langToggle, langParams);
+
+        TextView debugNote = text(String.format(tr("debug_note",
+                "The debug log is saved to Android/data/%s/files/%s/. Attach the newest one when you open an issue on GitHub."),
+                getPackageName(), DebugLog.DIRECTORY), 11, R.color.picker_muted);
         debugNote.setGravity(Gravity.CENTER);
         left.addView(debugNote, matchWrap(dp(6)));
 
-        TextView hint = text("A: select   B: back   Start: play", 12, R.color.picker_muted);
+        TextView hint = text(tr("gamepad_hint", "A: select   B: back   Start: play"), 12, R.color.picker_muted);
         hint.setGravity(Gravity.CENTER);
         left.addView(hint, matchWrap(dp(10)));
 
@@ -293,10 +297,10 @@ public class LauncherActivity extends Activity {
         right.setPadding(dp(16), dp(12), dp(16), dp(12));
         right.setBackground(rounded(color(R.color.picker_card), dp(10)));
 
-        TextView title = text("Vulkan driver", 18, R.color.picker_text);
+        TextView title = text(tr("driver_card_title", "Vulkan driver"), 18, R.color.picker_text);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         right.addView(title);
-        right.addView(text("Applied the next time you press Play.", 12, R.color.picker_muted),
+        right.addView(text(tr("driver_card_subtitle", "Applied the next time you press Play."), 12, R.color.picker_muted),
                 matchWrap(dp(2)));
 
         mDrivers = new RadioGroup(this);
@@ -308,19 +312,19 @@ public class LauncherActivity extends Activity {
 
         LinearLayout actions = new LinearLayout(this);
         actions.setOrientation(LinearLayout.HORIZONTAL);
-        Button importZip = button("Import driver (.zip)", false);
+        Button importZip = button(tr("btn_import_driver", "Import driver (.zip)"), false);
         importZip.setOnClickListener(v -> pickDriverZip());
         actions.addView(importZip, new LinearLayout.LayoutParams(0, dp(48), 1f));
-        mRemove = button("Remove", false);
+        mRemove = button(tr("btn_remove_driver", "Remove"), false);
         mRemove.setOnClickListener(v -> removeSelectedDriver());
         LinearLayout.LayoutParams removeParams = new LinearLayout.LayoutParams(dp(120), dp(48));
         removeParams.leftMargin = dp(10);
         actions.addView(mRemove, removeParams);
         right.addView(actions, matchWrap(dp(12)));
 
-        right.addView(text("Turnip packages for AdrenoTools (a zip with a .so and meta.json) "
+        right.addView(text(tr("driver_footer_note", "Turnip packages for AdrenoTools (a zip with a .so and meta.json) "
                 + "work here. The game needs Vulkan 1.2; if a driver cannot start, the game "
-                + "falls back to the device's own driver.", 12, R.color.picker_muted),
+                + "falls back to the device's own driver."), 12, R.color.picker_muted),
                 matchWrap(dp(10)));
 
         LinearLayout column = new LinearLayout(this);
@@ -344,6 +348,9 @@ public class LauncherActivity extends Activity {
             version = info.versionName;
         } catch (Exception ignored) {
         }
+        if (version != null && !version.endsWith("_modded")) {
+            version += "_modded";
+        }
         // The chip model is only known from Android 12 on.
         String soc = Build.VERSION.SDK_INT >= 31 ? Build.SOC_MODEL : null;
         String gpu = readFirstLine(new File("/sys/class/kgsl/kgsl-3d0/gpu_model"));
@@ -361,7 +368,7 @@ public class LauncherActivity extends Activity {
         boolean installedNow = mInstallerReady ? mInstalled
                 : installed != null && installed.length > 0;
         if (installedNow) {
-            mStatus.setText("Game installed. Press Play.");
+            mStatus.setText(tr("status_installed", "Game installed. Press Play."));
         } else {
             File[] sources = new File(mDataRoot, "install").listFiles();
             boolean disc = false;
@@ -372,10 +379,10 @@ public class LauncherActivity extends Activity {
                 else update = true;
             }
             if (disc && update) {
-                mStatus.setText("Game files found in install/. Press Install on the right.");
+                mStatus.setText(tr("status_install_found", "Game files found in install/. Press Install on the right."));
             } else {
-                mStatus.setText("Game not installed. Choose the disc image and Title Update 8 "
-                        + "on the right and press Install.");
+                mStatus.setText(tr("status_not_installed", "Game not installed. Choose the disc image and Title Update 8 "
+                        + "on the right and press Install."));
             }
         }
         String result = null;
@@ -390,7 +397,7 @@ public class LauncherActivity extends Activity {
             }
         } catch (IOException ignored) {
         }
-        mLastLaunch.setText(result != null ? "Last launch failed: " + result : "");
+        mLastLaunch.setText(result != null ? tr("status_last_launch_failed", "Last launch failed: ") + result : "");
         mLastLaunch.setVisibility(result != null ? View.VISIBLE : View.GONE);
     }
 
@@ -408,7 +415,7 @@ public class LauncherActivity extends Activity {
         android.graphics.drawable.GradientDrawable background = rounded(0x33FF5A5A, dp(10));
         background.setStroke(dp(2), 0xFFFF5A5A);
         mCrashCard.setBackground(background);
-        TextView title = text("The game crashed - a crash report was saved", 15,
+        TextView title = text(tr("crash_title", "The game crashed - a crash report was saved"), 15,
                 R.color.picker_text);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         mCrashCard.addView(title);
@@ -416,10 +423,10 @@ public class LauncherActivity extends Activity {
         mCrashCard.addView(mCrashText, matchWrap(dp(4)));
         LinearLayout actions = new LinearLayout(this);
         actions.setOrientation(LinearLayout.HORIZONTAL);
-        Button share = button("Share report", false);
+        Button share = button(tr("crash_btn_share", "Share report"), false);
         share.setOnClickListener(v -> shareCrash());
         actions.addView(share, new LinearLayout.LayoutParams(0, dp(44), 1f));
-        Button dismiss = button("Dismiss", false);
+        Button dismiss = button(tr("crash_btn_dismiss", "Dismiss"), false);
         dismiss.setOnClickListener(v -> {
             if (mCrash != null) CrashReports.dismiss(this, mCrash);
             mCrash = null;
@@ -442,10 +449,10 @@ public class LauncherActivity extends Activity {
                     mCrashCard.setVisibility(View.GONE);
                     return;
                 }
-                mCrashText.setText(report.headline + "\n\nSaved to Android/data/" + getPackageName()
+               mCrashText.setText(report.headline + "\n\n"
+                        + tr("crash_saved_prefix", "Saved to Android/data/") + getPackageName()
                         + "/files/crash_reports/" + report.file.getName()
-                        + "\nPlease attach it to an issue on GitHub (vaduur/LibertyRecompAndroid), "
-                        + "or press Share report to send it from here.");
+                        + "\n" + tr("crash_saved_suffix", "Press Share report to send it from here."));
                 mCrashCard.setVisibility(View.VISIBLE);
             });
         }, "CrashReports").start();
@@ -460,9 +467,9 @@ public class LauncherActivity extends Activity {
         send.putExtra(Intent.EXTRA_SUBJECT, "Liberty Recompiled crash report: " + mCrash.headline);
         send.putExtra(Intent.EXTRA_TEXT, text);
         try {
-            startActivity(Intent.createChooser(send, "Share crash report"));
+            startActivity(Intent.createChooser(send, tr("crash_share_chooser", "Share crash report")));
         } catch (Exception e) {
-            toast("No app to share with. The report is in " + mCrash.file.getAbsolutePath());
+            toast(tr("crash_toast_no_app", "No app to share with. The report is in ") + mCrash.file.getAbsolutePath());
         }
     }
 
@@ -472,6 +479,16 @@ public class LauncherActivity extends Activity {
     private boolean mInstalled;
     private boolean mExpanded;
     private final String[] mSources = new String[SOURCE_LABELS.length];
+    private String sourceLabel(int index) {
+        switch (index) {
+            case SOURCE_GAME: return tr("source_game", "Game disc image (.iso)");
+            case SOURCE_UPDATE: return tr("source_update", "Title Update 8 (TU8)");
+            case SOURCE_TLAD: return tr("source_tlad", "The Lost and Damned (TLAD, optional)");
+            case SOURCE_TBOGT: return tr("source_tbogt", "The Ballad of Gay Tony (TBOGT, optional)");
+            default: return "";
+        }
+    }
+
     private final TextView[] mSourceValues = new TextView[SOURCE_LABELS.length];
     private Installer.Inspection mInspection;
     private boolean mInspecting;
@@ -493,13 +510,13 @@ public class LauncherActivity extends Activity {
         card.setPadding(dp(16), dp(12), dp(16), dp(12));
         card.setBackground(rounded(color(R.color.picker_card), dp(10)));
 
-        mInstallTitle = text("Game", 18, R.color.picker_text);
+        mInstallTitle = text(tr("install_card_title", "Game"), 18, R.color.picker_text);
         mInstallTitle.setTypeface(Typeface.DEFAULT_BOLD);
         card.addView(mInstallTitle);
-        mInstallNote = text("Checking the installation...", 12, R.color.picker_muted);
+        mInstallNote = text(tr("install_note_checking", "Checking the installation..."), 12, R.color.picker_muted);
         card.addView(mInstallNote, matchWrap(dp(2)));
 
-        mExpand = button("Reinstall or add episodes", false);
+        mExpand = button(tr("btn_reinstall_episodes", "Reinstall or add episodes"), false);
         mExpand.setOnClickListener(v -> {
             mExpanded = true;
             refreshInstall();
@@ -515,9 +532,9 @@ public class LauncherActivity extends Activity {
         mInstallBody.addView(mSourceRows, matchWrap(0));
         for (int i = 0; i < SOURCE_LABELS.length; ++i) {
             final int index = i;
-            TextView label = text(SOURCE_LABELS[i], 14, R.color.picker_text);
+            TextView label = text(sourceLabel(i), 14, R.color.picker_text);
             mSourceRows.addView(label, matchWrap(dp(12)));
-            mSourceValues[i] = text("Not selected", 12, R.color.picker_muted);
+            mSourceValues[i] = text(tr("not_selected", "Not selected"), 12, R.color.picker_muted);
             mSourceRows.addView(mSourceValues[i], matchWrap(dp(2)));
             if (i == SOURCE_GAME) {
                 mInspectionText = text("", 12, R.color.picker_muted);
@@ -525,10 +542,10 @@ public class LauncherActivity extends Activity {
             }
             LinearLayout row = new LinearLayout(this);
             row.setOrientation(LinearLayout.HORIZONTAL);
-            Button choose = button("Choose file...", false);
+            Button choose = button(tr("btn_choose_file", "Choose file..."), false);
             choose.setOnClickListener(v -> chooseSource(index));
             row.addView(choose, new LinearLayout.LayoutParams(0, dp(44), 1f));
-            Button clear = button("Clear", false);
+            Button clear = button(tr("btn_clear", "Clear"), false);
             clear.setOnClickListener(v -> setSource(index, null));
             LinearLayout.LayoutParams clearParams = new LinearLayout.LayoutParams(dp(100), dp(44));
             clearParams.leftMargin = dp(10);
@@ -544,23 +561,24 @@ public class LauncherActivity extends Activity {
 
         LinearLayout actions = new LinearLayout(this);
         actions.setOrientation(LinearLayout.HORIZONTAL);
-        mInstall = button("Install", true);
+        mInstall = button(tr("btn_install", "Install"), true);
         mInstall.setOnClickListener(v -> startInstall());
         actions.addView(mInstall, new LinearLayout.LayoutParams(0, dp(52), 1f));
-        mCancelInstall = button("Cancel", false);
+        mCancelInstall = button(tr("btn_cancel", "Cancel"), false);
         mCancelInstall.setOnClickListener(v -> {
             Installer.cancel();
-            mProgressText.setText("Cancelling...");
+            mProgressText.setText(tr("btn_cancelling", "Cancelling..."));
         });
         LinearLayout.LayoutParams cancelParams = new LinearLayout.LayoutParams(dp(120), dp(52));
         cancelParams.leftMargin = dp(10);
         actions.addView(mCancelInstall, cancelParams);
         mInstallBody.addView(actions, matchWrap(dp(12)));
 
-        mInstallBody.addView(text("Files can be picked anywhere on the device storage or an "
+        mInstallBody.addView(text(String.format(tr("install_footer_note",
+                "Files can be picked anywhere on the device storage or an "
                 + "SD card (the app asks for file access once). Alternatively copy them into "
-                + "Android/data/" + getPackageName() + "/files/install/ - they are picked up "
-                + "automatically.", 12, R.color.picker_muted), matchWrap(dp(10)));
+                + "Android/data/%s/files/install/ - they are picked up "
+                + "automatically."), getPackageName()), 12, R.color.picker_muted), matchWrap(dp(10)));
         card.addView(mInstallBody, matchWrap(0));
         return card;
     }
@@ -568,10 +586,12 @@ public class LauncherActivity extends Activity {
     /** Re-reads the installation state and the install/ folder, then redraws. */
     private void refreshInstall() {
         if (!mInstallerReady) {
-            mInstallTitle.setText("Game");
-            mInstallNote.setText(Installer.loadError() == null ? "Checking the installation..."
-                    : "The installer is unavailable (" + Installer.loadError() + "). The game "
-                    + "installs itself on Play from the install/ folder.");
+            mInstallTitle.setText(tr("install_card_title", "Game"));
+            mInstallNote.setText(Installer.loadError() == null
+                    ? tr("install_note_checking", "Checking the installation...")
+                    : String.format(tr("install_note_unavailable",
+                            "The installer is unavailable (%s). The game installs itself on Play from the install/ folder."),
+                            Installer.loadError()));
             mExpand.setVisibility(View.GONE);
             mInstallBody.setVisibility(View.GONE);
             return;
@@ -593,21 +613,23 @@ public class LauncherActivity extends Activity {
 
     private void updateInstallViews(String reason) {
         boolean running = Installer.running();
-        mInstallTitle.setText(mInstalled ? "Game installed" : "Install the game");
+        mInstallTitle.setText(mInstalled
+                ? tr("install_card_title_installed", "Game installed")
+                : tr("install_card_title_install", "Install the game"));
         mInstallNote.setText(mInstalled
-                ? "GTA IV with Title Update 8 is installed and ready."
-                : "You need your own USA disc image and Title Update 8 (0.0.8.5)."
+                ? tr("install_note_ready", "GTA IV with Title Update 8 is installed and ready.")
+                : tr("install_note_need_iso", "You need your own USA disc image and Title Update 8 (0.0.8.5).")
                         + (reason != null && !reason.equals("not installed")
                         && new File(Installer.installRoot(mDataRoot), "game").exists()
-                        ? "\nCurrent installation: " + reason : ""));
+                        ? tr("install_note_current", "\nCurrent installation: ") + reason : ""));
         boolean showBody = !mInstalled || mExpanded || running;
         mExpand.setVisibility(showBody ? View.GONE : View.VISIBLE);
         mInstallBody.setVisibility(showBody ? View.VISIBLE : View.GONE);
         for (int i = 0; i < SOURCE_LABELS.length; ++i) {
-            mSourceValues[i].setText(mSources[i] != null ? mSources[i] : "Not selected");
+            mSourceValues[i].setText(mSources[i] != null ? mSources[i] : tr("not_selected", "Not selected"));
         }
         if (mInspecting) {
-            mInspectionText.setText("Checking the disc image...");
+            mInspectionText.setText(tr("disc_inspecting", "Checking the disc image..."));
             mInspectionText.setTextColor(0xFFFFC840);
         } else if (mInspection != null && mSources[SOURCE_GAME] != null) {
             mInspectionText.setText(mInspection.summary);
@@ -623,7 +645,7 @@ public class LauncherActivity extends Activity {
         boolean canInstall = !running && !mInspecting && (gameReady || episodesOnly);
         mInstall.setEnabled(canInstall);
         mInstall.setAlpha(canInstall ? 1f : 0.4f);
-        mInstall.setText(episodesOnly ? "Install episodes" : "Install");
+        mInstall.setText(episodesOnly ? tr("btn_install_episodes", "Install episodes") : tr("btn_install", "Install"));
         mCancelInstall.setVisibility(running ? View.VISIBLE : View.GONE);
         mSourceRows.setVisibility(running ? View.GONE : View.VISIBLE);
         mInstall.setVisibility(running ? View.GONE : View.VISIBLE);
@@ -679,13 +701,14 @@ public class LauncherActivity extends Activity {
     private void chooseSource(int index) {
         if (!Installer.hasFileAccess(this)) {
             new AlertDialog.Builder(this)
-                    .setTitle("Allow file access")
-                    .setMessage("To read the game files from anywhere on this device, Liberty "
+                    .setTitle(tr("install_perm_title", "Allow file access"))
+                    .setMessage(String.format(tr("install_perm_message",
+                            "To read the game files from anywhere on this device, Liberty "
                             + "Recompiled needs access to all files. Android opens the setting "
                             + "next; enable it and come back.\n\nWithout it, copy the files into "
-                            + "Android/data/" + getPackageName() + "/files/install/ instead.")
-                    .setPositiveButton("Open setting", (d, w) -> Installer.requestFileAccess(this, 2))
-                    .setNegativeButton("Cancel", null)
+                            + "Android/data/%s/files/install/ instead."), getPackageName()))
+                    .setPositiveButton(tr("install_perm_open", "Open setting"), (d, w) -> Installer.requestFileAccess(this, 2))
+                    .setNegativeButton(tr("btn_cancel", "Cancel"), null)
                     .show();
             return;
         }
@@ -695,7 +718,7 @@ public class LauncherActivity extends Activity {
         try {
             startActivityForResult(intent, REQUEST_SOURCE + index);
         } catch (Exception e) {
-            toast("No file picker is available on this device.");
+            toast(tr("toast_no_picker", "No file picker is available on this device."));
         }
     }
 
@@ -717,7 +740,7 @@ public class LauncherActivity extends Activity {
         boolean episodesOnly = mSources[SOURCE_GAME] == null;
         if (!Installer.start(mSources[SOURCE_GAME], mSources[SOURCE_UPDATE], mSources[SOURCE_TLAD],
                 mSources[SOURCE_TBOGT], mDataRoot)) {
-            toast("An installation is already running.");
+            toast(tr("install_toast_running", "An installation is already running."));
             return;
         }
         Log.i(TAG, "installation started" + (episodesOnly ? " (episodes only)" : ""));
@@ -729,19 +752,19 @@ public class LauncherActivity extends Activity {
     private void showInstallProgress() {
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         updateInstallViews(null);
-        mInstallTitle.setText("Installing...");
-        mInstallNote.setText("Keep the app open. This takes several minutes.");
+        mInstallTitle.setText(tr("installing_title", "Installing..."));
+        mInstallNote.setText(tr("installing_keep_open", "Keep the app open. This takes several minutes."));
         long[] progress = Installer.progress();
         long copied = progress[0];
         long total = progress[1];
         mProgress.setProgress(total > 0 ? (int) Math.min(1000, copied * 1000 / total) : 0);
         mProgressText.setText(total > 0
-                ? String.format(Locale.ROOT, "%.1f of %.1f GB (%d%%)", copied / 1e9, total / 1e9,
+                ? String.format(Locale.ROOT, tr("install_progress_bytes", "%.1f of %.1f GB (%d%%)"), copied / 1e9, total / 1e9,
                 copied * 100 / total)
-                : "Checking the sources...");
+                : tr("checking_sources", "Checking the sources..."));
         mStatus.setText(total > 0
-                ? String.format(Locale.ROOT, "Installing the game... %d%%", copied * 100 / total)
-                : "Installing the game...");
+                ? String.format(Locale.ROOT, tr("install_status_progress", "Installing the game... %d%%"), copied * 100 / total)
+                : tr("install_status_generic", "Installing the game..."));
         if (Installer.running()) {
             mMain.postDelayed(this::showInstallProgress, 300);
             return;
@@ -749,7 +772,7 @@ public class LauncherActivity extends Activity {
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         String result = Installer.takeResult();
         if (result != null && result.isEmpty()) {
-            toast("Installation complete. Press Play.");
+            toast(tr("install_complete_toast", "Installation complete. Press Play."));
             Arrays.fill(mSources, null);
             mInspection = null;
             mExpanded = false;
@@ -758,9 +781,9 @@ public class LauncherActivity extends Activity {
         } else {
             if (result != null) {
                 new AlertDialog.Builder(this)
-                        .setTitle("Installation failed")
+                        .setTitle(tr("install_failed_title", "Installation failed"))
                         .setMessage(result)
-                        .setPositiveButton("OK", null)
+                        .setPositiveButton(tr("btn_ok", "OK"), null)
                         .show();
             }
             refreshInstall();
@@ -779,10 +802,10 @@ public class LauncherActivity extends Activity {
         mDrivers.clearCheck();
         mDrivers.removeAllViews();
         mDriverModes.clear();
-        addDriver(DriverBridge.TURNIP, "Turnip 26.3.0-R6 (bundled)",
-                "Recommended for Adreno 6xx/7xx");
-        addDriver(DriverBridge.SYSTEM, "System driver",
-                "The device's own Vulkan driver (needs Vulkan 1.2)");
+        addDriver(DriverBridge.TURNIP, tr("driver_turnip_name", "Turnip 26.3.0-R6 (bundled)"),
+                tr("driver_turnip_desc", "Recommended for Adreno 6xx/7xx"));
+        addDriver(DriverBridge.SYSTEM, tr("driver_system_name", "System driver"),
+                tr("driver_system_desc", "The device's own Vulkan driver (needs Vulkan 1.2)"));
         File[] packages = customRoot().listFiles();
         if (packages != null) {
             Arrays.sort(packages);
@@ -790,11 +813,11 @@ public class LauncherActivity extends Activity {
                 if (!dir.isDirectory() || dir.getName().startsWith(".") || !hasLibrary(dir)) continue;
                 JSONObject meta = readMeta(dir);
                 String name = meta != null ? meta.optString("name", dir.getName()) : dir.getName();
-                String details = meta == null ? "Imported driver" : join(
+                String details = meta == null ? tr("driver_imported_desc", "Imported driver") : join(
                         meta.optString("description"), meta.optString("driverVersion"),
                         meta.optString("author").isEmpty() ? "" : "by " + meta.optString("author"));
                 addDriver(DriverBridge.CUSTOM_PREFIX + dir.getName(), name,
-                        details.isEmpty() ? "Imported driver" : details);
+                        details.isEmpty() ? tr("driver_imported_desc", "Imported driver") : details);
             }
         }
         int index = mDriverModes.indexOf(current);
@@ -856,7 +879,7 @@ public class LauncherActivity extends Activity {
             out.write((mode + "\n").getBytes(StandardCharsets.UTF_8));
         } catch (IOException e) {
             Log.e(TAG, "writing driver.txt failed", e);
-            toast("Could not save the driver choice: " + e.getMessage());
+            toast(tr("driver_save_error", "Could not save the driver choice: ") + e.getMessage());
         }
     }
 
@@ -869,7 +892,7 @@ public class LauncherActivity extends Activity {
         deleteRecursively(dir);
         writeDriverMode(DriverBridge.TURNIP);
         refreshDrivers();
-        toast("Driver removed. Using the bundled Turnip.");
+        toast(tr("driver_removed_toast", "Driver removed. Using the bundled Turnip."));
     }
 
     @SuppressWarnings("deprecation")
@@ -882,7 +905,7 @@ public class LauncherActivity extends Activity {
         try {
             startActivityForResult(intent, REQUEST_DRIVER_ZIP);
         } catch (Exception e) {
-            toast("No file picker is available on this device.");
+            toast(tr("toast_no_picker", "No file picker is available on this device."));
         }
     }
 
@@ -901,16 +924,16 @@ public class LauncherActivity extends Activity {
             return;
         }
         Uri uri = data.getData();
-        setBusy(true, "Importing driver...");
+        setBusy(true, tr("driver_importing_busy", "Importing driver..."));
         new Thread(() -> {
             String message;
             String mode = null;
             try {
                 mode = importDriver(uri);
-                message = "Driver imported and selected.";
+                message = tr("driver_imported_toast", "Driver imported and selected.");
             } catch (IOException | RuntimeException e) {
                 Log.e(TAG, "driver import failed", e);
-                message = "Import failed: " + e.getMessage();
+                message = tr("driver_import_failed", "Import failed: ") + e.getMessage();
             }
             final String finalMessage = message;
             final String finalMode = mode;
@@ -1042,7 +1065,111 @@ public class LauncherActivity extends Activity {
         return getSharedPreferences(PERF_PREFERENCES, Context.MODE_PRIVATE);
     }
 
+    private String legacyPerfSummary() {
+        android.content.SharedPreferences perf = perfTestPreferences();
+        int activeCount = 0;
+        if (perf.getBoolean(PERF_HALF_DRAW_DISTANCE, false)) activeCount++;
+        if (perf.getBoolean(PERF_SHADOWS_OFF, false)) activeCount++;
+        if (perf.getBoolean(PERF_GPU_TURBO, false)) activeCount++;
+        if (perf.getBoolean(PERF_SUSTAINED, false)) activeCount++;
+        if (perf.getBoolean(PERF_THERMAL_GUARD, false)) activeCount++;
+        if (perf.getBoolean(PERF_SAFE_MODE, false)) activeCount++;
+        if (perf.getInt(PERF_WATER_REFLECTIONS, 1) != 1) activeCount++;
+        if (perf.getInt(PERF_OTHER_REFLECTIONS, 1) != 1) activeCount++;
+
+        if (activeCount > 0) {
+            return String.format(Locale.getDefault(),
+                    tr("legacy_perf_summary_active", "Legacy graphic hacks: Active (%d)"),
+                    activeCount);
+        }
+        return tr("legacy_perf_summary_default", "Legacy graphic hacks (draw distance 0.5, shadows...)");
+    }
+
     private void showPerformanceTestSettings() {
+        android.app.Dialog dialog = new android.app.Dialog(this);
+        dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
+
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(18), dp(14), dp(18), dp(14));
+        card.setBackground(rounded(color(R.color.picker_card), dp(10)));
+
+        TextView title = text(tr("perf_title", "Performance test settings"), 18, R.color.picker_text);
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        card.addView(title);
+        // The warning is folded under an "Important" spoiler; A / tap opens it.
+        TextView warning = text(tr("perf_warning", "WARNING: For lower-end devices and endorsed ONLY for testing. "
+                + "Visuals will break. If you have stable 30fps please don't touch it, or your game will look like "
+                + "a potato with tons of other visual bugs and crashes. Issues made with any of these settings "
+                + "will be closed on GitHub. You have been warned, have fun then:"),
+                12, R.color.picker_error);
+        warning.setVisibility(View.GONE);
+        String importantLabel = tr("perf_important", "Important — read before changing anything");
+        TextView important = text("▸ " + importantLabel, 14, R.color.picker_error);
+        important.setTypeface(Typeface.DEFAULT_BOLD);
+        important.setPadding(dp(6), dp(8), dp(6), dp(8));
+        important.setBackground(focusBackground(Color.TRANSPARENT));
+        important.setFocusable(true);
+        important.setOnClickListener(v -> {
+            boolean open = warning.getVisibility() != View.VISIBLE;
+            warning.setVisibility(open ? View.VISIBLE : View.GONE);
+            important.setText((open ? "▾ " : "▸ ") + importantLabel);
+        });
+        card.addView(important, matchWrap(dp(4)));
+        card.addView(warning, matchWrap(dp(2)));
+
+        // 1. Placement of the game's threads on CPU cores
+        Button threadPlacement = button(ThreadAffinityDialog.summary(this), false);
+        threadPlacement.setOnClickListener(v -> new ThreadAffinityDialog(this,
+                () -> threadPlacement.setText(ThreadAffinityDialog.summary(this))).show());
+        LinearLayout.LayoutParams threadParams =
+                new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44));
+        threadParams.topMargin = dp(8);
+        card.addView(threadPlacement, threadParams);
+
+        // 2. Args.txt tweaks
+        Button argsTweaks = button(ArgsTweaksDialog.summary(this), false);
+        argsTweaks.setOnClickListener(v -> new ArgsTweaksDialog(this,
+                () -> argsTweaks.setText(ArgsTweaksDialog.summary(this))).show());
+        LinearLayout.LayoutParams argsParams =
+                new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44));
+        argsParams.topMargin = dp(8);
+        card.addView(argsTweaks, argsParams);
+
+        // 3. Legacy graphic hacks & overrides
+        Button legacyTests = button(legacyPerfSummary(), false);
+        legacyTests.setOnClickListener(v -> showLegacyTestSettingsDialog(() -> {
+            legacyTests.setText(legacyPerfSummary());
+        }));
+        LinearLayout.LayoutParams legacyParams =
+                new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44));
+        legacyParams.topMargin = dp(8);
+        card.addView(legacyTests, legacyParams);
+
+        // Close button
+        LinearLayout buttons = new LinearLayout(this);
+        buttons.setOrientation(LinearLayout.HORIZONTAL);
+        buttons.setGravity(Gravity.END);
+        Button close = button(tr("btn_close", "Close"), true);
+        LinearLayout.LayoutParams closeParams = new LinearLayout.LayoutParams(dp(120), dp(44));
+        buttons.addView(close, closeParams);
+        card.addView(buttons, matchWrap(dp(14)));
+
+        close.setOnClickListener(v -> dialog.dismiss());
+
+        dialog.setContentView(card);
+        android.view.Window window = dialog.getWindow();
+        if (window != null) {
+            window.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
+            android.util.DisplayMetrics metrics = getResources().getDisplayMetrics();
+            window.setLayout(Math.min(dp(560), (int) (metrics.widthPixels * 0.9f)),
+                    ViewGroup.LayoutParams.WRAP_CONTENT);
+        }
+        dialog.show();
+        close.requestFocus();
+    }
+
+    private void showLegacyTestSettingsDialog(Runnable onSaved) {
         android.content.SharedPreferences perf = perfTestPreferences();
         android.app.Dialog dialog = new android.app.Dialog(this);
         dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
@@ -1052,52 +1179,52 @@ public class LauncherActivity extends Activity {
         card.setPadding(dp(18), dp(14), dp(18), dp(14));
         card.setBackground(rounded(color(R.color.picker_card), dp(10)));
 
-        TextView title = text("Performance test settings", 18, R.color.picker_text);
+        TextView title = text(tr("legacy_perf_title", "Legacy Graphic Hacks"), 18, R.color.picker_text);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         card.addView(title);
-        card.addView(text("WARNING!!! For lower-end devices and endorsed ONLY for testing. SHIT "
-                + "WILL BREAK, and by shit I mean almost all visuals. If you have stable 30fps "
-                + "please don't touch it, or your game will look like a potato, and a very ugly one "
-                + "a that with tons of other visual bugs and crashes. Issues made with any of these "
-                + "settings probably will be skipped on Github. You have been warned, have fun then:",
-                12, R.color.picker_error), matchWrap(dp(4)));
 
         LinearLayout panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
 
-        android.widget.CheckBox drawDistance = styledCheck("Draw distance 0.5",
-                "Fixed half draw distance; the dynamic draw distance is turned off.",
+        android.widget.CheckBox drawDistance = styledCheck(
+                tr("chk_draw_dist_title", "Draw distance 0.5"),
+                tr("chk_draw_dist_note", "Fixed half draw distance; the dynamic draw distance is turned off."),
                 perf.getBoolean(PERF_HALF_DRAW_DISTANCE, false));
         panel.addView(drawDistance, matchWrap(dp(10)));
-        android.widget.CheckBox shadows = styledCheck("Sun shadows off",
-                "Nothing casts a sun shadow; the shadow map is not drawn.",
+        android.widget.CheckBox shadows = styledCheck(
+                tr("chk_shadows_title", "Sun shadows off"),
+                tr("chk_shadows_note", "Nothing casts a sun shadow; the shadow map is not drawn."),
                 perf.getBoolean(PERF_SHADOWS_OFF, false));
         panel.addView(shadows, matchWrap(dp(4)));
-        android.widget.CheckBox turbo = styledCheck("GPU turbo",
-                "Keeps the Adreno GPU at its highest clock. More heat and battery use.",
+        android.widget.CheckBox turbo = styledCheck(
+                tr("chk_turbo_title", "GPU turbo"),
+                tr("chk_turbo_note", "Keeps the Adreno GPU at its highest clock. More heat and battery use."),
                 perf.getBoolean(PERF_GPU_TURBO, false));
         panel.addView(turbo, matchWrap(dp(4)));
-        android.widget.CheckBox sustained = styledCheck("Sustained performance mode",
-                "Asks Android for steady clocks the device can hold without throttling "
-                        + "(where supported). Cooler, but the peak speed may be lower.",
+        android.widget.CheckBox sustained = styledCheck(
+                tr("chk_sustained_title", "Sustained performance mode"),
+                tr("chk_sustained_note", "Asks Android for steady clocks the device can hold without throttling "
+                        + "(where supported). Cooler, but the peak speed may be lower."),
                 perf.getBoolean(PERF_SUSTAINED, false));
         panel.addView(sustained, matchWrap(dp(4)));
-        android.widget.CheckBox thermalGuard = styledCheck("Thermal guard",
-                "Lowers the draw distance before the device starts throttling and restores it "
-                        + "after it has cooled down.",
+        android.widget.CheckBox thermalGuard = styledCheck(
+                tr("chk_thermal_title", "Thermal guard"),
+                tr("chk_thermal_note", "Lowers the draw distance before the device starts throttling and restores it "
+                        + "after it has cooled down."),
                 perf.getBoolean(PERF_THERMAL_GUARD, false));
         panel.addView(thermalGuard, matchWrap(dp(4)));
-        android.widget.CheckBox safeMode = styledCheck("Safe mode (for bug reports)",
-                "Turns off the port's speed shortcuts and gameplay tweaks. Slower. If a bug is "
-                        + "gone in safe mode, mention it in your issue.",
+        android.widget.CheckBox safeMode = styledCheck(
+                tr("chk_safemode_title", "Safe mode (for bug reports)"),
+                tr("chk_safemode_note", "Turns off the port's speed shortcuts and gameplay tweaks. Slower. If a bug is "
+                        + "gone in safe mode, mention it in your issue."),
                 perf.getBoolean(PERF_SAFE_MODE, false));
         panel.addView(safeMode, matchWrap(dp(4)));
 
-        RadioGroup water = intervalChoice(panel, "Water reflections",
+        RadioGroup water = intervalChoice(panel, tr("refl_water_title", "Water reflections"),
                 perf.getInt(PERF_WATER_REFLECTIONS, 1), 1000);
-        RadioGroup other = intervalChoice(panel, "Other reflections (cars, windows)",
+        RadioGroup other = intervalChoice(panel, tr("refl_other_title", "Other reflections (cars, windows)"),
                 perf.getInt(PERF_OTHER_REFLECTIONS, 1), 2000);
-        panel.addView(text("Off: the surface shows a plain colour instead of a reflection.",
+        panel.addView(text(tr("refl_off_note", "Off: the surface shows a plain colour instead of a reflection."),
                 12, R.color.picker_muted), matchWrap(dp(4)));
 
         ScrollView scroll = new ScrollView(this);
@@ -1108,8 +1235,8 @@ public class LauncherActivity extends Activity {
         LinearLayout buttons = new LinearLayout(this);
         buttons.setOrientation(LinearLayout.HORIZONTAL);
         buttons.setGravity(Gravity.END);
-        Button cancel = button("Cancel", false);
-        Button save = button("Save", true);
+        Button cancel = button(tr("btn_cancel", "Cancel"), false);
+        Button save = button(tr("btn_save", "Save"), true);
         LinearLayout.LayoutParams cancelParams = new LinearLayout.LayoutParams(dp(120), dp(44));
         LinearLayout.LayoutParams saveParams = new LinearLayout.LayoutParams(dp(120), dp(44));
         saveParams.leftMargin = dp(10);
@@ -1129,6 +1256,7 @@ public class LauncherActivity extends Activity {
                     .putInt(PERF_WATER_REFLECTIONS, checkedInterval(water, 1000))
                     .putInt(PERF_OTHER_REFLECTIONS, checkedInterval(other, 2000))
                     .apply();
+            if (onSaved != null) onSaved.run();
             dialog.dismiss();
         });
 
@@ -1170,7 +1298,7 @@ public class LauncherActivity extends Activity {
         heading.setTypeface(Typeface.DEFAULT_BOLD);
         panel.addView(heading, matchWrap(dp(14)));
         RadioGroup group = new RadioGroup(this);
-        String[] labels = {"Every frame", "Every 2nd frame", "Every 3rd frame", "Off"};
+        String[] labels = {tr("opt_every_frame", "Every frame"), tr("opt_every_2nd", "Every 2nd frame"), tr("opt_every_3rd", "Every 3rd frame"), tr("opt_off", "Off")};
         int[] intervals = {1, 2, 3, 0};
         for (int i = 0; i < labels.length; ++i) {
             RadioButton choice = new RadioButton(this);
@@ -1198,14 +1326,14 @@ public class LauncherActivity extends Activity {
     private void play(boolean debugLog) {
         if (mBusy) return;
         if (Installer.running()) {
-            toast("The game is being installed.");
+            toast(tr("toast_install_running", "The game is being installed."));
             return;
         }
         if (mInstallerReady && !mInstalled) {
-            toast("Install the game first (Game panel on the right).");
+            toast(tr("toast_install_first", "Install the game first (Game panel on the right)."));
             return;
         }
-        setBusy(true, "Starting...");
+        setBusy(true, tr("toast_game_busy", "Starting..."));
         new Thread(() -> {
             // A game process from an earlier session keeps the driver it
             // started with; end it so this launch uses the current choice.
@@ -1228,9 +1356,26 @@ public class LauncherActivity extends Activity {
                         perf.getInt(PERF_WATER_REFLECTIONS, 1));
                 intent.putExtra(LibertyActivity.EXTRA_OTHER_REFLECTION_INTERVAL,
                         perf.getInt(PERF_OTHER_REFLECTIONS, 1));
+                String affinitySpec = ThreadAffinityDialog.buildLaunchSpec(this);
+                Log.i(TAG, "affinity spec=" + affinitySpec);
+                intent.putExtra(ThreadAffinityDialog.EXTRA_SPEC, affinitySpec);
+                writeLaunchTicket(intent);
                 startActivity(intent);
             });
         }, "LaunchGame").start();
+    }
+
+    /**
+     * The same extras for LibertyActivity, written synchronously before startActivity():
+     * after stopGameProcess() the system recreates the game activity with the intent it
+     * was first started with (see LibertyActivity.launchIntent).
+     */
+    private void writeLaunchTicket(Intent intent) {
+        boolean saved = getSharedPreferences(LibertyActivity.LAUNCH_TICKET, Context.MODE_PRIVATE).edit()
+                .putString("intent", intent.toUri(Intent.URI_INTENT_SCHEME))
+                .putLong("time", System.currentTimeMillis())
+                .commit();
+        if (!saved) Log.w(TAG, "launch ticket not saved; the game may start with older settings");
     }
 
     private void stopGameProcess() {
@@ -1274,7 +1419,7 @@ public class LauncherActivity extends Activity {
                 }
                 case KeyEvent.KEYCODE_BUTTON_B:
                     if (Installer.running()) {
-                        toast("The game is being installed.");
+                        toast(tr("toast_install_running", "The game is being installed."));
                     } else {
                         finish();
                     }

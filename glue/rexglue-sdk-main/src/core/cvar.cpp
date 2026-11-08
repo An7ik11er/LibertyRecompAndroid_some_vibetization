@@ -25,6 +25,10 @@
 
 #include <toml++/toml.hpp>
 
+    #if defined(__ANDROID__)
+    #include <android/log.h>
+    #endif
+
 namespace rex::cvar {
 
 namespace {
@@ -567,22 +571,34 @@ std::vector<std::string> Init(int argc, char** argv) {
             if (SetFlagByName(name, value)) GetCommandLineValuesStorage()[name] = value;
           },
           entry.description);
-    } else {
-      app.add_option_function<std::string>(
-          "--" + entry.name, [name = entry.name](const std::string& value) {
-            if (SetFlagByName(name, value)) GetCommandLineValuesStorage()[name] = value;
-          },
-          entry.description);
-    }
-  }
+} else {
+          app.add_option_function<std::string>(
+                 "--" + entry.name, [name = entry.name](const std::string& value) {
+                   if (SetFlagByName(name, value)) GetCommandLineValuesStorage()[name] = value;
+                 },
+                 entry.description)
+              // Повтор строки в args.txt: берётся последняя. По умолчанию CLI11 бросает
+              // исключение, и все опции после неё молча остаются без значений.
+              ->multi_option_policy(CLI::MultiOptionPolicy::TakeLast);
+        }
+      }
 
-  try {
-    app.parse(argc, argv);
-  } catch (const CLI::ParseError& e) {
-    // TODO(tomc): dumb workaround for the stupid chicken and its egg.
-    //             dont call rex logging funcs here for now.
-    fprintf(stderr, "cvar: CLI11  parse error: %s\n", e.what());
-  }
+      try {
+        app.parse(argc, argv);
+      } catch (const CLI::ParseError& e) {
+        // TODO(tomc): dumb workaround for the stupid chicken and its egg.
+        //             dont call rex logging funcs here for now.
+        fprintf(stderr, "cvar: CLI11  parse error: %s\n", e.what());
+    #if defined(__ANDROID__)
+        // stderr на Android никуда не попадает.
+        __android_log_print(ANDROID_LOG_ERROR, "rex-cvar", "CLI11 parse error: %s", e.what());
+    #endif
+      }
+    #if defined(__ANDROID__)
+      __android_log_print(ANDROID_LOG_INFO, "rex-cvar",
+                          "command line: %d args, %zu applied now, %zu left for late modules",
+                          argc - 1, GetCommandLineValuesStorage().size(), app.remaining().size());
+    #endif
 
   // Stash unrecognized --options for cvars that register later. Supported
   // forms: --name=value, --name (true), --no-name (false); a separated

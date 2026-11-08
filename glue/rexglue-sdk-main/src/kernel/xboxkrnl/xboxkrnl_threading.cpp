@@ -13,15 +13,23 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(__ANDROID__) || defined(__linux__)
+#include <linux/futex.h>
 #include <pthread.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <cstdio>
+#include <ctime>
 #endif
 
 #include <rex/chrono/clock.h>
@@ -45,14 +53,97 @@
 #include <rex/system/xtypes.h>
 #include <rex/thread/atomic.h>
 #include <rex/thread/mutex.h>
-
-REXCVAR_DEFINE_UINT32(kernel_spinlock_spins, 64, "Kernel",
+// с 16 на 8 kernel_spinlock_spins
+REXCVAR_DEFINE_UINT32(kernel_spinlock_spins, 8, "Kernel",
                       "Rounds a contended guest spinlock waits on the CPU (watching the lock "
                       "word) before it starts giving up its time slice; 0 yields at once");
+// Experimental, off by default: in contention tests polling with short sleeps (now accurate
+// thanks to the 1 us timer slack in threading_posix.cpp) won over futex wake-ups. A/B on device.
+REXCVAR_DEFINE_BOOL(kernel_spinlock_futex, false, "Kernel",
+                    "After spinning and yielding, a contended guest spinlock sleeps until the "
+                    "owner releases it (futex) instead of polling with 50 us sleeps");
+
+// Package 39 (job-queue probe): an optional observer of guest waits made by Main XThread.
+// The title sets it at start-up (gta4-recomp src/android/android_job_probe.cpp); while it is
+// null every wait entry pays one relaxed load. phase 0 = wait begins (returns a token, 0 means
+// "not interested"), phase 1 = wait ended (receives that token).
+extern "C" {
+typedef uint64_t (*RexGuestWaitObserverFn)(int phase, uint64_t token);
+// Exported: librexruntime.so defines it, libmain.so (the title) sets it.
+__attribute__((visibility("default"))) RexGuestWaitObserverFn rex_guest_wait_observer = nullptr;
+// Package 40 (C3 step 2, work-helping): before Main XThread blocks without a timeout, the
+// title may run one queued RAGE job on this thread (returns 1) or decline (0). It gets the
+// thread's PPCContext and must leave it exactly as it found it.
+typedef int (*RexGuestWaitHelperFn)(void* ppc_context);
+__attribute__((visibility("default"))) RexGuestWaitHelperFn rex_guest_wait_helper = nullptr;
+}
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 using rex::runtime::current_ppc_context;
+
+namespace {
+bool CurrentThreadIsMainXThread() {
+  // -1 unknown, 0 no, 1 yes. Decided once per host thread, after the name is set.
+  thread_local int8_t is_main = -1;
+  if (is_main < 0) {
+    XThread* thread = XThread::GetCurrentThread();
+    if (!thread) return false;
+    // XObject::name() is empty for threads; the name lives on the host thread (fix from the
+    // 40 test run, by the user).
+    rex::thread::Thread* host_thread = thread->thread();
+    if (!host_thread) return false;
+    const std::string& name = host_thread->name();
+    if (name.empty()) return false;
+    is_main = name.rfind("Main XThread", 0) == 0 ? 1 : 0;
+  }
+  return is_main == 1;
+}
+
+struct MainWaitObservation {
+  RexGuestWaitObserverFn fn = nullptr;
+  uint64_t token = 0;
+  MainWaitObservation() {
+    RexGuestWaitObserverFn f = __atomic_load_n(&rex_guest_wait_observer, __ATOMIC_ACQUIRE);
+    if (f && CurrentThreadIsMainXThread()) {
+      fn = f;
+      token = f(0, 0);
+    }
+  }
+  ~MainWaitObservation() {
+    if (fn && token) fn(1, token);
+  }
+  MainWaitObservation(const MainWaitObservation&) = delete;
+  MainWaitObservation& operator=(const MainWaitObservation&) = delete;
+};
+
+// Package 40: an infinite wait of Main XThread first polls the objects; while the poll times
+// out and the title's helper runs a queued job, it polls again. A successful poll is a
+// successful wait (it consumes an auto-reset event, a semaphore count or a mutant exactly as
+// the blocking wait would). Waits with a timeout, and all other threads, go straight through.
+constexpr X_STATUS kWaitPollTimeout = X_STATUS(0x00000102);  // STATUS_TIMEOUT
+constexpr uint32_t kMaxHelpedJobsPerWait = 256;
+
+template <typename WaitFn>
+X_STATUS WaitHelpingJobs(uint64_t* timeout, WaitFn&& wait) {
+  if (!timeout) {
+    RexGuestWaitHelperFn helper = __atomic_load_n(&rex_guest_wait_helper, __ATOMIC_ACQUIRE);
+    if (helper && CurrentThreadIsMainXThread()) {
+      for (uint32_t round = 0; round < kMaxHelpedJobsPerWait; ++round) {
+        uint64_t zero_timeout = 0;
+        const X_STATUS polled = wait(&zero_timeout);
+        if (polled != kWaitPollTimeout) {
+          return polled;
+        }
+        if (!helper(current_ppc_context())) {
+          break;
+        }
+      }
+    }
+  }
+  return wait(timeout);
+}
+}  // namespace
 
 // r13 + 0x100: pointer to thread local state
 // Thread local state:
@@ -396,8 +487,14 @@ u32 KeQueryPerformanceFrequency_entry() {
   return static_cast<uint32_t>(result);
 }
 
+namespace {
+void NoteSleepZero();  // defined with the wait counters below
+}
+
 u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 interval_ptr) {
   XThread* thread = XThread::GetCurrentThread();
+  // Sleep(0) loops ("while (!ready) Sleep(0);") burn a core and were invisible in the log.
+  if (uint64_t(*interval_ptr) == 0) NoteSleepZero();
 
   if (alertable) {
     thread->DeliverAPCs();
@@ -414,14 +511,44 @@ u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 i
 
 namespace {
 
-// Per-thread yield counts for TakeYieldCountSummary. A thread's counter is
-// created on its first yield and kept for the process lifetime (threads that
-// yield are few), so the summary never races a thread's exit.
+// Cheap wait timer. arm64: the ARM generic counter (CNTVCT_EL0), readable from user space,
+// the same on every core, ~52 ns per tick on Snapdragon. Elsewhere: steady_clock in ns.
+inline uint64_t WaitTicks() {
+#if defined(__aarch64__)
+  uint64_t value;
+  __asm__ __volatile__("isb\n\tmrs %0, cntvct_el0" : "=r"(value)::"memory");
+  return value;
+#else
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+#endif
+}
+
+inline double WaitTicksToMs(uint64_t ticks) {
+#if defined(__aarch64__)
+  uint64_t frequency;
+  __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(frequency));
+  return frequency ? double(ticks) * 1000.0 / double(frequency) : 0.0;
+#else
+  return double(ticks) / 1e6;
+#endif
+}
+
+// Per-thread wait counts for TakeYieldCountSummary. A thread's counter is
+// created on its first yield / spin / Sleep(0) and kept for the process lifetime,
+// so the summary never races a thread's exit.
 struct YieldCounter {
-  std::atomic<uint64_t> yields{0};
-  std::atomic<uint64_t> spins{0};
+  std::atomic<uint64_t> yields{0};       // NtYieldExecution
+  std::atomic<uint64_t> spins{0};        // rounds waiting for a contended guest spinlock
+  std::atomic<uint64_t> spin_ticks{0};   // time spent in those waits (WaitTicks)
+  std::atomic<uint64_t> sleep0{0};       // KeDelayExecutionThread with a zero interval (Sleep(0))
   uint64_t reported_yields = 0;
   uint64_t reported_spins = 0;
+  uint64_t reported_spin_ticks = 0;
+  uint64_t reported_sleep0 = 0;
+  int tid = 0;
+  bool is_realtime = false;
   char name[16] = "?";
 };
 
@@ -432,6 +559,7 @@ YieldCounter& CurrentYieldCounter() {
   thread_local YieldCounter* counter = [] {
     auto* created = new YieldCounter();
 #if defined(__ANDROID__) || defined(__linux__)
+    created->tid = int(syscall(SYS_gettid));
     pthread_getname_np(pthread_self(), created->name, sizeof(created->name));
 #endif
     std::lock_guard lock(g_yield_counters_mutex);
@@ -441,13 +569,45 @@ YieldCounter& CurrentYieldCounter() {
   return *counter;
 }
 
+void NoteSleepZero() {
+  CurrentYieldCounter().sleep0.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Guest threads start as "XThreadXXXX" and are renamed (RenderGuest, RageStream...) a moment
+// later; a counter created in between would keep the old name. Re-read it from /proc
+// (never through pthread_t: the thread may have exited).
+void RefreshCounterName(YieldCounter* counter) {
+#if defined(__ANDROID__) || defined(__linux__)
+  if (!counter->tid) return;
+  char path[64];
+  std::snprintf(path, sizeof(path), "/proc/self/task/%d/comm", counter->tid);
+  if (FILE* f = std::fopen(path, "r")) {
+    char name[16] = {};
+    if (std::fgets(name, sizeof(name), f)) {
+      for (char& c : name)
+        if (c == '\n') c = '\0';
+      if (name[0]) {
+        std::memcpy(counter->name, name, sizeof(counter->name));
+        counter->is_realtime = std::strstr(counter->name, "Audio") != nullptr ||
+                               std::strstr(counter->name, "RenderGuest") != nullptr;
+      }
+    }
+    std::fclose(f);
+  }
+#endif
+}
+
 }  // namespace
 
+// Per thread: yields / spinlock rounds / ms waiting on spinlocks / Sleep(0) calls,
+// e.g. "RageStream=0/26246/12.3ms/z5100". Sorted by spinlock wait time.
 std::string TakeYieldCountSummary(size_t max_threads) {
   struct Delta {
-    const char* name;
+    std::string name;
     uint64_t yields;
     uint64_t spins;
+    uint64_t spin_ticks;
+    uint64_t sleep0;
   };
   std::vector<Delta> deltas;
   {
@@ -455,21 +615,33 @@ std::string TakeYieldCountSummary(size_t max_threads) {
     for (YieldCounter* counter : g_yield_counters) {
       const uint64_t yields = counter->yields.load(std::memory_order_relaxed);
       const uint64_t spins = counter->spins.load(std::memory_order_relaxed);
-      Delta delta{counter->name, yields - counter->reported_yields,
-                  spins - counter->reported_spins};
+      const uint64_t spin_ticks = counter->spin_ticks.load(std::memory_order_relaxed);
+      const uint64_t sleep0 = counter->sleep0.load(std::memory_order_relaxed);
+      Delta delta{{}, yields - counter->reported_yields, spins - counter->reported_spins,
+                  spin_ticks - counter->reported_spin_ticks, sleep0 - counter->reported_sleep0};
       counter->reported_yields = yields;
       counter->reported_spins = spins;
-      if (delta.yields || delta.spins) deltas.push_back(delta);
+      counter->reported_spin_ticks = spin_ticks;
+      counter->reported_sleep0 = sleep0;
+      if (delta.yields || delta.spins || delta.sleep0) {
+        RefreshCounterName(counter);
+        delta.name = counter->name;
+        deltas.push_back(std::move(delta));
+      }
     }
   }
   std::sort(deltas.begin(), deltas.end(), [](const Delta& a, const Delta& b) {
-    return a.yields + a.spins > b.yields + b.spins;
+    if (a.spin_ticks != b.spin_ticks) return a.spin_ticks > b.spin_ticks;
+    return a.yields + a.spins + a.sleep0 > b.yields + b.spins + b.sleep0;
   });
   std::string summary;
   for (size_t i = 0; i < deltas.size() && i < max_threads; ++i) {
     if (!summary.empty()) summary += ' ';
+    char ms[32];
+    std::snprintf(ms, sizeof(ms), "%.1fms", WaitTicksToMs(deltas[i].spin_ticks));
     summary += deltas[i].name;
-    summary += '=' + std::to_string(deltas[i].yields) + '/' + std::to_string(deltas[i].spins);
+    summary += '=' + std::to_string(deltas[i].yields) + '/' + std::to_string(deltas[i].spins) +
+               '/' + ms + "/z" + std::to_string(deltas[i].sleep0);
   }
   return summary;
 }
@@ -924,26 +1096,32 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
 
 u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 processor_mode,
                                 u32 alertable, mapped_u64 timeout_ptr) {
+  MainWaitObservation main_wait_observation;
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
   // REXKRNL_IMPORT_TRACE("KeWaitForSingleObject", "obj={:#x} reason={} mode={} alertable={}
   // timeout={}",
   // object_ptr.guest_address(), (uint32_t)wait_reason,
   //(uint32_t)processor_mode, (uint32_t)alertable,
   // timeout_ptr ? (int64_t)timeout : -1);
-  auto result = xeKeWaitForSingleObject(object_ptr, wait_reason, processor_mode, alertable,
-                                        timeout_ptr ? &timeout : nullptr);
+  auto result = WaitHelpingJobs(timeout_ptr ? &timeout : nullptr, [&](uint64_t* t) {
+    return X_STATUS(
+        xeKeWaitForSingleObject(object_ptr, wait_reason, processor_mode, alertable, t));
+  });
   // REXKRNL_IMPORT_RESULT("KeWaitForSingleObject", "{:#x}", result);
   return result;
 }
 
 u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertable,
                                   mapped_u64 timeout_ptr) {
+  MainWaitObservation main_wait_observation;
   X_STATUS result = X_STATUS_SUCCESS;
 
   auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
   if (object) {
     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
-    result = object->Wait(3, wait_mode, alertable, timeout_ptr ? &timeout : nullptr);
+    result = WaitHelpingJobs(timeout_ptr ? &timeout : nullptr, [&](uint64_t* t) {
+      return X_STATUS(object->Wait(3, wait_mode, alertable, t));
+    });
     if (alertable && result == X_STATUS_USER_APC) {
       XThread::GetCurrentThread()->DeliverAPCs();
     }
@@ -958,6 +1136,7 @@ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_t
                                    u32 wait_reason, u32 processor_mode, u32 alertable,
                                    mapped_u64 timeout_ptr, mapped_void wait_block_array_ptr) {
   assert_true(wait_type <= 1);
+  MainWaitObservation main_wait_observation;
 
   std::vector<object_ref<XObject>> objects;
   for (uint32_t n = 0; n < count; n++) {
@@ -971,9 +1150,11 @@ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_t
   }
 
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
-  X_STATUS result = XObject::WaitMultiple(
-      uint32_t(objects.size()), reinterpret_cast<XObject**>(objects.data()), wait_type, wait_reason,
-      processor_mode, alertable, timeout_ptr ? &timeout : nullptr);
+  X_STATUS result = WaitHelpingJobs(timeout_ptr ? &timeout : nullptr, [&](uint64_t* t) {
+    return X_STATUS(XObject::WaitMultiple(uint32_t(objects.size()),
+                                          reinterpret_cast<XObject**>(objects.data()), wait_type,
+                                          wait_reason, processor_mode, alertable, t));
+  });
   if (alertable && result == X_STATUS_USER_APC) {
     XThread::GetCurrentThread()->DeliverAPCs();
   }
@@ -995,8 +1176,10 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
     objects.push_back(std::move(object));
   }
 
-  auto result = XObject::WaitMultiple(count, reinterpret_cast<XObject**>(objects.data()), wait_type,
-                                      6, wait_mode, alertable, timeout_ptr);
+  auto result = WaitHelpingJobs(timeout_ptr, [&](uint64_t* t) {
+    return X_STATUS(XObject::WaitMultiple(count, reinterpret_cast<XObject**>(objects.data()),
+                                          wait_type, 6, wait_mode, alertable, t));
+  });
   if (alertable && result == X_STATUS_USER_APC) {
     XThread::GetCurrentThread()->DeliverAPCs();
   }
@@ -1005,6 +1188,7 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
 
 u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_type, u32 wait_mode,
                                      u32 alertable, mapped_u64 timeout_ptr) {
+  MainWaitObservation main_wait_observation;
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
   return xeNtWaitForMultipleObjectsEx(count, handles, wait_type, wait_mode, alertable,
                                       timeout_ptr ? &timeout : nullptr);
@@ -1012,6 +1196,7 @@ u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_typ
 
 u32 NtSignalAndWaitForSingleObjectEx_entry(u32 signal_handle, u32 wait_handle, u32 alertable,
                                            u32 r6, mapped_u64 timeout_ptr) {
+  MainWaitObservation main_wait_observation;
   X_STATUS result = X_STATUS_SUCCESS;
 
   auto signal_object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(signal_handle);
@@ -1030,6 +1215,42 @@ u32 NtSignalAndWaitForSingleObjectEx_entry(u32 signal_handle, u32 wait_handle, u
 
   return result;
 }
+
+// Parking for contended guest spinlocks. Waiters sleep on the lock word itself (futex);
+// the release in xeKeKfReleaseSpinLock wakes one of them. A small table of waiter counts
+// (by address) lets an uncontended release skip the syscall. The 1 ms timeout keeps a
+// waiter safe if some path ever frees a lock without going through the release below.
+namespace {
+std::array<std::atomic<uint32_t>, 64> g_spinlock_waiters{};
+
+inline std::atomic<uint32_t>& SpinlockWaiters(const volatile void* word) {
+  return g_spinlock_waiters[(reinterpret_cast<uintptr_t>(word) >> 2) & 63];
+}
+
+void SpinlockSleepUntilReleased(volatile uint32_t* word) {
+  std::atomic<uint32_t>& waiters = SpinlockWaiters(word);
+  waiters.fetch_add(1, std::memory_order_seq_cst);
+  const uint32_t owner = __atomic_load_n(word, __ATOMIC_SEQ_CST);
+  if (owner != 0) {
+#if defined(__ANDROID__) || defined(__linux__)
+    timespec timeout{0, 1000000};  // 1 ms
+    syscall(SYS_futex, word, FUTEX_WAIT_PRIVATE, owner, &timeout, nullptr, 0);
+#else
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
+#endif
+  }
+  waiters.fetch_sub(1, std::memory_order_seq_cst);
+}
+
+void SpinlockWakeWaiter(volatile uint32_t* word) {
+  // Orders the release store above against the waiter-count load (store -> load).
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  if (SpinlockWaiters(word).load(std::memory_order_relaxed) == 0) return;
+#if defined(__ANDROID__) || defined(__linux__)
+  syscall(SYS_futex, word, FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
+#endif
+}
+}  // namespace
 
 // Guest-memory IRQL helpers - read/write current_irql directly from PCR.
 // Take PPCContext* explicitly so they work from any thread (including host threads
@@ -1060,26 +1281,39 @@ uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool change_i
   // another core: watching the lock word for a while usually gets it without
   // a trip through the scheduler (sched_yield costs microseconds and can hand
   // the core to an unrelated thread). Past the budget the owner was most
-  // likely preempted, so give the core up as before.
-  YieldCounter& counter = CurrentYieldCounter();
+  // likely preempted (on a phone it can be off-core for milliseconds), so sleep
+  // until the release wakes us instead of polling.
+YieldCounter& counter = CurrentYieldCounter();
+  const uint64_t wait_begin = WaitTicks();
   uint32_t rounds = 0;
   const uint32_t spin_rounds = REXCVAR_GET(kernel_spinlock_spins);
-  do {
+  const bool use_futex = REXCVAR_GET(kernel_spinlock_futex);
+  for (;;) {
     counter.spins.fetch_add(1, std::memory_order_relaxed);
     if (rounds < spin_rounds) {
       ++rounds;
-      for (int i = 0; i < 32 && __atomic_load_n(&lock->prcb_of_owner.value, __ATOMIC_RELAXED);
+      for (int i = 0; i < 16 && __atomic_load_n(&lock->prcb_of_owner.value, __ATOMIC_RELAXED) != 0;
            ++i) {
 #if defined(__aarch64__)
-        __asm__ __volatile__("yield");
+        __asm__ __volatile__("isb" ::: "memory");
 #elif defined(__x86_64__) || defined(_M_X64)
         __builtin_ia32_pause();
 #endif
       }
+    } else if (rounds < spin_rounds + 4) {
+      ++rounds;
+      sched_yield();
+    } else if (use_futex) {
+      SpinlockSleepUntilReleased(&lock->prcb_of_owner.value);
     } else {
-      rex::thread::MaybeYield();
+      std::this_thread::sleep_for(std::chrono::microseconds(counter.is_realtime ? 10 : 50));
     }
-  } while (!rex::thread::atomic_cas(0u, self, &lock->prcb_of_owner.value));
+    if (__atomic_load_n(&lock->prcb_of_owner.value, __ATOMIC_RELAXED) == 0 &&
+        rex::thread::atomic_cas(0u, self, &lock->prcb_of_owner.value)) {
+      break;
+    }
+  }
+  counter.spin_ticks.fetch_add(WaitTicks() - wait_begin, std::memory_order_relaxed);
   return old_irql;
 }
 
@@ -1087,6 +1321,7 @@ void xeKeKfReleaseSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, uint32_t old_irql
                            bool change_irql) {
   assert_true(lock->prcb_of_owner == static_cast<uint32_t>(ctx->r13.u64));
   rex::thread::atomic_store_release(0u, &lock->prcb_of_owner.value);
+  SpinlockWakeWaiter(&lock->prcb_of_owner.value);
   if (change_irql && old_irql < IRQL_DISPATCH) {
     xeKfLowerIrql(ctx, static_cast<unsigned char>(old_irql));
   }

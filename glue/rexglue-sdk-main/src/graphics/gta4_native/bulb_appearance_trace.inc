@@ -142,7 +142,7 @@ bool Gta4NativeGraphicsSystem::PrepareBulbDraw(const NativeCommand& command, con
   if (!constants || !command.vertex_buffers[0]) return false;
   const auto& stream = command.pipeline_state->vertex_streams[0];
   DrawIndexedPrimitiveCommand draw{}; std::memcpy(&draw, command.bytes.data(), sizeof(draw));
-  const auto& fixed = command.fixed_function_state;
+  const auto& fixed = *command.fixed_function_state;
   const bool standard_viewport = std::bit_cast<float>(fixed.viewport_bits[0]) == 0 &&
       std::bit_cast<float>(fixed.viewport_bits[1]) == 0 &&
       std::bit_cast<float>(fixed.viewport_bits[2]) == float(target.logical_width) &&

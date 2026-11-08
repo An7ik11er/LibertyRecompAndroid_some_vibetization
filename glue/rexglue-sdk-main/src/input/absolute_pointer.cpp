@@ -49,8 +49,8 @@ bool HostInputAllowed() {
 }
 
 TouchControlsMode GetConfiguredTouchControlsMode() {
-  // The native menu can change this string while render/input threads read it.
-  const std::string mode = rex::cvar::GetFlagByName("touch_controls");
+  // Fast path: direct CVar reference avoids string allocation and hash lookup.
+  const std::string& mode = REXCVAR_GET(touch_controls);
   if (mode == "on") {
     return TouchControlsMode::kOn;
   }

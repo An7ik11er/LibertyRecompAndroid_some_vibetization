@@ -289,7 +289,10 @@ if(REXGLUE_USE_VULKAN)
     endif()
 
     add_library(rexgpu-gta4-native SHARED
+	gta4_native/sgsr_present_ps.h
+        gta4_native/sgsr_present_ps.inc
         gta4_native/graphics_system.cpp
+	gta4_native/frame_time_overlay.cpp
         gta4_native/core/font_atlas.cpp
         gta4_native/shader_override_policy.h
         gta4_native/native_buffer_arena.cpp

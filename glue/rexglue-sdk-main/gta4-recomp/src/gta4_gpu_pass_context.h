@@ -25,9 +25,23 @@ class ScopedFinalComposite {
 };
 inline std::atomic<bool> temporal_inputs{false};
 inline std::atomic<uint64_t> next_scope{1},unresolved_scopes{0},conflicting_scopes{0},oversized_envelopes{0};
+// 56: the diagnostics policy never changes once configured; asking it was a call into the
+// runtime library for every native command (part of gpu_pass::Submit's 0.22 ms of RenderGuest
+// per frame, 888 batch 54). Cached as CachedDiagnosticsEnabled does in the renderer.
+inline bool NativeProfilerEnabled(){
+  static std::atomic<int> cached{-1};
+  int value=cached.load(std::memory_order_relaxed);
+  if(value<0){
+    const bool enabled=rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeProfiler);
+    if(!rex::diagnostics::IsConfigured())return enabled;
+    value=enabled?1:0;
+    cached.store(value,std::memory_order_relaxed);
+  }
+  return value!=0;
+}
 inline bool Enabled(){
   static const bool markers=[] {const char* p=std::getenv("REX_GTA4_GPU_PASS_MARKERS");return p&&std::strcmp(p,"1")==0;}();
-  return temporal_inputs.load(std::memory_order_relaxed)||markers||rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeProfiler);
+  return temporal_inputs.load(std::memory_order_relaxed)||markers||NativeProfilerEnabled();
 }
 class ScopedExecutedList {
  public:

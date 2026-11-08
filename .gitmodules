@@ -1,39 +1,9 @@
 [submodule "thirdparty/ddspp"]
 	path = thirdparty/ddspp
 	url = https://github.com/redorav/ddspp.git
-[submodule "tools/SparkIV"]
-	path = tools/SparkIV
-	url = https://github.com/ahmed605/SparkIV.git
 [submodule "tools/XenosRecomp"]
 	path = tools/XenosRecomp
 	url = https://github.com/sonicnext-dev/XenosRecomp.git
-[submodule "tools/DLSS"]
-	path = tools/DLSS
-	url = https://github.com/NVIDIA/DLSS.git
-[submodule "tools/FidelityFX-SDK"]
-	path = tools/FidelityFX-SDK
-	url = https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git
-[submodule "tools/fsr1"]
-	path = tools/fsr1
-	url = https://github.com/GPUOpen-Effects/FidelityFX-FSR.git
-[submodule "tools/smaa"]
-	path = tools/smaa
-	url = https://github.com/iryoku/smaa.git
-[submodule "tools/extract-xiso"]
-	path = tools/extract-xiso
-	url = https://github.com/XboxDev/extract-xiso.git
-[submodule "tools/XexToolGUI"]
-	path = tools/XexToolGUI
-	url = https://github.com/XboxChef/XexToolGUI.git
-[submodule "tools/OpenOrbis-PS4-Toolchain"]
-	path = tools/OpenOrbis-PS4-Toolchain
-	url = https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain.git
-[submodule "tools/libnx"]
-	path = tools/libnx
-	url = https://github.com/switchbrew/libnx.git
-[submodule "tools/llvm-project-libcxx"]
-	path = tools/llvm-project-libcxx
-	url = https://github.com/llvm/llvm-project.git
 [submodule "thirdparty/msdf-atlas-gen"]
 	path = thirdparty/msdf-atlas-gen
 	url = https://github.com/Chlumsky/msdf-atlas-gen.git
@@ -74,21 +44,6 @@
 # [submodule "LibertyRecompResources"]
 # 	path = LibertyRecompResources
 # 	url = https://github.com/OZORDI/LibertyRecompResources
-[submodule "thirdparty/MoltenVK/MoltenVK"]
-	path = thirdparty/MoltenVK/MoltenVK
-	url = https://github.com/KhronosGroup/MoltenVK.git
-[submodule "thirdparty/MoltenVK/SPIRV-Cross"]
-	path = thirdparty/MoltenVK/SPIRV-Cross
-	url = https://github.com/KhronosGroup/SPIRV-Cross.git
-[submodule "thirdparty/plume"]
-	path = thirdparty/plume
-	url = https://github.com/renderbag/plume
-[submodule "thirdparty/ffmpeg-core"]
-	path = thirdparty/ffmpeg-core
-	url = https://github.com/sonicnext-dev/ffmpeg-core
-[submodule "thirdparty/GameNetworkingSockets"]
-	path = thirdparty/GameNetworkingSockets
-	url = https://github.com/ValveSoftware/GameNetworkingSockets.git
 [submodule "glue/rexglue-sdk-main/thirdparty/libmspack"]
 	path = glue/rexglue-sdk-main/thirdparty/libmspack
 	url = https://github.com/kyz/libmspack.git

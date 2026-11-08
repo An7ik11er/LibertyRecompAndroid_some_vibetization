@@ -13,7 +13,7 @@ void Gta4NativeGraphicsSystem::TracePhoneNativeCommand(std::string_view point,
                     command.type == CommandType::kDrawPrimitiveUp ||
                     command.type == CommandType::kDrawIndexedPrimitive;
   if (draw || command.type == CommandType::kClear) {
-    const auto& f = command.fixed_function_state;
+    const auto& f = *command.fixed_function_state;
     PhoneTraceLog("native-raster", fmt::format(
         "run={} event={} at={} viewport={:08X},{:08X},{:08X},{:08X},{:08X},{:08X} "
         "blend-words={:08X},{:08X},{:08X},{:08X} sample-mask={:08X} alpha-to-mask={:08X}",
@@ -33,13 +33,13 @@ void Gta4NativeGraphicsSystem::TracePhoneNativeCommand(std::string_view point,
         command.vertex_constants_hash, command.pixel_constants_hash));
     for (uint32_t i = 0; i < kRenderTargetCount; ++i) {
       const auto& surface = command.pipeline_state ? command.pipeline_state->render_targets[i]
-                                                   : command.snapshot_render_targets[i];
+                                                   : command.snapshot_targets->colors[i];
       PhoneTraceLog("native-attachment", fmt::format("run={} event={} at={} slot={} handle={:08X} address={:08X} size={}x{} format={} guest-samples={}",
           c.run, c.event, point, i, surface.handle, surface.address, surface.width,
           surface.height, surface.format, surface.sample_type));
     }
     const auto& depth = command.pipeline_state ? command.pipeline_state->depth_stencil
-                                              : command.snapshot_depth_stencil;
+                                              : command.snapshot_targets->depth;
     PhoneTraceLog("native-depth", fmt::format("run={} event={} at={} handle={:08X} address={:08X} size={}x{} format={} guest-samples={} stencil-write-mask={:08X}",
         c.run, c.event, point, depth.handle, depth.address, depth.width, depth.height,
         depth.format, depth.sample_type, f.stencil_write_mask));

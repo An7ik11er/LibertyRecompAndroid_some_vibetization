@@ -31,6 +31,8 @@
 #include <rex/thread.h>
 #include <rex/thread/atomic.h>
 
+#include <thread>
+
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 
@@ -386,7 +388,7 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
     cs->recursion_count++;
     return;
   }
-
+#if 0
   // Spin loop
   while (spin_count--) {
     if (rex::thread::atomic_cas(-1, 0, &cs->lock_count)) {
@@ -394,6 +396,27 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
       cs->owning_thread = cur_thread;
       cs->recursion_count = 1;
       return;
+    }
+  }
+#endif
+
+  // Spin loop — isb/pause so we do not peg the core; periodic yield if the
+  // guest asked for a huge spin_count (up to 255*256).
+  uint32_t spun = 0;
+  while (spin_count--) {
+    if (rex::thread::atomic_cas(-1, 0, &cs->lock_count)) {
+      // Acquired.
+      cs->owning_thread = cur_thread;
+      cs->recursion_count = 1;
+      return;
+    }
+#if defined(__aarch64__)
+    __asm__ __volatile__("isb" ::: "memory");
+#elif defined(__x86_64__) || defined(_M_X64)
+    __builtin_ia32_pause();
+#endif
+    if ((++spun & 63u) == 0u) {
+      std::this_thread::yield();
     }
   }
 

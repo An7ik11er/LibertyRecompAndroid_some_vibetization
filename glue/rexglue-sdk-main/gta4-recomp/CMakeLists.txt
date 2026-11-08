@@ -58,6 +58,7 @@ set(GTA4_APP_SOURCES
     src/input/context_touch_activity_context.cpp
     src/input/context_touch_activity_layout.cpp
     src/input/context_touch_overlay.cpp
+    src/debug/frame_time_dialog.cpp
     src/input/gamepad_touch_overlay.cpp
     src/gta4_touch_guest_hooks.cpp
     src/network/community_multiplayer.cpp
@@ -403,7 +404,8 @@ elseif(ANDROID)
         src/android/android_frame_wait_hook.cpp
         src/android/android_stale_object_guard.cpp
         src/android/android_thread_pinning.cpp
-        src/android/android_power.cpp)
+        src/android/android_power.cpp
+        src/android/android_job_probe.cpp)
     # The launcher's installer: the same source inspection and installation
     # code as the in-game installer dialog, without the rest of the title, so
     # the launcher process can install the game before it ever starts.

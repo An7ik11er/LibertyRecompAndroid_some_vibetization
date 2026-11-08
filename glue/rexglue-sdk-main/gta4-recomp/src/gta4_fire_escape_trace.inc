@@ -129,8 +129,11 @@ FireReplayState CaptureFireReplayState(uint8_t* base, uint32_t device) {
 bool SubmitFireTracedCommand(const void* bytes, size_t size, uint32_t device,
                             const FireTraceContext* captured = nullptr, uint32_t list = 0, uint32_t ordinal = 0,
                             const FireReplayState* replay_live = nullptr, const FireReplayState* replay_applied = nullptr) {
+  // 56: the configuration first. The context copy (a thread_local read and a large struct)
+  // ran for every native command with the trace off: 0.21 ms of RenderGuest per frame.
+  if (!FireTraceConfig().enabled) return SubmitTvTracedCommand(bytes, size, device);
   auto c = g_fire_context.occurrence ? g_fire_context : captured ? *captured : FireTraceContext{};
-  if (!FireTraceConfig().enabled || !c.occurrence) return SubmitTvTracedCommand(bytes, size, device);
+  if (!c.occurrence) return SubmitTvTracedCommand(bytes, size, device);
   c.event = g_fire_next_event.fetch_add(1, std::memory_order_relaxed); c.device = device;
   c.replay = list != 0; c.command_list = list; c.replay_ordinal = ordinal;
   if (replay_live) c.replay_live = *replay_live;

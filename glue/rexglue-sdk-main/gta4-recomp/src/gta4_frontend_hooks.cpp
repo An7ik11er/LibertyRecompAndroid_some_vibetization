@@ -338,9 +338,26 @@ constexpr std::array kAntiAliasingChoices = {
     Choice{"ssaa14x", TextId::kSsaa14x},
     Choice{"ssaa16x", TextId::kSsaa16x},
 };
+//constexpr std::array kUpscalerChoices = {
+//    Choice{"native", TextId::kNative},
+//    Choice{"fsr1", TextId::kFsr1},
+//#if defined(LIBERTY_HAS_FSR3)
+//    Choice{"fsr3", TextId::kFsr3},
+//#endif
+//#if defined(LIBERTY_HAS_DLSS)
+//    Choice{"dlss", TextId::kDlss},
+//#endif
+//#if REX_PLATFORM_MAC && !REX_PLATFORM_IOS
+//    Choice{"metalfx", TextId::kMetalFxUpscaler},
+//#endif
+//};
 constexpr std::array kUpscalerChoices = {
     Choice{"native", TextId::kNative},
     Choice{"fsr1", TextId::kFsr1},
+    // SGSR: временно используем TextId::kFsr1, чтобы не менять enum TextId;
+    // после добавления kSgsr заменить на него. В меню пункт будет
+    // отображаться как FSR 1, но cvar уже принимает "sgsr".
+    Choice{"sgsr", TextId::kFsr3},
 #if defined(LIBERTY_HAS_FSR3)
     Choice{"fsr3", TextId::kFsr3},
 #endif

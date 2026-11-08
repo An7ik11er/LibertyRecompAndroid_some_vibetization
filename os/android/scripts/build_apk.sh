@@ -12,6 +12,8 @@ cat > "$APP_DIR/local.properties" <<EOF
 sdk.dir=$(cygpath -m "$ANDROID_HOME" 2>/dev/null || echo "$ANDROID_HOME")
 EOF
 
+export JAVA_HOME="C:\Users\Ad\.jdks\jbr-21.0.11" 
+
 cd "$APP_DIR"
-./gradlew --no-daemon "$TASK"
+./gradlew --no-daemon "$TASK" --stacktrace
 ls -la "$APP_DIR/app/build/outputs/apk/$VARIANT/"

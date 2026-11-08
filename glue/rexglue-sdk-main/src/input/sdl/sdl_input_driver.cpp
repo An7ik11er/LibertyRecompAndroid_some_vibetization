@@ -1088,9 +1088,15 @@ X_RESULT SDLInputDriver::ApplyRumbleLocked(uint32_t user_index, ControllerState&
     state.next_rumble_refresh_ms = 0;
     // Keep the last successfully applied output. In particular, a failed
     // stop must remain different from the desired zero so the worker retries.
-    REXLOG_WARN("SDL HID: {} vibration failed for player index {} on '{}': {}",
-                is_refresh ? "Refreshing" : "Setting", user_index, SDL_GetGamepadName(state.sdl),
-                SDL_GetError());
+    // A pad without working rumble fails on every call; log the first few and then
+    // every 1024th instead of ~30 file writes a second from the title thread.
+    static std::atomic<uint32_t> rumble_failures{0};
+    const uint32_t failures = rumble_failures.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (failures <= 3 || (failures & 1023) == 0) {
+      REXLOG_WARN("SDL HID: {} vibration failed for player index {} on '{}': {} (failures: {})",
+                  is_refresh ? "Refreshing" : "Setting", user_index,
+                  SDL_GetGamepadName(state.sdl), SDL_GetError(), failures);
+    }
     return TranslateSdlRumbleResult(false);
   }
 

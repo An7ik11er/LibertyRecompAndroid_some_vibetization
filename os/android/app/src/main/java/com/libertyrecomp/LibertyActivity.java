@@ -85,6 +85,16 @@ public class LibertyActivity extends SDLActivity {
     static final String EXTRA_OTHER_REFLECTION_INTERVAL = "perf_other_reflection_interval";
     private boolean mDebugLog;
     private File mDebugLogFile;
+    /**
+     * Settings of the launcher's last "Play" press (LauncherActivity.writeLaunchTicket).
+     * getIntent() is not enough: the launcher kills the old :game process before Play, but
+     * the system keeps this singleTask activity's record and recreates it with the intent
+     * it was first started with; the new intent only arrives later, in onNewIntent().
+     */
+    static final String LAUNCH_TICKET = "launch_ticket";
+    /** A ticket older than this is not from this Play press. */
+    private static final long LAUNCH_TICKET_MAX_AGE_MS = 120_000;
+    private Intent mLaunchIntent;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -94,7 +104,7 @@ public class LibertyActivity extends SDLActivity {
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         // Steady clocks the device can hold, instead of peaks followed by
         // throttling (only where the device supports it).
-        Intent intent = getIntent();
+        Intent intent = launchIntent();
         if (intent != null && intent.getBooleanExtra(EXTRA_SUSTAINED, false)) {
             android.os.PowerManager power = (android.os.PowerManager) getSystemService(POWER_SERVICE);
             boolean supported = power != null && power.isSustainedPerformanceModeSupported();
@@ -180,6 +190,12 @@ public class LibertyActivity extends SDLActivity {
     protected SDLSurface createSDLSurface(Context context) {
         SDLSurface surface = super.createSDLSurface(context);
         if (mSurfaceWidth > 0 && mSurfaceHeight > 0) {
+            android.view.ViewGroup.LayoutParams lp = surface.getLayoutParams();
+            if (lp != null) {
+                lp.width = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
+                lp.height = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
+                surface.setLayoutParams(lp);
+            }
             surface.getHolder().setFixedSize(mSurfaceWidth, mSurfaceHeight);
             Log.i(TAG, "fixed surface " + mSurfaceWidth + "x" + mSurfaceHeight);
         }
@@ -215,17 +231,30 @@ public class LibertyActivity extends SDLActivity {
     // The launcher's performance test settings replace these cvars' lines in
     // args.txt for this run (the file itself is left as it is).
     private void applyPerformanceTestArguments(List<String> arguments) {
-        Intent intent = getIntent();
+        Intent intent = launchIntent();
+        // Thread placement from the launcher; independent of the extras below.
+        // android_thread_pinning.cpp reads the environment variable before the
+        // android_thread_affinity cvar, so native.toml / args.txt cannot override it.
+        // libmain.so is loaded after onCreate() -> prepareEnvironment(), so the
+        // variable is already set when the pinning thread starts.
+        if (intent != null && intent.hasExtra(ThreadAffinityDialog.EXTRA_SPEC)) {
+            String spec = intent.getStringExtra(ThreadAffinityDialog.EXTRA_SPEC);
+            if (spec == null || spec.isEmpty()) spec = "auto";
+            setenv(ThreadAffinityDialog.ENV_SPEC, spec);
+            Log.i(TAG, "thread affinity " + spec);
+        }
         if (intent == null || !intent.hasExtra(EXTRA_SHADOWS_OFF)) return;
         boolean shadowsOff = intent.getBooleanExtra(EXTRA_SHADOWS_OFF, false);
         // 0 = off.
         int water = Math.max(0, Math.min(intent.getIntExtra(EXTRA_WATER_REFLECTION_INTERVAL, 1), 3));
         int environment =
                 Math.max(0, Math.min(intent.getIntExtra(EXTRA_OTHER_REFLECTION_INTERVAL, 1), 3));
-        arguments.removeIf(a -> a.startsWith("--gta4_native_shadow_interval")
-                || a.startsWith("--gta4_native_water_reflection_interval")
+       arguments.removeIf(a -> a.startsWith("--gta4_native_water_reflection_interval")
                 || a.startsWith("--gta4_native_environment_reflection_interval"));
-        arguments.add("--gta4_native_shadow_interval=" + (shadowsOff ? 0 : 1));
+        if (shadowsOff) {
+            arguments.removeIf(a -> a.startsWith("--gta4_native_shadow_interval"));
+            arguments.add("--gta4_native_shadow_interval=0");
+        }
         arguments.removeIf(a -> a.startsWith("--android_gpu_turbo"));
         arguments.add("--android_gpu_turbo=" + intent.getBooleanExtra(EXTRA_GPU_TURBO, false));
         // Only adds: safe mode can also come from args.txt (scripts/regress.sh --safe).
@@ -286,16 +315,20 @@ public class LibertyActivity extends SDLActivity {
         // "Play (Debug Log)" from the launcher: the runtime logs at info level
         // and the whole process log is recorded into files/debug_logs/.
         applyPerformanceTestArguments(arguments);
-        mDebugLog = getIntent() != null && getIntent().getBooleanExtra(EXTRA_DEBUG_LOG, false);
+        Intent launch = launchIntent();
+        mDebugLog = launch != null && launch.getBooleanExtra(EXTRA_DEBUG_LOG, false);
         if (mDebugLog) {
-            arguments.removeIf(a -> a.startsWith("--diagnostics") || a.startsWith("--log_level"));
-            diagnosticsSet = false;
+            arguments.removeIf(a -> a.startsWith("--log_level") || a.startsWith("--gta4_native_hitch_log"));
             arguments.add("--log_level=info");
+            arguments.add("--gta4_native_hitch_log=true");
             mDebugLogFile = DebugLog.start(dataRoot);
+        } else {
+            arguments.removeIf(a -> a.startsWith("--gta4_native_hitch_log"));
+            arguments.add("--gta4_native_hitch_log=false");
         }
         if (!diagnosticsSet) {
             arguments.add("--diagnostics=true");
-            arguments.add("--diagnostics_categories=logging");
+            arguments.add("--diagnostics_categories=logging,native-profiler");
         }
         addInstallSources(new File(dataRoot, "install"), arguments);
         for (int i = arguments.size() - 1; i >= 0; --i) {
@@ -394,6 +427,51 @@ public class LibertyActivity extends SDLActivity {
             arguments.add("--install_update_source=" + update.getAbsolutePath());
             Log.i(TAG, "install title update " + update);
         }
+    }
+
+    /**
+     * The launcher's settings for this start: the ticket written right before
+     * startActivity() if there is a fresh one, else the activity's intent.
+     * Read once; the ticket is removed so a later restart by the system (no Play
+     * press) falls back to the intent.
+     */
+    private Intent launchIntent() {
+        if (mLaunchIntent != null) return mLaunchIntent;
+        Intent intent = getIntent();
+        mLaunchIntent = intent;
+        android.content.SharedPreferences ticket = getSharedPreferences(LAUNCH_TICKET, MODE_PRIVATE);
+        String uri = ticket.getString("intent", null);
+        long age = System.currentTimeMillis() - ticket.getLong("time", 0);
+        if (uri == null) return mLaunchIntent;
+        ticket.edit().clear().commit();
+        if (age < 0 || age > LAUNCH_TICKET_MAX_AGE_MS) {
+            Log.w(TAG, "launch ticket ignored: " + (age / 1000) + " s old");
+            return mLaunchIntent;
+        }
+        try {
+            Intent fromTicket = Intent.parseUri(uri, Intent.URI_INTENT_SCHEME);
+            String before = intent != null ? intent.getStringExtra(ThreadAffinityDialog.EXTRA_SPEC) : null;
+            String after = fromTicket.getStringExtra(ThreadAffinityDialog.EXTRA_SPEC);
+            boolean stale = !sameExtras(intent, fromTicket);
+            Log.i(TAG, "launch settings: launcher ticket"
+                    + (stale ? " (activity intent was stale; affinity " + before + " -> " + after + ")" : ""));
+            mLaunchIntent = fromTicket;
+        } catch (java.net.URISyntaxException e) {
+            Log.w(TAG, "launch ticket unreadable: " + uri, e);
+        }
+        return mLaunchIntent;
+    }
+
+    @SuppressWarnings("deprecation")
+    private static boolean sameExtras(Intent a, Intent b) {
+        Bundle x = a != null ? a.getExtras() : null;
+        Bundle y = b != null ? b.getExtras() : null;
+        if (x == null || y == null) return x == y;
+        if (!x.keySet().equals(y.keySet())) return false;
+        for (String key : x.keySet()) {
+            if (!String.valueOf(x.get(key)).equals(String.valueOf(y.get(key)))) return false;
+        }
+        return true;
     }
 
     private static void setenv(String name, String value) {
@@ -524,6 +602,10 @@ public class LibertyActivity extends SDLActivity {
      */
     private static final String[] CONFIG_LINE_REMOVALS = {
             "gta4_output_height_cap = 720",
+            "gta4_profile_native_detailed_cpu = true",
+            "gta4_profile_native_detailed_gpu = true",
+            "gta4_native_frame_timeline = true",
+            "gta4_native_max_queued_frames = 3",
     };
 
     /**

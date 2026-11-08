@@ -550,6 +550,13 @@ bool WithOnlyExtendedPlayerInfo(PPCContext& ctx, uint8_t* base, uint8_t player_i
   if (mp64::ClassifyPeerId(player_id) != mp64::PeerIdClass::kExtended) {
     return false;
   }
+  // 37: an empty slot returns false below anyway; checking it first skips the
+  // gate (EnterOpaque / LeaveOpaque: two mutex round trips and a thread-state
+  // lookup) and the alias mutex for each of the 48 extended ids. The entry is
+  // read again under both locks before use.
+  if (g_player_infos.Get(player_id).guest_player_info == 0) {
+    return false;
+  }
   auto alias_gate = g_player_info_alias_gate.EnterOpaque();
   std::scoped_lock alias_lock(g_player_info_alias_mutex);
   const mp64::PlayerInfoEntry entry = g_player_infos.Get(player_id);
@@ -3678,6 +3685,11 @@ extern "C" void sub_826DE548(PPCContext& ctx, uint8_t* base) {
 }
 
 extern "C" void sub_82718AE8(PPCContext& ctx, uint8_t* base) {
+  // 37: no extended player registered -> every retry below returns false.
+  if (!g_player_infos.HasExtended()) {
+    __imp__sub_82718AE8(ctx, base);
+    return;
+  }
   const PPCContext input_ctx = ctx;
   __imp__sub_82718AE8(ctx, base);
   if (ctx.r3.s32 >= 0) {
@@ -3700,6 +3712,11 @@ extern "C" void sub_82718AE8(PPCContext& ctx, uint8_t* base) {
 }
 
 extern "C" void sub_825755A0(PPCContext& ctx, uint8_t* base) {
+  // 37: no extended player registered -> every retry below returns false.
+  if (!g_player_infos.HasExtended()) {
+    __imp__sub_825755A0(ctx, base);
+    return;
+  }
   const PPCContext input_ctx = ctx;
   __imp__sub_825755A0(ctx, base);
   if (ctx.r3.s32 >= 0) {
@@ -3720,6 +3737,11 @@ extern "C" void sub_825755A0(PPCContext& ctx, uint8_t* base) {
 }
 
 extern "C" void sub_821F89C0(PPCContext& ctx, uint8_t* base) {
+  // 37: no extended player registered -> every retry below returns false.
+  if (!g_player_infos.HasExtended()) {
+    __imp__sub_821F89C0(ctx, base);
+    return;
+  }
   const PPCContext input_ctx = ctx;
   __imp__sub_821F89C0(ctx, base);
   if (ctx.r3.u8 == 0) {
@@ -3738,6 +3760,11 @@ extern "C" void sub_821F89C0(PPCContext& ctx, uint8_t* base) {
 }
 
 extern "C" void sub_8222A030(PPCContext& ctx, uint8_t* base) {
+  // 37: no extended player registered -> every retry below returns false.
+  if (!g_player_infos.HasExtended()) {
+    __imp__sub_8222A030(ctx, base);
+    return;
+  }
   const PPCContext input_ctx = ctx;
   __imp__sub_8222A030(ctx, base);
   if (ctx.r3.u8 != 0) {
@@ -3756,6 +3783,11 @@ extern "C" void sub_8222A030(PPCContext& ctx, uint8_t* base) {
 }
 
 extern "C" void sub_821F8A78(PPCContext& ctx, uint8_t* base) {
+  // 37: no extended player registered -> every retry below returns false.
+  if (!g_player_infos.HasExtended()) {
+    __imp__sub_821F8A78(ctx, base);
+    return;
+  }
   const PPCContext input_ctx = ctx;
   __imp__sub_821F8A78(ctx, base);
   if (ctx.r3.u8 != 0) {
@@ -3774,6 +3806,11 @@ extern "C" void sub_821F8A78(PPCContext& ctx, uint8_t* base) {
 }
 
 extern "C" void sub_823A3DD0(PPCContext& ctx, uint8_t* base) {
+  // 37: no extended player registered -> every retry below returns false.
+  if (!g_player_infos.HasExtended()) {
+    __imp__sub_823A3DD0(ctx, base);
+    return;
+  }
   const PPCContext input_ctx = ctx;
   __imp__sub_823A3DD0(ctx, base);
   if (ctx.r3.u8 != 0) {
@@ -3792,6 +3829,11 @@ extern "C" void sub_823A3DD0(PPCContext& ctx, uint8_t* base) {
 }
 
 extern "C" void sub_82502B88(PPCContext& ctx, uint8_t* base) {
+  // 37: no extended player registered -> every retry below returns false.
+  if (!g_player_infos.HasExtended()) {
+    RunPrimaryPlayerInfoAlias(ctx, base, __imp__sub_82502B88);
+    return;
+  }
   const PPCContext input_ctx = ctx;
   RunPrimaryPlayerInfoAlias(ctx, base, __imp__sub_82502B88);
   if (ctx.r3.u8 == 0) {
@@ -3811,6 +3853,11 @@ extern "C" void sub_82502B88(PPCContext& ctx, uint8_t* base) {
 
 template <GuestFunction* Original>
 void RunPlayerInfoFloatMinimum(PPCContext& ctx, uint8_t* base) {
+  // 37: no extended player registered -> the minimum is the retail result.
+  if (!g_player_infos.HasExtended()) {
+    Original(ctx, base);
+    return;
+  }
   const PPCContext input_ctx = ctx;
   Original(ctx, base);
   double best = ctx.f1.f64;
@@ -3838,6 +3885,11 @@ extern "C" void sub_826E5E18(PPCContext& ctx, uint8_t* base) {
 }
 
 extern "C" void sub_821C1460(PPCContext& ctx, uint8_t* base) {
+  // 37: no extended player registered -> every retry below returns false.
+  if (!g_player_infos.HasExtended()) {
+    __imp__sub_821C1460(ctx, base);
+    return;
+  }
   const PPCContext input_ctx = ctx;
   __imp__sub_821C1460(ctx, base);
   const PPCContext result_ctx = ctx;

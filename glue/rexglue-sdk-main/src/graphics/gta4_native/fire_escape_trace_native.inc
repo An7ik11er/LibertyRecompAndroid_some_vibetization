@@ -77,7 +77,7 @@ void Gta4NativeGraphicsSystem::TraceFireCommand(std::string_view point,const Nat
   const bool draw = c.type == CommandType::kDrawIndexedPrimitive || c.type == CommandType::kDrawPrimitive || c.type == CommandType::kDrawPrimitiveUp;
   if (!c.fire_trace && draw && (!ps || !FireDownstreamShader(ps->filename))) return;
   const FireTraceContext empty; const auto& x = c.fire_trace ? *c.fire_trace : empty;
-  const auto& f = c.fixed_function_state;
+  const auto& f = *c.fixed_function_state;
   DrawIndexedPrimitiveCommand d{};
   if (c.type == CommandType::kDrawIndexedPrimitive && c.bytes.size() == sizeof(d)) std::memcpy(&d,c.bytes.data(),sizeof(d));
   FireTraceLog(point,fmt::format("frame={} cmd={} seq={} epoch={} occurrence={} event={} type={} phase={} result={} model={:08X} geometry={:08X} material={:08X} ordinal={} bucket={} technique={:08X} pass={:08X} replay={} list={:08X} texture-name={} vs={:016X} ps={:016X} shader={} draw={} indices={} start={} base={} caller={:08X} rt={:08X} ds={:08X} depth={},{},{} stencil={},{},{},{},{} stencil-back={},{},{},{} alpha={},{},{} coverage={} cull={} blend={},{},{},{} alpha-blend={},{},{} write-mask={:08X} used={:08X} realized={:08X} failed={:08X} pbool={:08X} vbool={:08X}",

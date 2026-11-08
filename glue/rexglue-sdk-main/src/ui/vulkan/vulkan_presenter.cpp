@@ -59,6 +59,17 @@
 REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
                     "Clear render pass during presentation");
 
+// 40 (G2): on the 888 the surface reports currentTransform = ROTATE_90 for the
+// landscape window; with preTransform = IDENTITY SurfaceFlinger rotated every
+// buffer on the GPU (FALLBACK composition for 1139 of 1140 buffers, 30.10).
+REXCVAR_DEFINE_INT32(vulkan_prerotate, 1, "UI/Vulkan",
+                     "Pre-rotation: create the swapchain in the display's native orientation "
+                     "(preTransform = currentTransform) and rotate in one extra pass, so the "
+                     "compositor can scan the buffer out without GPU composition. 0 = off, "
+                     "1 = on, 2 = on with the opposite quarter turn (if the picture is upside "
+                     "down on some device)")
+    .range(0, 2);
+
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_immediate,
 #if REX_PLATFORM_MAC
                     false,
@@ -171,6 +182,93 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/guest_output_ffx_fsr_rcas_ps.h"
 #endif
 #include "../shaders/vulkan_spirv/guest_output_triangle_strip_rect_vs.h"
+// 40 (G2): glslangValidator 15.1 -V --target-env vulkan1.0, spirv-val clean.
+// Source (guest_output_prerotate.frag, next to this file in package 40):
+//   layout(push_constant) uniform PushConstants { layout(offset = 16) uint rotation; } pc;
+//   layout(set = 0, binding = 0) uniform texture2D source_texture;
+//   layout(set = 0, binding = 1) uniform sampler source_sampler;
+//   layout(location = 0) out vec4 out_color;
+//   void main() {
+//     ivec2 p = ivec2(gl_FragCoord.xy);
+//     ivec2 size = textureSize(sampler2D(source_texture, source_sampler), 0);
+//     ivec2 s;
+//     if (pc.rotation == 1u) s = ivec2(p.y, size.y - 1 - p.x);
+//     else if (pc.rotation == 3u) s = ivec2(size.x - 1 - p.y, p.x);
+//     else if (pc.rotation == 2u) s = size - ivec2(1) - p;
+//     else s = p;
+//     out_color = texelFetch(sampler2D(source_texture, source_sampler), s, 0);
+//   }
+const uint32_t guest_output_prerotate_ps[] = {
+    0x07230203, 0x00010000, 0x0008000B, 0x0000005F, 0x00000000, 0x00020011, 0x00000001, 0x00020011,
+    0x00000032, 0x0006000B, 0x00000001, 0x4C534C47, 0x6474732E, 0x3035342E, 0x00000000, 0x0003000E,
+    0x00000000, 0x00000001, 0x0007000F, 0x00000004, 0x00000004, 0x6E69616D, 0x00000000, 0x0000000D,
+    0x00000058, 0x00030010, 0x00000004, 0x00000007, 0x00030003, 0x00000002, 0x000001C2, 0x00040005,
+    0x00000004, 0x6E69616D, 0x00000000, 0x00030005, 0x00000009, 0x00000070, 0x00060005, 0x0000000D,
+    0x465F6C67, 0x43676172, 0x64726F6F, 0x00000000, 0x00040005, 0x00000012, 0x657A6973, 0x00000000,
+    0x00060005, 0x00000015, 0x72756F73, 0x745F6563, 0x75747865, 0x00006572, 0x00060005, 0x00000019,
+    0x72756F73, 0x735F6563, 0x6C706D61, 0x00007265, 0x00060005, 0x00000021, 0x68737550, 0x736E6F43,
+    0x746E6174, 0x00000073, 0x00060006, 0x00000021, 0x00000000, 0x61746F72, 0x6E6F6974, 0x00000000,
+    0x00030005, 0x00000023, 0x00006370, 0x00030005, 0x0000002C, 0x00000073, 0x00050005, 0x00000058,
+    0x5F74756F, 0x6F6C6F63, 0x00000072, 0x00040047, 0x0000000D, 0x0000000B, 0x0000000F, 0x00040047,
+    0x00000015, 0x00000021, 0x00000000, 0x00040047, 0x00000015, 0x00000022, 0x00000000, 0x00040047,
+    0x00000019, 0x00000021, 0x00000001, 0x00040047, 0x00000019, 0x00000022, 0x00000000, 0x00030047,
+    0x00000021, 0x00000002, 0x00050048, 0x00000021, 0x00000000, 0x00000023, 0x00000010, 0x00040047,
+    0x00000058, 0x0000001E, 0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002,
+    0x00040015, 0x00000006, 0x00000020, 0x00000001, 0x00040017, 0x00000007, 0x00000006, 0x00000002,
+    0x00040020, 0x00000008, 0x00000007, 0x00000007, 0x00030016, 0x0000000A, 0x00000020, 0x00040017,
+    0x0000000B, 0x0000000A, 0x00000004, 0x00040020, 0x0000000C, 0x00000001, 0x0000000B, 0x0004003B,
+    0x0000000C, 0x0000000D, 0x00000001, 0x00040017, 0x0000000E, 0x0000000A, 0x00000002, 0x00090019,
+    0x00000013, 0x0000000A, 0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000,
+    0x00040020, 0x00000014, 0x00000000, 0x00000013, 0x0004003B, 0x00000014, 0x00000015, 0x00000000,
+    0x0002001A, 0x00000017, 0x00040020, 0x00000018, 0x00000000, 0x00000017, 0x0004003B, 0x00000018,
+    0x00000019, 0x00000000, 0x0003001B, 0x0000001B, 0x00000013, 0x0004002B, 0x00000006, 0x0000001D,
+    0x00000000, 0x00040015, 0x00000020, 0x00000020, 0x00000000, 0x0003001E, 0x00000021, 0x00000020,
+    0x00040020, 0x00000022, 0x00000009, 0x00000021, 0x0004003B, 0x00000022, 0x00000023, 0x00000009,
+    0x00040020, 0x00000024, 0x00000009, 0x00000020, 0x0004002B, 0x00000020, 0x00000027, 0x00000001,
+    0x00020014, 0x00000028, 0x00040020, 0x0000002D, 0x00000007, 0x00000006, 0x0004002B, 0x00000006,
+    0x00000032, 0x00000001, 0x0004002B, 0x00000020, 0x00000034, 0x00000000, 0x0004002B, 0x00000020,
+    0x0000003C, 0x00000003, 0x0004002B, 0x00000020, 0x0000004C, 0x00000002, 0x0005002C, 0x00000007,
+    0x00000051, 0x00000032, 0x00000032, 0x00040020, 0x00000057, 0x00000003, 0x0000000B, 0x0004003B,
+    0x00000057, 0x00000058, 0x00000003, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003,
+    0x000200F8, 0x00000005, 0x0004003B, 0x00000008, 0x00000009, 0x00000007, 0x0004003B, 0x00000008,
+    0x00000012, 0x00000007, 0x0004003B, 0x00000008, 0x0000002C, 0x00000007, 0x0004003D, 0x0000000B,
+    0x0000000F, 0x0000000D, 0x0007004F, 0x0000000E, 0x00000010, 0x0000000F, 0x0000000F, 0x00000000,
+    0x00000001, 0x0004006E, 0x00000007, 0x00000011, 0x00000010, 0x0003003E, 0x00000009, 0x00000011,
+    0x0004003D, 0x00000013, 0x00000016, 0x00000015, 0x0004003D, 0x00000017, 0x0000001A, 0x00000019,
+    0x00050056, 0x0000001B, 0x0000001C, 0x00000016, 0x0000001A, 0x00040064, 0x00000013, 0x0000001E,
+    0x0000001C, 0x00050067, 0x00000007, 0x0000001F, 0x0000001E, 0x0000001D, 0x0003003E, 0x00000012,
+    0x0000001F, 0x00050041, 0x00000024, 0x00000025, 0x00000023, 0x0000001D, 0x0004003D, 0x00000020,
+    0x00000026, 0x00000025, 0x000500AA, 0x00000028, 0x00000029, 0x00000026, 0x00000027, 0x000300F7,
+    0x0000002B, 0x00000000, 0x000400FA, 0x00000029, 0x0000002A, 0x00000039, 0x000200F8, 0x0000002A,
+    0x00050041, 0x0000002D, 0x0000002E, 0x00000009, 0x00000027, 0x0004003D, 0x00000006, 0x0000002F,
+    0x0000002E, 0x00050041, 0x0000002D, 0x00000030, 0x00000012, 0x00000027, 0x0004003D, 0x00000006,
+    0x00000031, 0x00000030, 0x00050082, 0x00000006, 0x00000033, 0x00000031, 0x00000032, 0x00050041,
+    0x0000002D, 0x00000035, 0x00000009, 0x00000034, 0x0004003D, 0x00000006, 0x00000036, 0x00000035,
+    0x00050082, 0x00000006, 0x00000037, 0x00000033, 0x00000036, 0x00050050, 0x00000007, 0x00000038,
+    0x0000002F, 0x00000037, 0x0003003E, 0x0000002C, 0x00000038, 0x000200F9, 0x0000002B, 0x000200F8,
+    0x00000039, 0x00050041, 0x00000024, 0x0000003A, 0x00000023, 0x0000001D, 0x0004003D, 0x00000020,
+    0x0000003B, 0x0000003A, 0x000500AA, 0x00000028, 0x0000003D, 0x0000003B, 0x0000003C, 0x000300F7,
+    0x0000003F, 0x00000000, 0x000400FA, 0x0000003D, 0x0000003E, 0x00000049, 0x000200F8, 0x0000003E,
+    0x00050041, 0x0000002D, 0x00000040, 0x00000012, 0x00000034, 0x0004003D, 0x00000006, 0x00000041,
+    0x00000040, 0x00050082, 0x00000006, 0x00000042, 0x00000041, 0x00000032, 0x00050041, 0x0000002D,
+    0x00000043, 0x00000009, 0x00000027, 0x0004003D, 0x00000006, 0x00000044, 0x00000043, 0x00050082,
+    0x00000006, 0x00000045, 0x00000042, 0x00000044, 0x00050041, 0x0000002D, 0x00000046, 0x00000009,
+    0x00000034, 0x0004003D, 0x00000006, 0x00000047, 0x00000046, 0x00050050, 0x00000007, 0x00000048,
+    0x00000045, 0x00000047, 0x0003003E, 0x0000002C, 0x00000048, 0x000200F9, 0x0000003F, 0x000200F8,
+    0x00000049, 0x00050041, 0x00000024, 0x0000004A, 0x00000023, 0x0000001D, 0x0004003D, 0x00000020,
+    0x0000004B, 0x0000004A, 0x000500AA, 0x00000028, 0x0000004D, 0x0000004B, 0x0000004C, 0x000300F7,
+    0x0000004F, 0x00000000, 0x000400FA, 0x0000004D, 0x0000004E, 0x00000055, 0x000200F8, 0x0000004E,
+    0x0004003D, 0x00000007, 0x00000050, 0x00000012, 0x00050082, 0x00000007, 0x00000052, 0x00000050,
+    0x00000051, 0x0004003D, 0x00000007, 0x00000053, 0x00000009, 0x00050082, 0x00000007, 0x00000054,
+    0x00000052, 0x00000053, 0x0003003E, 0x0000002C, 0x00000054, 0x000200F9, 0x0000004F, 0x000200F8,
+    0x00000055, 0x0004003D, 0x00000007, 0x00000056, 0x00000009, 0x0003003E, 0x0000002C, 0x00000056,
+    0x000200F9, 0x0000004F, 0x000200F8, 0x0000004F, 0x000200F9, 0x0000003F, 0x000200F8, 0x0000003F,
+    0x000200F9, 0x0000002B, 0x000200F8, 0x0000002B, 0x0004003D, 0x00000013, 0x00000059, 0x00000015,
+    0x0004003D, 0x00000017, 0x0000005A, 0x00000019, 0x00050056, 0x0000001B, 0x0000005B, 0x00000059,
+    0x0000005A, 0x0004003D, 0x00000007, 0x0000005C, 0x0000002C, 0x00040064, 0x00000013, 0x0000005D,
+    0x0000005B, 0x0007005F, 0x0000000B, 0x0000005E, 0x0000005D, 0x0000005C, 0x00000002, 0x0000001D,
+    0x0003003E, 0x00000058, 0x0000005E, 0x000100FD, 0x00010038,
+};
 }  // namespace shaders
 
 VulkanPresenter::PaintContext::Submission::~Submission() {
@@ -309,6 +407,14 @@ VulkanPresenter::~VulkanPresenter() {
   if (paint_context_.swapchain_render_pass != VK_NULL_HANDLE) {
     dfn.vkDestroyRenderPass(device, paint_context_.swapchain_render_pass, nullptr);
   }
+  // 40 (G2). The target itself went with the swapchain above.
+  paint_context_.DestroyPrerotateTarget();
+  util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, paint_context_.prerotate_pipeline);
+  util::DestroyAndNullHandle(dfn.vkDestroyRenderPass, device,
+                             paint_context_.prerotate_render_pass);
+  util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device, prerotate_descriptor_pool_);
+  util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device, prerotate_pipeline_layout_);
+  util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device, prerotate_fs_);
 
   for (const PaintContext::UISetupCommandBuffer& ui_setup_command_buffer :
        paint_context_.ui_setup_command_buffers) {
@@ -725,6 +831,12 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     }
   }
   bool new_swapchain_probe_enabled = false;
+  // 40 (G2). The pixel probe reads swapchain pixels at logical coordinates, so
+  // it keeps the unrotated swapchain.
+  const bool new_swapchain_prerotate_allowed = REXCVAR_GET(vulkan_prerotate) != 0 &&
+                                               prerotate_supported_ &&
+                                               !new_swapchain_probe_requested;
+  uint32_t new_swapchain_rotation = 0;
 
   // ConnectOrReconnectToSurfaceFromUIThread may be called only for the
   // ui::Surface of the current swapchain or when the old swapchain and
@@ -744,7 +856,8 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         new_present_options, paint_context_.present_queue_family, new_swapchain_format,
         new_swapchain_color_space, paint_context_.swapchain_extent,
         paint_context_.swapchain_is_fifo, new_swapchain_is_hdr,
-        new_swapchain_probe_enabled, surface_unusable);
+        new_swapchain_probe_enabled, surface_unusable, new_swapchain_prerotate_allowed,
+        new_swapchain_rotation);
     // Destroy the old swapchain that may be retired now.
     if (old_swapchain != VK_NULL_HANDLE) {
       dfn.vkDestroySwapchainKHR(device, old_swapchain, nullptr);
@@ -841,7 +954,8 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         new_present_options, paint_context_.present_queue_family, new_swapchain_format,
         new_swapchain_color_space, paint_context_.swapchain_extent,
         paint_context_.swapchain_is_fifo, new_swapchain_is_hdr,
-        new_swapchain_probe_enabled, surface_unusable);
+        new_swapchain_probe_enabled, surface_unusable, new_swapchain_prerotate_allowed,
+        new_swapchain_rotation);
     if (paint_context_.swapchain == VK_NULL_HANDLE) {
       // Failed to create the swapchain for the new Vulkan surface - destroy the
       // Vulkan surface.
@@ -856,6 +970,14 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   // From now on, in case of failure,
   // paint_context_.DestroySwapchainAndVulkanSurface must be called before
   // returning.
+
+  // 40 (G2): the swapchain was created with its physical extent; painting uses
+  // the logical one.
+  paint_context_.swapchain_rotation = new_swapchain_rotation;
+  paint_context_.swapchain_physical_extent = paint_context_.swapchain_extent;
+  if (new_swapchain_rotation == 1 || new_swapchain_rotation == 3) {
+    std::swap(paint_context_.swapchain_extent.width, paint_context_.swapchain_extent.height);
+  }
 
   ++diagnostic_swapchain_epoch_;
   frame_pacer().Reset();
@@ -1051,8 +1173,8 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   framebuffer_create_info.renderPass = paint_context_.swapchain_render_pass;
   framebuffer_create_info.attachmentCount = 1;
   framebuffer_create_info.pAttachments = &image_view;
-  framebuffer_create_info.width = paint_context_.swapchain_extent.width;
-  framebuffer_create_info.height = paint_context_.swapchain_extent.height;
+  framebuffer_create_info.width = paint_context_.swapchain_physical_extent.width;
+  framebuffer_create_info.height = paint_context_.swapchain_physical_extent.height;
   framebuffer_create_info.layers = 1;
   for (VkImage image : paint_context_.swapchain_images) {
     image_view_create_info.image = image;
@@ -1085,10 +1207,245 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
                                                        present_semaphore);
   }
 
+  if (paint_context_.swapchain_rotation) {
+    if (!SetUpPrerotationForConnection(new_swapchain_format)) {
+      // The swapchain already expects rotated content. Drop it; the next
+      // connection attempt creates an unrotated one.
+      REXLOG_ERROR("VulkanPresenter: pre-rotation setup failed, disabling pre-rotation");
+      prerotate_supported_ = false;
+      paint_context_.DestroySwapchainAndVulkanSurface();
+      return SurfacePaintConnectResult::kFailure;
+    }
+  }
+  REXLOG_INFO("VulkanPresenter: pre-rotation={} rotation={} logical={}x{} physical={}x{}",
+              paint_context_.swapchain_rotation ? "on" : "off",
+              paint_context_.swapchain_rotation, paint_context_.swapchain_extent.width,
+              paint_context_.swapchain_extent.height,
+              paint_context_.swapchain_physical_extent.width,
+              paint_context_.swapchain_physical_extent.height);
+
   is_vsync_implicit_out = paint_context_.swapchain_is_fifo;
   generated_frame_presentation_enabled_.store(paint_context_.swapchain_is_fifo,
                                                std::memory_order_release);
   return SurfacePaintConnectResult::kSuccess;
+}
+
+bool VulkanPresenter::SetUpPrerotationForConnection(VkFormat swapchain_format) {
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+
+  // Render pass for the logical target: the swapchain pass with a sampled
+  // final layout and dependencies on the rotation pass reading it.
+  if (paint_context_.prerotate_render_pass_format != swapchain_format) {
+    util::DestroyAndNullHandle(dfn.vkDestroyRenderPass, device,
+                               paint_context_.prerotate_render_pass);
+    paint_context_.prerotate_render_pass_format = VK_FORMAT_UNDEFINED;
+  }
+  if (paint_context_.prerotate_render_pass == VK_NULL_HANDLE) {
+    VkAttachmentDescription attachment;
+    attachment.flags = 0;
+    attachment.format = swapchain_format;
+    attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    attachment.loadOp = paint_context_.swapchain_render_pass_clear_load_op
+                            ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                            : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkAttachmentReference color_attachment;
+    color_attachment.attachment = 0;
+    color_attachment.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkSubpassDescription subpass = {};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &color_attachment;
+    VkSubpassDependency dependencies[2];
+    // The previous paint's rotation pass read the image.
+    dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[0].dstSubpass = 0;
+    dependencies[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependencies[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    dependencies[0].dstAccessMask =
+        VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dependencies[0].dependencyFlags = 0;
+    dependencies[1].srcSubpass = 0;
+    dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    dependencies[1].srcAccessMask =
+        VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    dependencies[1].dependencyFlags = 0;
+    VkRenderPassCreateInfo create_info;
+    create_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    create_info.pNext = nullptr;
+    create_info.flags = 0;
+    create_info.attachmentCount = 1;
+    create_info.pAttachments = &attachment;
+    create_info.subpassCount = 1;
+    create_info.pSubpasses = &subpass;
+    create_info.dependencyCount = uint32_t(rex::countof(dependencies));
+    create_info.pDependencies = dependencies;
+    if (dfn.vkCreateRenderPass(device, &create_info, nullptr,
+                               &paint_context_.prerotate_render_pass) != VK_SUCCESS) {
+      REXLOG_ERROR("VulkanPresenter: Failed to create the pre-rotation render pass");
+      paint_context_.prerotate_render_pass = VK_NULL_HANDLE;
+      return false;
+    }
+    paint_context_.prerotate_render_pass_format = swapchain_format;
+  }
+
+  // The rotation pipeline draws to the swapchain image.
+  if (paint_context_.prerotate_pipeline_format != swapchain_format) {
+    util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, paint_context_.prerotate_pipeline);
+    paint_context_.prerotate_pipeline_format = VK_FORMAT_UNDEFINED;
+  }
+  if (paint_context_.prerotate_pipeline == VK_NULL_HANDLE) {
+    VkPipelineShaderStageCreateInfo stages[2] = {};
+    for (uint32_t i = 0; i < 2; ++i) {
+      stages[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+      stages[i].stage = i ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
+      stages[i].pName = "main";
+    }
+    stages[0].module = guest_output_paint_vs_;
+    stages[1].module = prerotate_fs_;
+    VkPipelineVertexInputStateCreateInfo vertex_input_state = {};
+    vertex_input_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    VkPipelineInputAssemblyStateCreateInfo input_assembly_state = {};
+    input_assembly_state.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    input_assembly_state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    VkPipelineViewportStateCreateInfo viewport_state = {};
+    viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewport_state.viewportCount = 1;
+    viewport_state.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rasterization_state = {};
+    rasterization_state.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterization_state.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterization_state.cullMode = VK_CULL_MODE_NONE;
+    rasterization_state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterization_state.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo multisample_state = {};
+    multisample_state.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisample_state.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState color_blend_attachment_state = {};
+    color_blend_attachment_state.colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+        VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo color_blend_state = {};
+    color_blend_state.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    color_blend_state.attachmentCount = 1;
+    color_blend_state.pAttachments = &color_blend_attachment_state;
+    static const VkDynamicState kDynamicStates[] = {
+        VK_DYNAMIC_STATE_VIEWPORT,
+        VK_DYNAMIC_STATE_SCISSOR,
+    };
+    VkPipelineDynamicStateCreateInfo dynamic_state = {};
+    dynamic_state.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamic_state.dynamicStateCount = uint32_t(rex::countof(kDynamicStates));
+    dynamic_state.pDynamicStates = kDynamicStates;
+    VkGraphicsPipelineCreateInfo pipeline_create_info = {};
+    pipeline_create_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipeline_create_info.stageCount = uint32_t(rex::countof(stages));
+    pipeline_create_info.pStages = stages;
+    pipeline_create_info.pVertexInputState = &vertex_input_state;
+    pipeline_create_info.pInputAssemblyState = &input_assembly_state;
+    pipeline_create_info.pViewportState = &viewport_state;
+    pipeline_create_info.pRasterizationState = &rasterization_state;
+    pipeline_create_info.pMultisampleState = &multisample_state;
+    pipeline_create_info.pColorBlendState = &color_blend_state;
+    pipeline_create_info.pDynamicState = &dynamic_state;
+    pipeline_create_info.layout = prerotate_pipeline_layout_;
+    pipeline_create_info.renderPass = paint_context_.swapchain_render_pass;
+    pipeline_create_info.subpass = 0;
+    pipeline_create_info.basePipelineHandle = VK_NULL_HANDLE;
+    pipeline_create_info.basePipelineIndex = -1;
+    if (dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_create_info, nullptr,
+                                      &paint_context_.prerotate_pipeline) != VK_SUCCESS) {
+      REXLOG_ERROR("VulkanPresenter: Failed to create the pre-rotation pipeline");
+      paint_context_.prerotate_pipeline = VK_NULL_HANDLE;
+      return false;
+    }
+    paint_context_.prerotate_pipeline_format = swapchain_format;
+  }
+
+  // The logical target, recreated with every connection (the previous one was
+  // destroyed with the previous swapchain, after its submissions completed).
+  paint_context_.DestroyPrerotateTarget();
+  VkImageCreateInfo image_create_info = {};
+  image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  image_create_info.imageType = VK_IMAGE_TYPE_2D;
+  image_create_info.format = swapchain_format;
+  image_create_info.extent.width = paint_context_.swapchain_extent.width;
+  image_create_info.extent.height = paint_context_.swapchain_extent.height;
+  image_create_info.extent.depth = 1;
+  image_create_info.mipLevels = 1;
+  image_create_info.arrayLayers = 1;
+  image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+  image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  image_create_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+          vulkan_device_, image_create_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+          paint_context_.prerotate_image, paint_context_.prerotate_memory)) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create the pre-rotation image");
+    return false;
+  }
+  VkImageViewCreateInfo view_create_info = {};
+  view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  view_create_info.image = paint_context_.prerotate_image;
+  view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view_create_info.format = swapchain_format;
+  view_create_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+  view_create_info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+  view_create_info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+  view_create_info.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+  view_create_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  view_create_info.subresourceRange.baseMipLevel = 0;
+  view_create_info.subresourceRange.levelCount = 1;
+  view_create_info.subresourceRange.baseArrayLayer = 0;
+  view_create_info.subresourceRange.layerCount = 1;
+  if (dfn.vkCreateImageView(device, &view_create_info, nullptr, &paint_context_.prerotate_view) !=
+      VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create the pre-rotation image view");
+    paint_context_.prerotate_view = VK_NULL_HANDLE;
+    paint_context_.DestroyPrerotateTarget();
+    return false;
+  }
+  VkFramebufferCreateInfo framebuffer_create_info = {};
+  framebuffer_create_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+  framebuffer_create_info.renderPass = paint_context_.prerotate_render_pass;
+  framebuffer_create_info.attachmentCount = 1;
+  framebuffer_create_info.pAttachments = &paint_context_.prerotate_view;
+  framebuffer_create_info.width = paint_context_.swapchain_extent.width;
+  framebuffer_create_info.height = paint_context_.swapchain_extent.height;
+  framebuffer_create_info.layers = 1;
+  if (dfn.vkCreateFramebuffer(device, &framebuffer_create_info, nullptr,
+                              &paint_context_.prerotate_framebuffer) != VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create the pre-rotation framebuffer");
+    paint_context_.prerotate_framebuffer = VK_NULL_HANDLE;
+    paint_context_.DestroyPrerotateTarget();
+    return false;
+  }
+  // No paint is in flight here (the swapchain retirement awaited them), so the
+  // descriptor can be rewritten.
+  VkDescriptorImageInfo image_info;
+  image_info.sampler = VK_NULL_HANDLE;
+  image_info.imageView = paint_context_.prerotate_view;
+  image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  VkWriteDescriptorSet write = {};
+  write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  write.dstSet = prerotate_descriptor_set_;
+  write.dstBinding = 0;
+  write.dstArrayElement = 0;
+  write.descriptorCount = 1;
+  write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+  write.pImageInfo = &image_info;
+  dfn.vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+  return true;
 }
 
 void VulkanPresenter::DisconnectPaintingFromSurfaceFromUIThreadImpl() {
@@ -1207,10 +1564,11 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     uint32_t& present_queue_family_out, VkFormat& image_format_out,
     VkColorSpaceKHR& image_color_space_out, VkExtent2D& image_extent_out,
     bool& is_fifo_out, bool& is_hdr_out, bool& swapchain_probe_enabled_out,
-    bool& ui_surface_unusable_out) {
+    bool& ui_surface_unusable_out, bool prerotate_allowed, uint32_t& rotation_out) {
   ui_surface_unusable_out = false;
   is_hdr_out = false;
   swapchain_probe_enabled_out = false;
+  rotation_out = 0;
 
   const VulkanInstance::Functions& ifn = vulkan_device->vulkan_instance()->functions();
   const VkPhysicalDevice physical_device = vulkan_device->physical_device();
@@ -1225,12 +1583,18 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     // Some strange error, try again later.
     return VK_NULL_HANDLE;
   }
+  // 30.10: + transforms. currentTransform != 0x1 (identity) with preTransform
+  // IDENTITY below means SurfaceFlinger rotates every frame; on the 888 that is
+  // GPU (client) composition: 0x2 = ROTATE_90, 0x8 = ROTATE_270.
   REXLOG_INFO(
-      "[SwapchainCapabilities] requested={}x{} current={}x{} min={}x{} max={}x{}",
+      "[SwapchainCapabilities] requested={}x{} current={}x{} min={}x{} max={}x{} "
+      "currentTransform={:#x} supportedTransforms={:#x}",
       width, height, surface_capabilities.currentExtent.width,
       surface_capabilities.currentExtent.height, surface_capabilities.minImageExtent.width,
       surface_capabilities.minImageExtent.height, surface_capabilities.maxImageExtent.width,
-      surface_capabilities.maxImageExtent.height);
+      surface_capabilities.maxImageExtent.height,
+      uint32_t(surface_capabilities.currentTransform),
+      uint32_t(surface_capabilities.supportedTransforms));
 
   // First, check if the surface is not zero-area because in this case, the rest
   // of the fields in theory may not be informative as the surface doesn't need
@@ -1255,6 +1619,33 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     height = surface_capabilities.currentExtent.height;
   }
 #endif
+  // 40 (G2): with pre-rotation the images are in the display's native
+  // orientation, so a quarter turn swaps the requested (window) extent.
+  VkSurfaceTransformFlagBitsKHR prerotate_transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+  if (prerotate_allowed) {
+    const VkSurfaceTransformFlagBitsKHR current_transform = surface_capabilities.currentTransform;
+    if (surface_capabilities.supportedTransforms & current_transform) {
+      switch (current_transform) {
+        case VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR:
+          rotation_out = 1;
+          break;
+        case VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR:
+          rotation_out = 2;
+          break;
+        case VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR:
+          rotation_out = 3;
+          break;
+        default:
+          break;
+      }
+    }
+    if (rotation_out) {
+      prerotate_transform = current_transform;
+      if (rotation_out != 2) {
+        std::swap(width, height);
+      }
+    }
+  }
   VkExtent2D image_extent;
   image_extent.width = std::min(std::max(std::min(width, max_framebuffer_extent.width),
                                          surface_capabilities.minImageExtent.width),
@@ -1497,7 +1888,8 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     swapchain_create_info.pQueueFamilyIndices = nullptr;
   }
   swapchain_create_info.preTransform =
-      (surface_capabilities.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+      rotation_out ? prerotate_transform
+      : (surface_capabilities.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
           ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
           : VK_SURFACE_TRANSFORM_INHERIT_BIT_KHR;
   // Prefer opaque to avoid blending in the window system, or let that be
@@ -1565,6 +1957,11 @@ VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
   swapchain_images.clear();
   swapchain_extent.width = 0;
   swapchain_extent.height = 0;
+  // 40 (G2). Submissions have completed above.
+  DestroyPrerotateTarget();
+  swapchain_rotation = 0;
+  swapchain_physical_extent.width = 0;
+  swapchain_physical_extent.height = 0;
   swapchain_color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
   swapchain_is_hdr = false;
   swapchain_hdr_requested = false;
@@ -1574,6 +1971,15 @@ VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
   VkSwapchainKHR old_swapchain = swapchain;
   swapchain = nullptr;
   return old_swapchain;
+}
+
+void VulkanPresenter::PaintContext::DestroyPrerotateTarget() {
+  const VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  util::DestroyAndNullHandle(dfn.vkDestroyFramebuffer, device, prerotate_framebuffer);
+  util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, prerotate_view);
+  util::DestroyAndNullHandle(dfn.vkDestroyImage, device, prerotate_image);
+  util::DestroyAndNullHandle(dfn.vkFreeMemory, device, prerotate_memory);
 }
 
 void VulkanPresenter::PaintContext::DestroySwapchainAndVulkanSurface() {
@@ -2097,6 +2503,19 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     swapchain_render_pass_begin_info.clearValueCount = 1;
     swapchain_render_pass_begin_info.pClearValues = &swapchain_image_clear_attachment.clearValue;
     swapchain_image_clear_needed = false;
+  }
+  // 40 (G2): everything below draws to the logical target (same format and
+  // load op, logical extent); the rotation pass after it writes the swapchain
+  // image.
+  const bool prerotate_pass = paint_context_.swapchain_rotation != 0 &&
+                              paint_context_.prerotate_framebuffer != VK_NULL_HANDLE &&
+                              paint_context_.prerotate_pipeline != VK_NULL_HANDLE;
+  VkRenderPassBeginInfo swapchain_image_render_pass_begin_info = swapchain_render_pass_begin_info;
+  if (prerotate_pass) {
+    swapchain_render_pass_begin_info.renderPass = paint_context_.prerotate_render_pass;
+    swapchain_render_pass_begin_info.framebuffer = paint_context_.prerotate_framebuffer;
+    swapchain_image_render_pass_begin_info.renderArea.extent =
+        paint_context_.swapchain_physical_extent;
   }
 
   bool swapchain_image_pass_begun = false;
@@ -2649,6 +3068,47 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   }
 
   dfn.vkCmdEndRenderPass(draw_command_buffer);
+
+  if (prerotate_pass) {
+    // 40 (G2): one fragment per swapchain pixel, texelFetch from the logical
+    // target turned by swapchain_rotation.
+    dfn.vkCmdBeginRenderPass(draw_command_buffer, &swapchain_image_render_pass_begin_info,
+                             VK_SUBPASS_CONTENTS_INLINE);
+    VkViewport prerotate_viewport;
+    prerotate_viewport.x = 0.0f;
+    prerotate_viewport.y = 0.0f;
+    prerotate_viewport.width = float(paint_context_.swapchain_physical_extent.width);
+    prerotate_viewport.height = float(paint_context_.swapchain_physical_extent.height);
+    prerotate_viewport.minDepth = 0.0f;
+    prerotate_viewport.maxDepth = 1.0f;
+    dfn.vkCmdSetViewport(draw_command_buffer, 0, 1, &prerotate_viewport);
+    VkRect2D prerotate_scissor;
+    prerotate_scissor.offset.x = 0;
+    prerotate_scissor.offset.y = 0;
+    prerotate_scissor.extent = paint_context_.swapchain_physical_extent;
+    dfn.vkCmdSetScissor(draw_command_buffer, 0, 1, &prerotate_scissor);
+    dfn.vkCmdBindPipeline(draw_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          paint_context_.prerotate_pipeline);
+    dfn.vkCmdBindDescriptorSets(draw_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                prerotate_pipeline_layout_, 0, 1, &prerotate_descriptor_set_, 0,
+                                nullptr);
+    GuestOutputPaintRectangleConstants prerotate_rect;
+    prerotate_rect.x = -1.0f;
+    prerotate_rect.y = -1.0f;
+    prerotate_rect.width = 2.0f;
+    prerotate_rect.height = 2.0f;
+    dfn.vkCmdPushConstants(draw_command_buffer, prerotate_pipeline_layout_,
+                           VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(prerotate_rect), &prerotate_rect);
+    uint32_t prerotate_turns = paint_context_.swapchain_rotation;
+    if (REXCVAR_GET(vulkan_prerotate) == 2 && prerotate_turns != 2) {
+      prerotate_turns = 4 - prerotate_turns;
+    }
+    dfn.vkCmdPushConstants(draw_command_buffer, prerotate_pipeline_layout_,
+                           VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(prerotate_rect),
+                           sizeof(prerotate_turns), &prerotate_turns);
+    dfn.vkCmdDraw(draw_command_buffer, 4, 1, 0, 0);
+    dfn.vkCmdEndRenderPass(draw_command_buffer);
+  }
 
   const FramePixelProbeKey frame_key{frame_probe.run, frame_probe.source_sequence, frame_probe.frame, diagnostic_swapchain_epoch_};
   const bool frame_probe_selected = frame_probe.valid() && frame_region.valid() && guest_output_pass_recorded &&
@@ -3536,6 +3996,76 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
         "VulkanPresenter: Failed to allocate the guest output painting "
         "descriptor sets");
     return false;
+  }
+
+  // 40 (G2). Not fatal: without these objects the swapchain stays unrotated.
+  prerotate_supported_ = false;
+  [&]() {
+    static_assert(sizeof(GuestOutputPaintRectangleConstants) == 16,
+                  "guest_output_prerotate_ps reads its rotation at push constant offset 16");
+    VkShaderModuleCreateInfo fs_create_info;
+    fs_create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    fs_create_info.pNext = nullptr;
+    fs_create_info.flags = 0;
+    fs_create_info.codeSize = sizeof(shaders::guest_output_prerotate_ps);
+    fs_create_info.pCode = shaders::guest_output_prerotate_ps;
+    if (dfn.vkCreateShaderModule(device, &fs_create_info, nullptr, &prerotate_fs_) !=
+        VK_SUCCESS) {
+      prerotate_fs_ = VK_NULL_HANDLE;
+      return;
+    }
+    VkPushConstantRange ranges[2];
+    ranges[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    ranges[0].offset = 0;
+    ranges[0].size = sizeof(GuestOutputPaintRectangleConstants);
+    ranges[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    ranges[1].offset = sizeof(GuestOutputPaintRectangleConstants);
+    ranges[1].size = sizeof(uint32_t);
+    VkPipelineLayoutCreateInfo layout_create_info;
+    layout_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layout_create_info.pNext = nullptr;
+    layout_create_info.flags = 0;
+    layout_create_info.setLayoutCount = 1;
+    layout_create_info.pSetLayouts = &guest_output_paint_image_descriptor_set_layout_;
+    layout_create_info.pushConstantRangeCount = uint32_t(rex::countof(ranges));
+    layout_create_info.pPushConstantRanges = ranges;
+    if (dfn.vkCreatePipelineLayout(device, &layout_create_info, nullptr,
+                                   &prerotate_pipeline_layout_) != VK_SUCCESS) {
+      prerotate_pipeline_layout_ = VK_NULL_HANDLE;
+      return;
+    }
+    VkDescriptorPoolSize pool_sizes[2];
+    pool_sizes[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    pool_sizes[0].descriptorCount = 1;
+    pool_sizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLER;
+    pool_sizes[1].descriptorCount = 1;
+    VkDescriptorPoolCreateInfo pool_create_info;
+    pool_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool_create_info.pNext = nullptr;
+    pool_create_info.flags = 0;
+    pool_create_info.maxSets = 1;
+    pool_create_info.poolSizeCount = uint32_t(rex::countof(pool_sizes));
+    pool_create_info.pPoolSizes = pool_sizes;
+    if (dfn.vkCreateDescriptorPool(device, &pool_create_info, nullptr,
+                                   &prerotate_descriptor_pool_) != VK_SUCCESS) {
+      prerotate_descriptor_pool_ = VK_NULL_HANDLE;
+      return;
+    }
+    VkDescriptorSetAllocateInfo set_allocate_info;
+    set_allocate_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    set_allocate_info.pNext = nullptr;
+    set_allocate_info.descriptorPool = prerotate_descriptor_pool_;
+    set_allocate_info.descriptorSetCount = 1;
+    set_allocate_info.pSetLayouts = &guest_output_paint_image_descriptor_set_layout_;
+    if (dfn.vkAllocateDescriptorSets(device, &set_allocate_info, &prerotate_descriptor_set_) !=
+        VK_SUCCESS) {
+      prerotate_descriptor_set_ = VK_NULL_HANDLE;
+      return;
+    }
+    prerotate_supported_ = true;
+  }();
+  if (!prerotate_supported_) {
+    REXLOG_WARN("VulkanPresenter: pre-rotation objects could not be created; it stays off");
   }
 
   return InitializeCommonSurfaceIndependent();

@@ -16,21 +16,37 @@ plugins {
 val sdlJavaDir = rootProject.file(
     "../../glue/rexglue-sdk-main/thirdparty/sdl3/android-project/app/src/main/java")
 
+val isAlt = project.hasProperty("alt") || System.getenv("ALT_BUILD") == "1"
+val altKeystore = file("alt.keystore")
+
 android {
     namespace   = "com.libertyrecomp"
     compileSdk  = 35
-    ndkVersion  = "29.0.14206865"
+    ndkVersion  = "30.0.16248370"
 
     defaultConfig {
-        applicationId = "com.libertyrecomp"
+        applicationId = if (isAlt) "com.libertyrecomp.alt" else "com.libertyrecomp"
         // 28: ASharedMemory (26) for guest memory and AAudio (27) for audio.
         minSdk        = 29
         targetSdk     = 35
         versionCode   = 18
-        versionName   = "0.5.9.3"
+        versionName   = if (isAlt) "0.5.9.3_alt_modded" else "0.5.9.3_modded"
+
+        manifestPlaceholders["appName"] = if (isAlt) "Liberty Recompiled Alt" else "Liberty Recompiled"
 
         ndk {
             abiFilters += listOf("arm64-v8a")
+        }
+    }
+
+    signingConfigs {
+        if (altKeystore.exists()) {
+            create("altKey") {
+                storeFile     = altKeystore
+                storePassword = "libertyrecomp"
+                keyAlias      = "liberty_alt"
+                keyPassword   = "libertyrecomp"
+            }
         }
     }
 
@@ -41,10 +57,17 @@ android {
             isDebuggable    = true
             isJniDebuggable = true
             isMinifyEnabled = false
+            if (isAlt && altKeystore.exists()) {
+                signingConfig = signingConfigs.getByName("altKey")
+            }
         }
         release {
             isMinifyEnabled = false
-            signingConfig   = signingConfigs.getByName("debug")
+            if (isAlt && altKeystore.exists()) {
+                signingConfig = signingConfigs.getByName("altKey")
+            } else {
+                signingConfig = signingConfigs.getByName("debug")
+            }
         }
     }
 
@@ -58,9 +81,11 @@ android {
             // Unpack the libraries into nativeLibraryDir: the runtime finds its
             // GPU plugins by real path next to itself, and a Turnip driver
             // loaded through libadrenotools needs real files as well.
-            useLegacyPackaging = true
+            useLegacyPackaging = false
             // build_native.sh decides what is stripped.
-            keepDebugSymbols += "**/*.so"
+            if (!isAlt && !project.hasProperty("strip")) {
+                keepDebugSymbols += "**/*.so"
+            }
         }
     }
 
@@ -68,4 +93,8 @@ android {
         checkReleaseBuilds = false
         abortOnError = false
     }
+}
+
+tasks.withType<JavaCompile> {
+    options.encoding = "UTF-8"
 }

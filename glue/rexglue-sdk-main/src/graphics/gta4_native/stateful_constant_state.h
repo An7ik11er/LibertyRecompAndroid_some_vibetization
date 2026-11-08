@@ -2,6 +2,7 @@
 #define REX_GRAPHICS_GTA4_NATIVE_STATEFUL_CONSTANT_STATE_H_
 
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -32,6 +33,11 @@ struct ConstantPayloadDelta {
   std::vector<ConstantDeltaRange> ranges;
   std::vector<uint8_t> payload;
   bool complete_snapshot = false;
+  // 52: built by CaptureChangedConstantPayloadDelta: every range differs from the
+  // consumer's bank as the producer's shadow saw it, so Apply copies it without the
+  // memcmp first. If the shadow was stale (after a rejected command, before the resync)
+  // an equal range is just copied again; the result is the same bank.
+  bool changed_only = false;
 
   bool empty() const { return ranges.empty(); }
 };
@@ -69,10 +75,14 @@ inline bool CaptureConstantPayloadDelta(std::span<const uint8_t> source,
                                         const DirtyRangeSet& dirty_ranges,
                                         uint32_t bytes_per_element,
                                         ConstantPayloadDelta& result) {
+  // 35: back to the 31.10 version (insert per range). The 34 two-pass version had to
+  // resize() the cleared payload first, and that zero-fill showed up as memset at ~3 %
+  // of RenderGuest on 888 / 855 (more than the insert bookkeeping it replaced).
   // Cleared, not reassigned: recycled commands keep these buffers' capacity.
   result.ranges.clear();
   result.payload.clear();
   result.complete_snapshot = false;
+  result.changed_only = false;  // 52
   if (!bytes_per_element) {
     return false;
   }
@@ -81,8 +91,14 @@ inline bool CaptureConstantPayloadDelta(std::span<const uint8_t> source,
   {
     uint64_t total = 0;
     for (const DirtyElementRange& dirty : dirty_ranges.ranges) total += uint64_t(dirty.count) * bytes_per_element;
-    if (total <= source.size()) result.payload.reserve(size_t(total));
-    result.ranges.reserve(dirty_ranges.ranges.size());
+    // 31.10: powers of two. Exact reserves made a recycled command's buffers
+    // creep up a few bytes at a time: malloc + free on the title thread for
+    // most draws (malloc/insert/free here were ~5% of RenderGuest). The bank
+    // is 4 KB, so the rounding never exceeds it by more than 2x of the need.
+    if (total <= source.size() && result.payload.capacity() < total)
+      result.payload.reserve(std::bit_ceil(std::max<size_t>(size_t(total), 64)));
+    if (result.ranges.capacity() < dirty_ranges.ranges.size())
+      result.ranges.reserve(std::bit_ceil(std::max<size_t>(dirty_ranges.ranges.size(), 4)));
   }
   for (const DirtyElementRange& dirty : dirty_ranges.ranges) {
     if (!dirty.count || dirty.first > std::numeric_limits<uint32_t>::max() / bytes_per_element ||
@@ -119,6 +135,71 @@ inline bool CaptureConstantPayloadDelta(std::span<const uint8_t> source,
   return ValidateConstantPayloadDelta(result, source.size());
 }
 
+// 49 (шаг 3.2): like CaptureConstantPayloadDelta, but only the dirty groups
+// whose bytes differ from `shadow` (what the consumer's bank holds after every
+// delta queued so far) go into the delta. The guest marks a group dirty on every
+// write, also when it writes the same values; those groups are left out, so the
+// consumer neither receives nor compares them. `shadow` is not changed here.
+// dirty_bytes: bytes the dirty ranges cover (statistics).
+inline bool CaptureChangedConstantPayloadDelta(std::span<const uint8_t> source,
+                                               const DirtyRangeSet& dirty_ranges,
+                                               uint32_t bytes_per_element,
+                                               std::span<const uint8_t> shadow,
+                                               ConstantPayloadDelta& result,
+                                               uint64_t& dirty_bytes) {
+  result.ranges.clear();
+  result.payload.clear();
+  result.complete_snapshot = false;
+  result.changed_only = false;
+  if (!bytes_per_element || shadow.size() != source.size()) {
+    return false;
+  }
+  // 52: changed groups are gathered into runs and each run is copied with one insert.
+  // The 49 version inserted every 64-byte group on its own; on the 888 the payload
+  // copies were ~1.2 ms of RenderGuest per frame (vector insert bookkeeping per group).
+  size_t run_begin = 0, run_size = 0;
+  const auto flush_run = [&] {
+    if (!run_size) return;
+    const uint32_t payload_offset = static_cast<uint32_t>(result.payload.size());
+    if (result.ranges.capacity() == result.ranges.size() && result.ranges.size() < 4)
+      result.ranges.reserve(4);
+    result.ranges.push_back({static_cast<uint32_t>(run_begin), payload_offset,
+                             static_cast<uint32_t>(run_size)});
+    result.payload.insert(result.payload.end(), source.data() + run_begin,
+                          source.data() + run_begin + run_size);
+    run_size = 0;
+  };
+  for (const DirtyElementRange& dirty : dirty_ranges.ranges) {
+    if (!dirty.count || dirty.first > std::numeric_limits<uint32_t>::max() / bytes_per_element ||
+        dirty.count > std::numeric_limits<uint32_t>::max() / bytes_per_element) {
+      result = {};
+      return false;
+    }
+    const size_t begin = size_t(dirty.first) * bytes_per_element;
+    const size_t size = size_t(dirty.count) * bytes_per_element;
+    if (begin > source.size() || size > source.size() - begin) {
+      result = {};
+      return false;
+    }
+    dirty_bytes += size;
+    for (size_t offset = begin; offset < begin + size; offset += bytes_per_element) {
+      if (std::memcmp(source.data() + offset, shadow.data() + offset, bytes_per_element) == 0) {
+        continue;
+      }
+      if (run_size && run_begin + run_size == offset) {
+        run_size += bytes_per_element;  // adjacent: same run (also across dirty ranges)
+      } else {
+        flush_run();
+        run_begin = offset;
+        run_size = bytes_per_element;
+      }
+    }
+  }
+  flush_run();
+  result.changed_only = true;
+  return ValidateConstantPayloadDelta(result, source.size());
+}
+
 inline bool CaptureCompleteConstantSnapshot(std::span<const uint8_t> source,
                                             ConstantPayloadDelta& result) {
   if (source.size() > std::numeric_limits<uint32_t>::max()) {
@@ -128,6 +209,7 @@ inline bool CaptureCompleteConstantSnapshot(std::span<const uint8_t> source,
   result.ranges = {{0, 0, static_cast<uint32_t>(source.size())}};
   result.payload.assign(source.begin(), source.end());
   result.complete_snapshot = true;
+  result.changed_only = false;  // 52
   return ValidateConstantPayloadDelta(result, source.size(), true);
 }
 
@@ -189,15 +271,18 @@ class ConstantSnapshotPool {
                                                           size_t copy_bytes = SIZE_MAX) {
     copy_bytes = std::min(copy_bytes, source.size());
     std::vector<uint8_t>* buffer = nullptr;
-    {
+    auto& local = local_free_list(source.size());
+    if (local.empty()) {
       std::lock_guard lock(mutex());
-      auto& list = free_list(source.size());
-      if (!list.empty()) {
-        buffer = list.back();
-        list.pop_back();
+      auto& shared = free_list(source.size());
+      while (!shared.empty() && local.size() < 64) {
+        local.push_back(shared.back());
+        shared.pop_back();
       }
     }
-    if (buffer) {
+    if (!local.empty()) {
+      buffer = local.back();
+      local.pop_back();
       std::memcpy(buffer->data(), source.data(), copy_bytes);
     } else if (copy_bytes == source.size()) {
       buffer = new std::vector<uint8_t>(source);
@@ -209,17 +294,40 @@ class ConstantSnapshotPool {
         buffer,
         [](const std::vector<uint8_t>* bytes) {
           auto* owned = const_cast<std::vector<uint8_t>*>(bytes);
-          std::lock_guard lock(mutex());
-          auto& list = free_list(owned->size());
-          if (list.size() < 8192) list.push_back(owned);
-          else delete owned;
+          auto& loc = local_free_list(owned->size());
+          loc.push_back(owned);
+          // Flush in batches of 64 so background retirement threads (GtaCmdRetirer)
+          // neither hoard 1024 buffers in dead TLS nor lock mutex() per buffer.
+          if (loc.size() >= 128) {
+            std::lock_guard lock(mutex());
+            auto& list = free_list(owned->size());
+            while (loc.size() > 64) {
+              auto* item = loc.back();
+              loc.pop_back();
+              if (list.size() < 8192) list.push_back(item);
+              else delete item;
+            }
+          }
         },
         std::pmr::polymorphic_allocator<std::byte>(&ConstantVersionResource()));
   }
 
  private:
   static std::mutex& mutex() { static std::mutex instance; return instance; }
-  // One list per bank size (vertex, pixel and the rare others).
+  static std::vector<std::vector<uint8_t>*>& local_free_list(size_t size) {
+    struct FastLocalLists {
+      std::vector<std::vector<uint8_t>*> vs_4096;
+      std::vector<std::vector<uint8_t>*> ps_3584;
+      std::vector<std::pair<size_t, std::vector<std::vector<uint8_t>*>>> other;
+    };
+    thread_local FastLocalLists lists;
+    if (size == 4096) return lists.vs_4096;
+    if (size == 3584) return lists.ps_3584;
+    for (auto& [list_size, list] : lists.other)
+      if (list_size == size) return list;
+    lists.other.emplace_back(size, std::vector<std::vector<uint8_t>*>{});
+    return lists.other.back().second;
+  }
   static std::vector<std::vector<uint8_t>*>& free_list(size_t size) {
     static std::vector<std::pair<size_t, std::vector<std::vector<uint8_t>*>>> lists;
     for (auto& [list_size, list] : lists)
@@ -294,7 +402,10 @@ class AuthoritativeConstantState {
       for (const ConstantDeltaRange& range : delta.ranges) {
         const uint8_t* source = delta.payload.data() + range.payload_offset;
         uint8_t* destination = canonical_.data() + range.destination_offset;
-        if (initialized_ && std::memcmp(destination, source, range.byte_count) == 0) continue;
+        // 52: a changed_only delta needs no compare (see ConstantPayloadDelta).
+        if (initialized_ && !delta.changed_only &&
+            std::memcmp(destination, source, range.byte_count) == 0)
+          continue;
         changed = true;
         std::memcpy(destination, source, range.byte_count);
       }
@@ -303,6 +414,9 @@ class AuthoritativeConstantState {
       initialized_ = true;
       auto next = MakeConstantStateVersion();
       next->token = version_;
+      // 29.10: as before 27.10. In normal play hash_callback already returns 0
+      // (gta4_native_lazy_constant_hash); only diagnostic captures ask for the
+      // whole-bank hash, and they compare versions by it.
       next->content_hash = hash_callback(std::span<const uint8_t>(canonical_));
       next->byte_size = canonical_.size();
       // No delta and no parent: the draw snapshots this version from the
@@ -312,14 +426,30 @@ class AuthoritativeConstantState {
       return {ConstantApplyStatus::kApplied, true, current_};
     }
 
+    // 29.10: checked before canonical_ is written (as in the consume path above):
+    // the single-pass copy below must not change the bank when the version
+    // cannot move, or canonical_ would stop matching current_.
+    if (!CanIncrementStateVersion(version_)) {
+      bool unchanged = initialized_;
+      for (const ConstantDeltaRange& range : delta.ranges) {
+        unchanged = unchanged && std::memcmp(canonical_.data() + range.destination_offset,
+                                             delta.payload.data() + range.payload_offset,
+                                             range.byte_count) == 0;
+      }
+      return {unchanged ? ConstantApplyStatus::kApplied : ConstantApplyStatus::kVersionSpaceExhausted,
+              false, current_};
+    }
     ConstantPayloadDelta changed_delta;
     changed_delta.complete_snapshot = !initialized_;
     for (const ConstantDeltaRange& range : delta.ranges) {
       const uint8_t* source = delta.payload.data() + range.payload_offset;
       uint8_t* destination = canonical_.data() + range.destination_offset;
-      if (initialized_ && std::memcmp(destination, source, range.byte_count) == 0) {
+      if (initialized_ && !delta.changed_only &&  // 52
+          std::memcmp(destination, source, range.byte_count) == 0) {
         continue;
       }
+      // Пишем сразу в canonical_ за один проход!
+      std::memcpy(destination, source, range.byte_count);
       const uint32_t payload_offset = static_cast<uint32_t>(changed_delta.payload.size());
       changed_delta.ranges.push_back(
           {range.destination_offset, payload_offset, range.byte_count});
@@ -330,19 +460,12 @@ class AuthoritativeConstantState {
     if (initialized_ && changed_delta.empty()) {
       return {ConstantApplyStatus::kApplied, false, current_};
     }
-    if (!CanIncrementStateVersion(version_)) {
-      return {ConstantApplyStatus::kVersionSpaceExhausted, false, current_};
-    }
-    for (const ConstantDeltaRange& range : changed_delta.ranges) {
-      std::memcpy(canonical_.data() + range.destination_offset,
-                  changed_delta.payload.data() + range.payload_offset, range.byte_count);
-    }
     IncrementStateVersion(version_);
     initialized_ = true;
 
     auto next = MakeConstantStateVersion();
     next->token = version_;
-    next->content_hash = hash_callback(std::span<const uint8_t>(canonical_));
+    next->content_hash = hash_callback(std::span<const uint8_t>(canonical_));  // 29.10: see above
     next->byte_size = canonical_.size();
     // Updates without a consuming draw must not retain an unlimited chain.
     // A complete copied base is equivalent to replaying all prior deltas.

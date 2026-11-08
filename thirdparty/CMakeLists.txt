@@ -79,14 +79,18 @@ add_subdirectory("${LIBERTY_RECOMP_THIRDPARTY_ROOT}/o1heap")
 # Plume (Vulkan abstraction) — Switch uses NVN via libnx, not Vulkan.
 # Volk (plume dep) requires dlfcn.h which newlib doesn't provide.
 if (NOT LIBERTY_RECOMP_TARGET_PLATFORM STREQUAL "switch")
+    if (EXISTS "${LIBERTY_RECOMP_THIRDPARTY_ROOT}/plume")
     add_subdirectory("${LIBERTY_RECOMP_THIRDPARTY_ROOT}/plume")
+endif()
 endif()
 # ffmpeg-core downloads prebuilt binaries — only available for desktop platforms
 if (NOT (LIBERTY_RECOMP_TARGET_PLATFORM STREQUAL "ps4" OR LIBERTY_RECOMP_TARGET_PLATFORM STREQUAL "switch" OR ANDROID))
+    if (EXISTS "${LIBERTY_RECOMP_THIRDPARTY_ROOT}/ffmpeg-core")
     add_subdirectory("${LIBERTY_RECOMP_THIRDPARTY_ROOT}/ffmpeg-core")
 endif()
+endif()
 
-if (APPLE)
+if (APPLE AND EXISTS "${LIBERTY_RECOMP_THIRDPARTY_ROOT}/MoltenVK")
     add_subdirectory("${LIBERTY_RECOMP_THIRDPARTY_ROOT}/MoltenVK")
 endif()
 
@@ -100,5 +104,7 @@ if (NOT (LIBERTY_RECOMP_TARGET_PLATFORM STREQUAL "ps4" OR LIBERTY_RECOMP_TARGET_
     set(ENABLE_ICE ON CACHE BOOL "" FORCE)
     set(USE_STEAMWEBRTC OFF CACHE BOOL "" FORCE)
     set(Protobuf_USE_STATIC_LIBS OFF CACHE BOOL "" FORCE)
+    if (EXISTS "${LIBERTY_RECOMP_THIRDPARTY_ROOT}/GameNetworkingSockets")
     add_subdirectory("${LIBERTY_RECOMP_THIRDPARTY_ROOT}/GameNetworkingSockets")
+endif()
 endif()

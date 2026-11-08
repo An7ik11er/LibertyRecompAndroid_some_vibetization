@@ -82,6 +82,18 @@ void TelemetryEnd(int64_t begin_ns, uint32_t bytes, bool async) {
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 
+static std::string FixShaderPath(std::string path) {
+  size_t shaders_pos = path.find("shaders\\");
+  if (shaders_pos != std::string::npos && path.find("_e2dcl\\") != std::string::npos) {
+    size_t last_slash = path.find_last_of("\\");
+    if (last_slash != std::string::npos) {
+      std::string filename = path.substr(last_slash + 1);
+      return path.substr(0, shaders_pos) + "shaders\\dcl\\" + filename;
+    }
+  }
+  return path;
+}
+
 struct CreateOptions {
   // https://processhacker.sourceforge.io/doc/ntioapi_8h.html
   static const uint32_t FILE_DIRECTORY_FILE = 0x00000001;
@@ -240,10 +252,10 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
 
   auto object_name = REX_KERNEL_MEMORY()->TranslateVirtual<X_ANSI_STRING*>(object_attrs->name_ptr);
 
-  rex::filesystem::Entry* root_entry = nullptr;
+rex::filesystem::Entry* root_entry = nullptr;
 
   // Compute path, possibly attrs relative.
-  auto target_path = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), object_name);
+  auto target_path = FixShaderPath(util::TranslateAnsiPath(REX_KERNEL_MEMORY(), object_name));
   REXKRNL_IMPORT_TRACE(
       "NtCreateFile", "path={} access={:#x} attrs={:#x} share={:#x} disp={:#x} options={:#x}",
       target_path, (uint32_t)desired_access, (uint32_t)file_attributes, (uint32_t)share_access,
@@ -628,7 +640,7 @@ u32 NtRemoveIoCompletion_entry(u32 handle, mapped_u32 key_context, mapped_u32 ap
 u32 NtQueryFullAttributesFile_entry(ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attribs,
                                     ppc_ptr_t<X_FILE_NETWORK_OPEN_INFORMATION> file_info) {
   auto object_name = REX_KERNEL_MEMORY()->TranslateVirtual<X_ANSI_STRING*>(obj_attribs->name_ptr);
-  auto path_str = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), object_name);
+  auto path_str = FixShaderPath(util::TranslateAnsiPath(REX_KERNEL_MEMORY(), object_name));
   REXKRNL_IMPORT_TRACE("NtQueryFullAttributesFile", "path={}", path_str);
 
   object_ref<XFile> root_file;
@@ -636,11 +648,11 @@ u32 NtQueryFullAttributesFile_entry(ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attribs,
       obj_attribs->root_directory != 0) {
     root_file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(obj_attribs->root_directory);
     assert_not_null(root_file);
-    assert_true(root_file->type() == XObject::Type::File);
+ assert_true(root_file->type() == XObject::Type::File);
     assert_always();
   }
 
-  auto target_path = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), object_name);
+  auto target_path = FixShaderPath(util::TranslateAnsiPath(REX_KERNEL_MEMORY(), object_name));
 
   // Enforce that the path is ASCII.
   if (!IsValidPath(target_path, false)) {

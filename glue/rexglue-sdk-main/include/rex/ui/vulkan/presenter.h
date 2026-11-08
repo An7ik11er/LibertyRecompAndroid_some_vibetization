@@ -510,7 +510,7 @@ class VulkanPresenter final : public Presenter {
         uint32_t& present_queue_family_out, VkFormat& image_format_out,
         VkColorSpaceKHR& image_color_space_out, VkExtent2D& image_extent_out,
         bool& is_fifo_out, bool& is_hdr_out, bool& swapchain_probe_enabled_out,
-        bool& ui_surface_unusable_out);
+        bool& ui_surface_unusable_out, bool prerotate_allowed, uint32_t& rotation_out);
 
     // Destroys the swapchain and its derivatives, nulls `swapchain` and returns
     // the original swapchain object, if it existed, for use as oldSwapchain if
@@ -580,6 +580,30 @@ class VulkanPresenter final : public Presenter {
     bool swapchain_hdr_requested = false;
     std::vector<VkImage> swapchain_images;
     std::vector<SwapchainFramebuffer> swapchain_framebuffers;
+
+    // 40 (G2, pre-rotation). While swapchain_rotation != 0 the swapchain images
+    // are in the display's native orientation (swapchain_physical_extent) and
+    // the swapchain is created with preTransform = currentTransform, so the
+    // compositor does not rotate every frame on the GPU. swapchain_extent stays
+    // the logical (window) size used by all painting: the guest output and the
+    // UI are drawn to prerotate_framebuffer exactly as they were drawn to the
+    // swapchain image, and one pass copies that into the swapchain image turned
+    // by swapchain_rotation (clockwise quarter turns: 1 = 90, 2 = 180, 3 = 270).
+    uint32_t swapchain_rotation = 0;
+    VkExtent2D swapchain_physical_extent = {};
+    // Same attachment format as swapchain_render_pass (compatible with every
+    // pipeline created for it), ends in SHADER_READ_ONLY_OPTIMAL.
+    VkRenderPass prerotate_render_pass = VK_NULL_HANDLE;
+    VkFormat prerotate_render_pass_format = VK_FORMAT_UNDEFINED;
+    VkImage prerotate_image = VK_NULL_HANDLE;
+    VkDeviceMemory prerotate_memory = VK_NULL_HANDLE;
+    VkImageView prerotate_view = VK_NULL_HANDLE;
+    VkFramebuffer prerotate_framebuffer = VK_NULL_HANDLE;
+    // For swapchain_render_pass (the rotation pass draws to the swapchain image).
+    VkPipeline prerotate_pipeline = VK_NULL_HANDLE;
+    VkFormat prerotate_pipeline_format = VK_FORMAT_UNDEFINED;
+    // Image, view and framebuffer only; submissions must have completed.
+    void DestroyPrerotateTarget();
   };
 
   explicit VulkanPresenter(HostGpuLossCallback host_gpu_loss_callback,
@@ -647,6 +671,16 @@ class VulkanPresenter final : public Presenter {
   // same due to different dependencies (this is shader read > color
   // attachment > shader read).
   VkRenderPass guest_output_intermediate_render_pass_ = VK_NULL_HANDLE;
+
+  // 40 (G2): the rotation pass (guest_output_paint_vs_ + prerotate_fs_).
+  VkShaderModule prerotate_fs_ = VK_NULL_HANDLE;
+  VkPipelineLayout prerotate_pipeline_layout_ = VK_NULL_HANDLE;
+  VkDescriptorPool prerotate_descriptor_pool_ = VK_NULL_HANDLE;
+  VkDescriptorSet prerotate_descriptor_set_ = VK_NULL_HANDLE;
+  // False if the surface-independent objects above could not be created, or a
+  // connection failed to set up the rotation target: no pre-rotation then.
+  bool prerotate_supported_ = false;
+  [[nodiscard]] bool SetUpPrerotationForConnection(VkFormat swapchain_format);
 
   // Value monotonically increased every time a new guest output image is
   // initialized, for recreation of dependent objects such as framebuffers in

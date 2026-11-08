@@ -1,0 +1,9 @@
+--diagnostics=true
+--diagnostics_categories=logging,native-profiler
+--log_level=info
+--gta4_native_frame_timeline=true
+--gta4_native_hitch_breakdown=true
+--gta4_profile_native_detailed_cpu=true
+--gta4_profile_native_interval=5
+--gta4_profile_native_samples=120
+--gta4_profile_native_capture_trigger=0

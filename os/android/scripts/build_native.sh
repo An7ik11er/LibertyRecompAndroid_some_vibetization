@@ -7,7 +7,7 @@
 # usage: build_native.sh [jobs]      (default: number of CPUs - 2)
 set -euo pipefail
 . "$(dirname "$0")/env.sh"
-JOBS="${1:-$(( $(nproc) > 3 ? $(nproc) - 2 : 1 ))}"
+JOBS="${1:-${JOBS:-4}}"
 
 [ -d "$ANDROID_NDK" ] || { echo "no NDK at $ANDROID_NDK"; exit 1; }
 
@@ -17,8 +17,8 @@ python "$APP_DIR/scripts/materialize_symlinks.py"
 # Snapdragon 865 and every Android 10+ arm64 device we target are ARMv8.2:
 # inline LSE atomics instead of outline-atomic calls, and native ELF TLS
 # (API 29+) instead of emulated TLS. Both are hot in the guest thread.
-CPU_FLAGS="-march=armv8.2-a -fno-emulated-tls"
-if [ ! -f "$BUILD_DIR/build.ninja" ] || ! grep -q -- "-fno-emulated-tls" "$BUILD_DIR/CMakeCache.txt"; then
+CPU_FLAGS="-march=armv8.2-a+lse+dotprod+fp16+crypto -mno-outline-atomics -Wno-asm-operand-widths -DREX_FPCR_STICKY_FLUSH"
+if [ ! -f "$BUILD_DIR/build.ninja" ] || ! grep -qE "ANDROID_PLATFORM:[A-Z]*=android-29" "$BUILD_DIR/CMakeCache.txt"; then
   echo "== configuring $BUILD_TYPE in $BUILD_DIR"
   cmake -S "$REPO" -B "$BUILD_DIR" -G Ninja \
     -DCMAKE_C_FLAGS="$CPU_FLAGS" \
@@ -26,7 +26,7 @@ if [ ! -f "$BUILD_DIR/build.ninja" ] || ! grep -q -- "-fno-emulated-tls" "$BUILD
     -DCMAKE_TOOLCHAIN_FILE="$REPO/toolchains/android.cmake" \
     -DANDROID_NDK="$ANDROID_NDK" \
     -DANDROID_ABI=arm64-v8a \
-    -DANDROID_PLATFORM=android-28 \
+    -DANDROID_PLATFORM=android-29 \
     -DANDROID_STL=c++_shared \
     -DLIBERTY_RECOMP_TARGET_PLATFORM=android \
     -DLIBERTY_RECOMP_ANDROID_RUNTIME_ASSETS=ON \
@@ -61,7 +61,7 @@ mkdir -p "$JNILIBS"
 rm -f "$JNILIBS"/libmain.so "$JNILIBS"/libliberty_install.so "$JNILIBS"/librexruntime.so "$JNILIBS"/librexgpu-*.so       "$JNILIBS"/libSDL3.so "$JNILIBS"/libc++_shared.so
 for so in "$BUILD_DIR"/glue/gta4-recomp/libmain.so \
           "$BUILD_DIR"/glue/gta4-recomp/libliberty_install.so "$REX_OUT_DIR"/librexruntime.so \
-          "$REX_OUT_DIR"/librexgpu-*.so "$REX_OUT_DIR"/libSDL3.so; do
+          "$REX_OUT_DIR"/librexgpu-*.so "$REX_OUT_DIR"/libSDL3.so;do
   [ -f "$so" ] || continue
   # Packaged unstripped by default so ndk-stack and simpleperf can resolve
   # frames. STRIP=1 makes a smaller APK.
@@ -71,7 +71,11 @@ for so in "$BUILD_DIR"/glue/gta4-recomp/libmain.so \
     cp "$so" "$JNILIBS/"
   fi
 done
-cp "$NDK_SYSROOT_LIB/libc++_shared.so" "$JNILIBS/"
+if [ "${STRIP:-0}" = "1" ]; then
+  "$NDK_BIN/llvm-strip" --strip-unneeded -o "$JNILIBS/libc++_shared.so" "$NDK_SYSROOT_LIB/libc++_shared.so"
+else
+  cp "$NDK_SYSROOT_LIB/libc++_shared.so" "$JNILIBS/"
+fi
 
 echo "== checks"
 # A hook added after the hooked list was taken must not be bypassed.

@@ -928,6 +928,11 @@ class Presenter {
   void PaintFromUIThreadImpl(bool force_paint, bool display_opportunity);
   bool ui_paint_pending_ = true;  // UI owner; callbacks do not manufacture work.
   PublicationProgress publication_progress_;
+  // 39: steady-clock ns of the last guest output publication (guest output
+  // thread writes, UI thread reads). While guest frames keep coming, UI-only
+  // repaints wait for the next guest frame instead of presenting on their own.
+  std::atomic<uint64_t> last_guest_publication_ns_{0};
+  bool UIPaintFollowsGuestOutput() const;
 
   void HandleUIDrawersChangeFromUIThread(bool drawers_were_empty);
   void InvalidateGuestOutputTransform() const;

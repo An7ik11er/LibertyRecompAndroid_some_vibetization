@@ -184,12 +184,14 @@ bool Gta4NativeGraphicsSystem::PrepareTemporalFrame() {
     if (contract->filter == gta4_metal::temporal::CompositeFilter::kStockF6) {
       auto prefilter = std::make_shared<NativeCommand>(command);
       prefilter->temporal_composite_mode = 1;
-      prefilter->fixed_function_state.depth_enable = prefilter->fixed_function_state.depth_write_enable = 0;
-      prefilter->fixed_function_state.stencil_enable = prefilter->fixed_function_state.alpha_test_enable = 0;
-      prefilter->fixed_function_state.alpha_to_mask = prefilter->fixed_function_state.alpha_to_mask_enable = 0;
-      prefilter->fixed_function_state.blend_enable = 0;
-      prefilter->fixed_function_state.blend_controls.fill(0x00010001u);
-      prefilter->fixed_function_state.color_write_mask = 0xFu;
+      // 48: the prefilter's own fixed state (the source command's block is shared).
+      NativeFixedFunctionState& prefilter_fixed = MutableOwnedFixedState(*prefilter);
+      prefilter_fixed.depth_enable = prefilter_fixed.depth_write_enable = 0;
+      prefilter_fixed.stencil_enable = prefilter_fixed.alpha_test_enable = 0;
+      prefilter_fixed.alpha_to_mask = prefilter_fixed.alpha_to_mask_enable = 0;
+      prefilter_fixed.blend_enable = 0;
+      prefilter_fixed.blend_controls.fill(0x00010001u);
+      prefilter_fixed.color_write_mask = 0xFu;
       command.temporal_prefilter = std::move(prefilter);
       command.temporal_composite_mode = 2;
       temporal_fields_set_ = true;
@@ -240,8 +242,8 @@ void Gta4NativeGraphicsSystem::ClassifyTemporalDraw(const NativeCommand& command
   const bool primary = depth && depth->scale_domain == VirtualResourceScaleDomain::kPrimaryScene &&
       ((color && color->scale_domain == VirtualResourceScaleDomain::kPrimaryScene &&
         (target.color_attachment_mask & 7u) == 7u) ||
-       (!target.color_attachment_mask && command.fixed_function_state.depth_write_enable &&
-        ((flags & kTemporalSceneGeometry) || command.lighting.stage == RenderExecutionStage::kSceneToGBuffer)));
+       (!target.color_attachment_mask && command.fixed_function_state->depth_write_enable &&
+        ((flags & kTemporalSceneGeometry) || command.lighting().stage == RenderExecutionStage::kSceneToGBuffer)));
   if (primary && !temporal_camera_adopted_ && (flags & kTemporalExecutionCamera)) {
     const auto projection = gta4_metal::temporal::DescribeProjection(instance->projection);
     if (projection && projection->reversed == temporal_configuration_.reversed_depth) {
@@ -268,8 +270,8 @@ void Gta4NativeGraphicsSystem::ClassifyTemporalDraw(const NativeCommand& command
       instance->time_ns == temporal_composite_scope_;
   const auto policy = gta4_metal::temporal::ClassifySceneDraw(true, false, composite, primary,
       bool(flags & kTemporalSceneGeometry), bool(flags & kTemporalScreenSpace), camera_matches,
-      command.lighting);
-  const auto& fixed = command.fixed_function_state;
+      command.lighting());
+  const auto& fixed = *command.fixed_function_state;
   bool blending = false;
   for (uint32_t i = 0; i < kRenderTargetCount; ++i)
     if ((target.color_attachment_mask & (1u << i)) && IsNativeBlendControlEnabled(fixed.blend_controls[i]))
@@ -440,14 +442,14 @@ bool Gta4NativeGraphicsSystem::ResolveTemporalScene(VkCommandBuffer cb, const Na
 bool Gta4NativeGraphicsSystem::ReplayTemporalDraw(VkCommandBuffer cb, const NativeCommand& command,
     const NativeRenderingTarget& original, NativeFrameResources& resources,
     temporal::Image& image, bool clear) {
-  const auto& fixed = command.fixed_function_state;
+  const auto& fixed = *command.fixed_function_state;
   const bool finite_viewport = std::all_of(fixed.viewport_bits.begin(), fixed.viewport_bits.end(),
       [](uint32_t bits) { return std::isfinite(std::bit_cast<float>(bits)); });
   const bool raster_area = original.logical_width && original.logical_height &&
       std::bit_cast<float>(fixed.viewport_bits[2]) > 0 && std::bit_cast<float>(fixed.viewport_bits[3]) > 0 &&
       std::clamp(fixed.scissor[2], 0, int(original.logical_width)) > std::clamp(fixed.scissor[0], 0, int(original.logical_width)) &&
       std::clamp(fixed.scissor[3], 0, int(original.logical_height)) > std::clamp(fixed.scissor[1], 0, int(original.logical_height));
-  if (command.fixed_function_state.depth_enable || command.fixed_function_state.stencil_enable ||
+  if (command.fixed_function_state->depth_enable || command.fixed_function_state->stencil_enable ||
       !command.pipeline_state || !image || !finite_viewport || !raster_area) return false;
   auto* provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
   const auto* device = provider->vulkan_device(); const auto& fn = device->functions();

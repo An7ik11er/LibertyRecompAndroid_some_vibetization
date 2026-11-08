@@ -22,11 +22,12 @@ bool SetFeaturesEnabled(bool enabled) {
 }
 
 Options GetOptions() {
-  // The SDL output worker and guest threads read while the frontend may write.
-  // Registry queries take its lock; raw REXCVAR_GET references do not.
-  using rex::cvar::Query;
-  return {Query<bool>("gta4_sony_enabled"), Query<bool>("gta4_sony_gestures"),
-          Query<bool>("gta4_sony_lighting"), Query<bool>("gta4_sony_rumble"),
-          Query<bool>("gta4_sony_triggers"), static_cast<float>(Query<double>("gta4_sony_intensity"))};
+  // Direct REXCVAR_GET avoids Query / GetFlagByName string allocations and mutex locks.
+  return {REXCVAR_GET(gta4_sony_enabled),
+          REXCVAR_GET(gta4_sony_gestures),
+          REXCVAR_GET(gta4_sony_lighting),
+          REXCVAR_GET(gta4_sony_rumble),
+          REXCVAR_GET(gta4_sony_triggers),
+          static_cast<float>(REXCVAR_GET(gta4_sony_intensity))};
 }
 }  // namespace rex::input::sony

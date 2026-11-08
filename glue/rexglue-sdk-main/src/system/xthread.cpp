@@ -13,7 +13,7 @@
 #include <atomic>
 #include <cstring>
 #include <thread>
-
+#include <pthread.h>
 #include <fmt/format.h>
 
 #include <rex/chrono/clock.h>
@@ -669,8 +669,42 @@ void XThread::Execute() {
   // when another fiber switches back to the main execution context.
   main_fiber_ = rex::thread::Fiber::ConvertCurrentThread();
 
-  // Execute the function
+ // Execute the function
   REXSYS_NOISY_DEBUG("XThread::Execute - Calling function at {:08X}", address);
+
+#if defined(__ANDROID__)
+  // Читаем реальную целевую функцию из контекста RAGE (регистр r4 -> первое 32-битное слово)
+  uint32_t rage_fn = 0;
+  if (ctx->r4.u32 >= 0x80000000 && ctx->r4.u32 < 0x90000000 && !(ctx->r4.u32 & 3)) {
+    // r4 — параметр потока, не обязательно указатель: читать только закоммиченную
+    // страницу, иначе SIGSEGV на старте потока.
+    auto* heap = memory->LookupHeap(ctx->r4.u32);
+    if (heap && heap->QueryRangeAccess(ctx->r4.u32, ctx->r4.u32 + 3) !=
+                    rex::memory::PageAccess::kNoAccess) {
+      std::memcpy(&rage_fn, base + ctx->r4.u32, sizeof(rage_fn));
+      rage_fn = __builtin_bswap32(rage_fn);
+    }
+  }
+
+  if (address == 0x821909D0 || rage_fn == 0x821909D0) {
+    pthread_setname_np(pthread_self(), "AudioGuest");
+  } else if (address == 0x821B6F18 || rage_fn == 0x821B6F18) {
+    pthread_setname_np(pthread_self(), "RenderGuest");
+  } else if (rage_fn == 0x82902728) {
+    pthread_setname_np(pthread_self(), "RageStream");
+  } else if (rage_fn == 0x8285D368) {
+    pthread_setname_np(pthread_self(), "RageJobWork");
+  } else if (rage_fn == 0x82798BA0 || rage_fn == 0x827989F8) {
+    pthread_setname_np(pthread_self(), "RagePhysics");
+  } else if (rage_fn == 0x8284C5E8) {
+    pthread_setname_np(pthread_self(), "RageFileIO");
+  } else if (rage_fn != 0) {
+    char tname[16];
+    std::snprintf(tname, sizeof(tname), "Rage_%06X", rage_fn & 0xFFFFFF);
+    pthread_setname_np(pthread_self(), tname);
+  }
+#endif
+
   func(*ctx, base);
 
   exit_code = static_cast<int>(ctx->r3.u32);

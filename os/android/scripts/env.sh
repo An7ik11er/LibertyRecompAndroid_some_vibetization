@@ -7,7 +7,11 @@ _scripts_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export APP_DIR="$(cd "$_scripts_dir/.." && pwd)"
 export REPO="$(cd "$APP_DIR/../.." && pwd)"
 
-if [ -z "${ANDROID_HOME:-}" ]; then
+if [ -d "/g/cod/cacheSlopodroid" ]; then
+  ANDROID_HOME="/g/cod/cacheSlopodroid"
+elif [ -d "G:/cod/cacheSlopodroid" ]; then
+  ANDROID_HOME="G:/cod/cacheSlopodroid"
+elif [ -z "${ANDROID_HOME:-}" ] || [[ "${ANDROID_HOME:-}" =~ ^[Dd]: ]] || [[ "${ANDROID_HOME:-}" =~ ^/d/ ]]; then
   if [ -n "${LOCALAPPDATA:-}" ]; then
     ANDROID_HOME="$(cygpath -u "$LOCALAPPDATA")/Android/Sdk"
   else
@@ -16,7 +20,7 @@ if [ -z "${ANDROID_HOME:-}" ]; then
 fi
 export ANDROID_HOME
 export ANDROID_SDK_ROOT="$ANDROID_HOME"
-export NDK_VER="${NDK_VER:-29.0.14206865}"
+export NDK_VER="${NDK_VER:-30.0.16248370}"
 export ANDROID_NDK="${ANDROID_NDK:-$ANDROID_HOME/ndk/$NDK_VER}"
 export JAVA_HOME="${JAVA_HOME:-/c/Program Files/Android/Android Studio/jbr}"
 
@@ -48,6 +52,12 @@ export FILES="/sdcard/Android/data/$PKG/files"
 export GAME_DIR="$FILES/LibertyRecomp/game"
 
 export PATH="$JAVA_HOME/bin:$ANDROID_HOME/platform-tools:$PATH"
+for _cmake_bin in "$ANDROID_HOME"/cmake/*/bin; do
+  if [ -d "$_cmake_bin" ]; then
+    export PATH="$_cmake_bin:$PATH"
+    break
+  fi
+done
 
 # Whichever single device is attached, unless SERIAL is set.
 if [ -z "${SERIAL:-}" ]; then
