@@ -527,6 +527,7 @@ bool Gta4NativeGraphicsSystem::ClearGuestOutputStreamed(
     if ((present_source ? present_source->generation : 0) != predicted) {
       ++stream_source_mismatches_;
     }
+    CountStreamPresentHandle(present_source);  // 62
     RememberStreamPresentSource(present_source);
     stream_last_width_ = width;
     stream_last_height_ = height;
@@ -632,12 +633,25 @@ void Gta4NativeGraphicsSystem::ReportStreamRecord() {
       ANDROID_LOG_WARN, "LibertyRecomp",
       "gta4-native-stream: %.1f s: streamed=%llu classic=%llu flushes=%llu failed=%llu "
       "presenter-fallbacks=%llu frame-mismatches=%llu source-mismatches=%llu deferred-fb=%llu "
+      "fb-handle-same=%llu fb-handle-other=%llu "
+      "fb-new-gen[none/cpu/lifetime/dirty/fetch/alias/pre-resolve/snapshot]="
+      "%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu tex-images-created=%llu "
       "pumps/frame=%.0f lookahead=%u constant-reserve=%lluKB draw-reserve=%u resolve-reserve=%u "
       "task-frame=%lluKB disabled=%d last=%s",
       double(now - stream_report_tick_) / double(frequency), ull(stream_frames_),
       ull(stream_classic_frames_), ull(stream_flushes_), ull(stream_failed_frames_),
       ull(stream_presenter_fallbacks_), ull(stream_frame_mismatches_),
       ull(stream_source_mismatches_), ull(stream_deferred_frontbuffer_resolves_),
+      ull(stream_handle_same_), ull(stream_handle_other_),
+      ull(frontbuffer_new_generation_[0].load(std::memory_order_relaxed)),
+      ull(frontbuffer_new_generation_[1].load(std::memory_order_relaxed)),
+      ull(frontbuffer_new_generation_[2].load(std::memory_order_relaxed)),
+      ull(frontbuffer_new_generation_[3].load(std::memory_order_relaxed)),
+      ull(frontbuffer_new_generation_[4].load(std::memory_order_relaxed)),
+      ull(frontbuffer_new_generation_[5].load(std::memory_order_relaxed)),
+      ull(frontbuffer_new_generation_[6].load(std::memory_order_relaxed)),
+      ull(frontbuffer_new_generation_[7].load(std::memory_order_relaxed)),
+      ull(texture_images_created_.load(std::memory_order_relaxed)),
       stream_frames_ ? double(stream_pumps_) / double(stream_frames_) : 0.0,
       unsigned(stream_.lookahead), ull(stream_constant_reserve_ >> 10),
       unsigned(stream_draw_reserve_), unsigned(stream_resolve_reserve_),
@@ -649,4 +663,7 @@ void Gta4NativeGraphicsSystem::ReportStreamRecord() {
   stream_presenter_fallbacks_ = stream_frame_mismatches_ = stream_source_mismatches_ = 0;
   stream_pumps_ = 0;
   stream_deferred_frontbuffer_resolves_ = 0;
+  stream_handle_same_ = stream_handle_other_ = 0;
+  for (auto& count : frontbuffer_new_generation_) count.store(0, std::memory_order_relaxed);
+  texture_images_created_.store(0, std::memory_order_relaxed);
 }

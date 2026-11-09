@@ -5731,6 +5731,30 @@ Gta4NativeGraphicsSystem::CreateResolvedTextureResource(const ResolveCommand& co
         return existing_resource;
       }
     }
+    // 62: batch 64 — the frontbuffer got a new generation on every frame (deferred-fb ==
+    // streamed), though a resolve into the same handle reuses its resource. Which condition
+    // fails, for the handles the recent Presents showed: none / cpu (not GPU-produced) /
+    // lifetime / dirty / fetch (fetch: the first cases log which dwords changed). The other
+    // three places that make a generation count into [5] alias, [6] pre-resolve, [7] snapshot.
+    if (IsRecentFrontbufferHandle(command.destination_texture)) {
+      const uint32_t reason =
+          !existing_resource                                                    ? 0u
+          : !existing_resource->gpu_produced                                    ? 1u
+          : existing_resource->virtual_lifetime != virtual_lifetime             ? 2u
+          : dirty_texture_handles_.contains(command.destination_texture)        ? 3u
+                                                                                : 4u;
+      const uint64_t count =
+          frontbuffer_new_generation_[reason].fetch_add(1, std::memory_order_relaxed);
+      if (reason == 4 && count < 8) {
+        const auto& old = existing_resource->fetch;
+        REXLOG_WARN(
+            "gta4-native-frontbuffer: new generation for {:08X}: fetch "
+            "{:08X},{:08X},{:08X},{:08X},{:08X},{:08X} -> {:08X},{:08X},{:08X},{:08X},{:08X},{:08X}",
+            command.destination_texture, old.dword_0, old.dword_1, old.dword_2, old.dword_3,
+            old.dword_4, old.dword_5, fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3,
+            fetch.dword_4, fetch.dword_5);
+      }
+    }
   }
 
   auto resource = std::make_shared<NativeTextureResource>();
@@ -6207,6 +6231,8 @@ Gta4NativeGraphicsSystem::CaptureTextureResourceUncached(
             resource->fetch.swizzle == fetch.swizzle) {
           return resource;
         }
+        if (IsRecentFrontbufferHandle(handle))  // 62
+          frontbuffer_new_generation_[5].fetch_add(1, std::memory_order_relaxed);
         auto alias = std::make_shared<NativeTextureResource>();
         alias->handle = handle;
         alias->generation = next_texture_generation_++;
@@ -6248,6 +6274,8 @@ Gta4NativeGraphicsSystem::CaptureTextureResourceUncached(
         return resource;
       }
       if (action == VirtualTextureCaptureAction::kCreateDeterministicHostGeneration) {
+        if (IsRecentFrontbufferHandle(handle))  // 62
+          frontbuffer_new_generation_[6].fetch_add(1, std::memory_order_relaxed);
         auto deterministic = std::make_shared<NativeTextureResource>();
         deterministic->handle = handle;
         deterministic->generation = next_texture_generation_++;
@@ -6747,6 +6775,8 @@ Gta4NativeGraphicsSystem::CaptureTextureResourceUncached(
     }
   }
 
+  if (IsRecentFrontbufferHandle(handle))  // 62: a guest (CPU) snapshot of a frontbuffer
+    frontbuffer_new_generation_[7].fetch_add(1, std::memory_order_relaxed);
   auto resource = std::make_shared<NativeTextureResource>();
   resource->handle = handle;
   resource->content_hash = content_hash;
@@ -19792,6 +19822,7 @@ Gta4NativeGraphicsSystem::NativeTextureImage* Gta4NativeGraphicsSystem::GetOrCre
     return reject("format-capabilities");
   }
 
+  texture_images_created_.fetch_add(1, std::memory_order_relaxed);  // 62: per-frame churn
   auto image = std::make_unique<NativeTextureImage>();
   // 32: the image outlives the frame; never keep the frame's capture
   // keep-alive (and every resource in it) alive through it.
@@ -39740,6 +39771,7 @@ bool Gta4NativeGraphicsSystem::ClearGuestOutput(
     if (present.device) {
       stream_has_water_ = frame_constant_bound_.valid && frame_constant_bound_.has_water;
       stream_next_frame_ = submitted_frame + 1;
+      CountStreamPresentHandle(present_source);  // 62: before the prediction moves on
       RememberStreamPresentSource(present_source);  // 61
       stream_last_width_ = width;
       stream_last_height_ = height;

@@ -2670,6 +2670,32 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     return stream_last_present_source_;
   }
   uint64_t stream_deferred_frontbuffer_resolves_ = 0;
+  // 62: frontbuffer diagnostics (batch 64: source-mismatches on every frame). The handle
+  // (guest texture) of a Present against the previous one's, and why resolves into the recent
+  // Presents' handles got a new generation (CreateResolvedTextureResource and three others).
+  uint64_t stream_handle_same_ = 0, stream_handle_other_ = 0;
+  // The last four distinct changes of the presented handle: covers up to four frontbuffers
+  // in rotation (a resolve targets the one presented N frames ago).
+  std::array<std::atomic<uint32_t>, 4> frontbuffer_handles_{};
+  std::array<std::atomic<uint64_t>, 8> frontbuffer_new_generation_{};
+  std::atomic<uint64_t> texture_images_created_{0};
+  void CountStreamPresentHandle(const std::shared_ptr<const NativeTextureResource>& source) {
+    const uint32_t handle = source ? source->handle : 0;
+    const uint32_t last = frontbuffer_handles_[0].load(std::memory_order_relaxed);
+    if (handle && last) ++(handle == last ? stream_handle_same_ : stream_handle_other_);
+    if (handle && handle != last) {
+      for (size_t i = frontbuffer_handles_.size() - 1; i > 0; --i)
+        frontbuffer_handles_[i].store(frontbuffer_handles_[i - 1].load(std::memory_order_relaxed),
+                                      std::memory_order_relaxed);
+      frontbuffer_handles_[0].store(handle, std::memory_order_relaxed);
+    }
+  }
+  bool IsRecentFrontbufferHandle(uint32_t handle) const {
+    if (!handle) return false;
+    for (const auto& recent : frontbuffer_handles_)
+      if (recent.load(std::memory_order_relaxed) == handle) return true;
+    return false;
+  }
   bool stream_last_hdr_output_ = false;
   float stream_last_hdr_headroom_ = 0.0f;
   bool stream_presenter_seen_ = false;  // a callback ran since the last flush
