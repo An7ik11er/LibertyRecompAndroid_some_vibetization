@@ -1923,10 +1923,20 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     bool has_last_shared_key = false;
     NativeSharedConstantSemanticKey last_shared_key{};
     NativeUploadAllocation last_shared_allocation{};
+    static constexpr size_t kSharedMruSize = 4;
+    struct SharedMruEntry {
+      bool valid = false;
+      NativeSharedConstantSemanticKey key{};
+      NativeUploadAllocation allocation{};
+    };
+    std::array<SharedMruEntry, kSharedMruSize> shared_mru{};
+    uint32_t shared_mru_cursor = 0;
     bool Reset() {
       has_last_shared_key = false;
       last_shared_key = {};
       last_shared_allocation = {};
+      for (auto& entry : shared_mru) entry.valid = false;
+      shared_mru_cursor = 0;
       if (!vertex_uploads.CanResetGeneration() || !index16_uploads.CanResetGeneration() ||
           !index32_uploads.CanResetGeneration()) return false;
       return vertex_uploads.ResetGeneration() && index16_uploads.ResetGeneration() &&
@@ -2664,6 +2674,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   uint64_t pipeline_snapshot_reuses_=0,shader_snapshot_reuses_=0;
   uint64_t zero_dof_skips_=0,postfx_direct_writes_=0;
   std::shared_ptr<const NativePipelineState> last_pipeline_snapshot_;
+  const NativeTargetSnapshot* last_pipeline_snapshot_targets_ = nullptr;
   std::shared_ptr<const NativeShaderState> last_shader_snapshot_;
   // 33: worker snapshot keep-alive. The worker makes a NativeShaderState and a
   // NativePipelineState for nearly every draw (constants and texture / stream
@@ -2800,12 +2811,30 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
       }
     }
   }
+  struct BufferMruEntry {
+    uint32_t handle = 0;
+    uint32_t alias_serial = 0;
+    uint64_t epoch = 0;
+    const NativeBufferResource* alias = nullptr;
+  };
+  std::array<BufferMruEntry, 4> buffer_capture_mru_{};  // command_capture_mutex_
+  uint32_t buffer_capture_mru_cursor_ = 0;
+
   std::array<BufferCaptureCacheSlot, 8192> buffer_capture_cache_{};  // command_capture_mutex_
   std::atomic<uint64_t> buffer_resources_epoch_{1};
   BufferCaptureCacheSlot& BufferCaptureSlot(uint32_t handle) {
     return CaptureCacheWay(buffer_capture_cache_, handle);
   }
-  void ForgetBufferCapture(uint32_t handle) { ForgetCaptureCache(buffer_capture_cache_, handle); }
+  void ForgetBufferCapture(uint32_t handle) {
+    for (auto& entry : buffer_capture_mru_) {
+      if (entry.handle == handle) {
+        entry.handle = 0;
+        entry.alias = nullptr;
+        entry.alias_serial = 0;
+      }
+    }
+    ForgetCaptureCache(buffer_capture_cache_, handle);
+  }
   // Producer-only memo of clean texture captures: same handle and identical
   // image fetch words with no texture-map change since give the same resource, so
   // Prepare, both texture_resource_mutex_ acquisitions and three hash lookups

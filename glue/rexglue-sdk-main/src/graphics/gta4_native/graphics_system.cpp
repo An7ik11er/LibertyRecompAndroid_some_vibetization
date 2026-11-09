@@ -5773,6 +5773,43 @@ Gta4NativeGraphicsSystem::CreateResolvedTextureResource(const ResolveCommand& co
 
 std::shared_ptr<const Gta4NativeGraphicsSystem::NativeBufferResource>
 Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
+  if (!handle) [[unlikely]] return {};
+
+  const uint64_t cache_epoch = buffer_resources_epoch_.load(std::memory_order_relaxed);
+  const uint32_t current_serial = capture_keepalive_serial_;
+
+  // Fast path 1: Instant L1 MRU hit for consecutive draws sharing vertex/index buffer
+  if (current_serial) [[likely]] {
+    for (const auto& entry : buffer_capture_mru_) {
+      if (entry.handle == handle && entry.epoch == cache_epoch &&
+          entry.alias_serial == current_serial && entry.alias) [[likely]] {
+        const uint32_t current_frame =
+            g_native_memory_profile_event_frame.load(std::memory_order_relaxed);
+        if (entry.alias->last_used_frame.load(std::memory_order_relaxed) != current_frame) {
+          entry.alias->last_used_frame.store(current_frame, std::memory_order_relaxed);
+        }
+        return AliasCaptured(entry.alias);
+      }
+    }
+  }
+
+  // Fast path 2: Direct 2-way slot check BEFORE expensive TranslateVirtual, bswaps, and metadata decoding!
+  BufferCaptureCacheSlot& cache_slot = BufferCaptureSlot(handle);
+  if (current_serial && cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
+      cache_slot.alias && cache_slot.alias_serial == current_serial) [[likely]] {
+    const uint32_t current_frame =
+        g_native_memory_profile_event_frame.load(std::memory_order_relaxed);
+    if (cache_slot.alias->last_used_frame.load(std::memory_order_relaxed) != current_frame) {
+      cache_slot.alias->last_used_frame.store(current_frame, std::memory_order_relaxed);
+    }
+    auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & 3];
+    mru.handle = handle;
+    mru.alias_serial = current_serial;
+    mru.epoch = cache_epoch;
+    mru.alias = cache_slot.alias;
+    return AliasCaptured(cache_slot.alias);
+  }
+
   auto reject = [handle](const char* reason, uint32_t flags, uint32_t data_address,
                          uint32_t data_size) {
     static std::atomic<uint64_t> rejection_count{0};
@@ -5810,8 +5847,6 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
     return reject("metadata", flags, data_address, data_size);
   }
 
-  BufferCaptureCacheSlot& cache_slot = BufferCaptureSlot(handle);
-  const uint64_t cache_epoch = buffer_resources_epoch_.load(std::memory_order_acquire);
   const uint32_t current_frame =
       g_native_memory_profile_event_frame.load(std::memory_order_relaxed);
   static const bool use_keepalive = REXCVAR_GET(gta4_native_capture_keepalive);
@@ -5837,13 +5872,25 @@ if (cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
     if (cache_slot.alias && cache_slot.alias_serial == capture_keepalive_serial_ &&
         capture_keepalive_serial_) {
       touch_frame(*cache_slot.alias);
+      auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & 3];
+      mru.handle = handle;
+      mru.alias_serial = capture_keepalive_serial_;
+      mru.epoch = cache_epoch;
+      mru.alias = cache_slot.alias;
       return AliasCaptured(cache_slot.alias);
     }
     if (auto cached = cache_slot.resource.lock()) {
       // Чистый слот во фронт-кэше (сбрасывается при любом ResourceUnlock) — возвращаем сразу без memcmp!
       touch_frame(*cached);
-      if (use_keepalive)
-        return KeepCaptured(std::move(cached), cache_slot.alias, cache_slot.alias_serial);
+      if (use_keepalive) {
+        auto res = KeepCaptured(std::move(cached), cache_slot.alias, cache_slot.alias_serial);
+        auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & 3];
+        mru.handle = handle;
+        mru.alias_serial = capture_keepalive_serial_;
+        mru.epoch = cache_epoch;
+        mru.alias = cache_slot.alias;
+        return res;
+      }
       return cached;
     }
     cache_slot.handle = 0;
@@ -5873,8 +5920,16 @@ if (cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
     touch_frame(*matching_cache_entry);
     remember(matching_cache_entry);
     if (use_keepalive) {
-      return KeepCaptured(std::move(matching_cache_entry), cache_slot.alias,
+      auto res = KeepCaptured(std::move(matching_cache_entry), cache_slot.alias,
                           cache_slot.alias_serial);
+      if (cache_slot.alias) {
+        auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & 3];
+        mru.handle = handle;
+        mru.alias_serial = capture_keepalive_serial_;
+        mru.epoch = cache_epoch;
+        mru.alias = cache_slot.alias;
+      }
+      return res;
     }
     return matching_cache_entry;
   }
@@ -5894,8 +5949,16 @@ if (cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
       matching_cache_entry->last_used_frame.store(current_frame, std::memory_order_relaxed);
       remember(matching_cache_entry);
       if (use_keepalive) {
-        return KeepCaptured(std::move(matching_cache_entry), cache_slot.alias,
-                            cache_slot.alias_serial);
+        auto res = KeepCaptured(std::move(matching_cache_entry), cache_slot.alias,
+                                cache_slot.alias_serial);
+        if (cache_slot.alias) {
+          auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & 3];
+          mru.handle = handle;
+          mru.alias_serial = capture_keepalive_serial_;
+          mru.epoch = cache_epoch;
+          mru.alias = cache_slot.alias;
+        }
+        return res;
       }
       return matching_cache_entry;
     }
@@ -5913,6 +5976,18 @@ if (cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
       dirty_buffer_handles_.erase(handle);
       resource->last_used_frame.store(current_frame, std::memory_order_relaxed);
       remember(resource);
+      if (use_keepalive) {
+        std::shared_ptr<const NativeBufferResource> keep_resource = resource;
+        auto res = KeepCaptured(std::move(keep_resource), cache_slot.alias, cache_slot.alias_serial);
+        if (cache_slot.alias) {
+          auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & 3];
+          mru.handle = handle;
+          mru.alias_serial = capture_keepalive_serial_;
+          mru.epoch = cache_epoch;
+          mru.alias = cache_slot.alias;
+        }
+        return res;
+      }
       return resource;
     }
   }
@@ -5937,6 +6012,18 @@ if (cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
       handle, resource->generation, 0, resource->payload.size(), resource->payload.capacity(), 0,
       resource->created_frame, flags);
   remember(resource);
+  if (use_keepalive) {
+    std::shared_ptr<const NativeBufferResource> keep_resource = resource;
+    auto res = KeepCaptured(std::move(keep_resource), cache_slot.alias, cache_slot.alias_serial);
+    if (cache_slot.alias) {
+      auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & 3];
+      mru.handle = handle;
+      mru.alias_serial = capture_keepalive_serial_;
+      mru.epoch = cache_epoch;
+      mru.alias = cache_slot.alias;
+    }
+    return res;
+  }
   return resource;
 }
 
@@ -8477,17 +8564,27 @@ Gta4NativeGraphicsSystem::SnapshotPipeline(const NativeCommand& command, bool dr
   if (last_pipeline_snapshot_ && last_pipeline_snapshot_->version == pipeline_state_.version &&
       last_pipeline_snapshot_->vertex_shader_resource == pipeline_state_.vertex_shader_resource &&
       last_pipeline_snapshot_->pixel_shader_resource == pipeline_state_.pixel_shader_resource &&
-      last_pipeline_snapshot_->vertex_declaration_resource == pipeline_state_.vertex_declaration_resource &&
-      NativeSurfaceStateEqual(last_pipeline_snapshot_->depth_stencil, depth) &&
-      std::equal(colors.begin(), colors.end(), last_pipeline_snapshot_->render_targets.begin(),
-                 [](const auto& a, const auto& b) { return NativeSurfaceStateEqual(a, b); })) {
-    ++pipeline_snapshot_reuses_;
-    return last_pipeline_snapshot_;
+      last_pipeline_snapshot_->vertex_declaration_resource == pipeline_state_.vertex_declaration_resource) {
+    if (draw) {
+      const NativeTargetSnapshot* targets_ptr = command.snapshot_targets.get();
+      if (targets_ptr == last_pipeline_snapshot_targets_ ||
+          (NativeSurfaceStateEqual(last_pipeline_snapshot_->depth_stencil, depth) &&
+           std::equal(colors.begin(), colors.end(), last_pipeline_snapshot_->render_targets.begin(),
+                      [](const auto& a, const auto& b) { return NativeSurfaceStateEqual(a, b); }))) {
+        last_pipeline_snapshot_targets_ = targets_ptr;
+        ++pipeline_snapshot_reuses_;
+        return last_pipeline_snapshot_;
+      }
+    } else {
+      ++pipeline_snapshot_reuses_;
+      return last_pipeline_snapshot_;
+    }
   }
-auto snapshot = std::allocate_shared<NativePipelineState>(
+  auto snapshot = std::allocate_shared<NativePipelineState>(
       std::pmr::polymorphic_allocator<NativePipelineState>(&snapshot_pool_), pipeline_state_);
   snapshot->render_targets = colors;
   snapshot->depth_stencil = depth;
+  last_pipeline_snapshot_targets_ = draw ? command.snapshot_targets.get() : nullptr;
   last_pipeline_snapshot_ = std::move(snapshot);
   return last_pipeline_snapshot_;
 }
@@ -25145,9 +25242,23 @@ fast_valid     = true;
   if (active_frame_slot_ >= frame_constant_arenas_.size()) {
     return false;
   }
+  bool shared_hit = false;
   if (resources.has_last_shared_key && shared_key == resources.last_shared_key) {
     shared_constants_allocation = resources.last_shared_allocation;
+    shared_hit = true;
   } else {
+    for (const auto& entry : resources.shared_mru) {
+      if (entry.valid && entry.key == shared_key) {
+        shared_constants_allocation = entry.allocation;
+        shared_hit = true;
+        resources.has_last_shared_key = true;
+        resources.last_shared_key = entry.key;
+        resources.last_shared_allocation = entry.allocation;
+        break;
+      }
+    }
+  }
+  if (!shared_hit) {
     NativeFrameConstantArena& constant_arena = frame_constant_arenas_[active_frame_slot_];
     uint64_t remembered_identity = 0;
     uint64_t* shared_identity = nullptr;
@@ -25259,6 +25370,10 @@ fast_valid     = true;
         return false;
       }
     }
+    auto& mru_entry = resources.shared_mru[resources.shared_mru_cursor++ & (NativeFrameResources::kSharedMruSize - 1)];
+    mru_entry.valid = true;
+    mru_entry.key = shared_key;
+    mru_entry.allocation = shared_constants_allocation;
     resources.has_last_shared_key = true;
     resources.last_shared_key = shared_key;
     resources.last_shared_allocation = shared_constants_allocation;
