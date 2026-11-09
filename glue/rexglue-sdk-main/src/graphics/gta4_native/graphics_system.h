@@ -2821,7 +2821,9 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     uint64_t epoch = 0;
     const NativeBufferResource* alias = nullptr;
   };
-  std::array<BufferMruEntry, 4> buffer_capture_mru_{};  // command_capture_mutex_
+  static constexpr size_t kBufferCaptureMruSize = 8;
+  static constexpr uint32_t kBufferCaptureMruMask = kBufferCaptureMruSize - 1;
+  std::array<BufferMruEntry, kBufferCaptureMruSize> buffer_capture_mru_{};  // command_capture_mutex_
   uint32_t buffer_capture_mru_cursor_ = 0;
 
   std::array<BufferCaptureCacheSlot, 8192> buffer_capture_cache_{};  // command_capture_mutex_

@@ -833,3 +833,7 @@ export_for_direct_record/
 audit_changes.ps1
 tools/direct_calls_hooked_used_49.txt
 tools/optimize_generated_report.txt
+
+# Game files - DO NOT COMMIT
+game_files/
+game_files

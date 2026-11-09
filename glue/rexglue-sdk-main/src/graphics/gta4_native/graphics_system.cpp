@@ -5800,7 +5800,7 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
     if (cache_slot.alias->last_used_frame.load(std::memory_order_relaxed) != current_frame) {
       cache_slot.alias->last_used_frame.store(current_frame, std::memory_order_relaxed);
     }
-    auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & 3];
+    auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & kBufferCaptureMruMask];
     mru.handle = handle;
     mru.alias_serial = current_serial;
     mru.epoch = cache_epoch;
@@ -5870,7 +5870,7 @@ if (cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
     if (cache_slot.alias && cache_slot.alias_serial == capture_keepalive_serial_ &&
         capture_keepalive_serial_) {
       touch_frame(*cache_slot.alias);
-      auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & 3];
+      auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & kBufferCaptureMruMask];
       mru.handle = handle;
       mru.alias_serial = capture_keepalive_serial_;
       mru.epoch = cache_epoch;
@@ -5882,7 +5882,7 @@ if (cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
       touch_frame(*cached);
       if (use_keepalive) {
         auto res = KeepCaptured(std::move(cached), cache_slot.alias, cache_slot.alias_serial);
-        auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & 3];
+        auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & kBufferCaptureMruMask];
         mru.handle = handle;
         mru.alias_serial = capture_keepalive_serial_;
         mru.epoch = cache_epoch;
@@ -5921,7 +5921,7 @@ if (cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
       auto res = KeepCaptured(std::move(matching_cache_entry), cache_slot.alias,
                           cache_slot.alias_serial);
       if (cache_slot.alias) {
-        auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & 3];
+        auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & kBufferCaptureMruMask];
         mru.handle = handle;
         mru.alias_serial = capture_keepalive_serial_;
         mru.epoch = cache_epoch;
@@ -5950,7 +5950,7 @@ if (cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
         auto res = KeepCaptured(std::move(matching_cache_entry), cache_slot.alias,
                                 cache_slot.alias_serial);
         if (cache_slot.alias) {
-          auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & 3];
+          auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & kBufferCaptureMruMask];
           mru.handle = handle;
           mru.alias_serial = capture_keepalive_serial_;
           mru.epoch = cache_epoch;
@@ -5978,7 +5978,7 @@ if (cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
         std::shared_ptr<const NativeBufferResource> keep_resource = resource;
         auto res = KeepCaptured(std::move(keep_resource), cache_slot.alias, cache_slot.alias_serial);
         if (cache_slot.alias) {
-          auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & 3];
+          auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & kBufferCaptureMruMask];
           mru.handle = handle;
           mru.alias_serial = capture_keepalive_serial_;
           mru.epoch = cache_epoch;
@@ -6014,7 +6014,7 @@ if (cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
     std::shared_ptr<const NativeBufferResource> keep_resource = resource;
     auto res = KeepCaptured(std::move(keep_resource), cache_slot.alias, cache_slot.alias_serial);
     if (cache_slot.alias) {
-      auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & 3];
+      auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & kBufferCaptureMruMask];
       mru.handle = handle;
       mru.alias_serial = capture_keepalive_serial_;
       mru.epoch = cache_epoch;
@@ -20721,7 +20721,7 @@ NativeFrameTask Gta4NativeGraphicsSystem::PrepareFrameTexturesTask(
   // batch is as valid a source as the previous one. Cleared wherever
   // previous_prepared_draw is.
   constexpr size_t kPreparedDrawCacheSize = 512;
-  std::array<const NativeCommand*, kPreparedDrawCacheSize> prepared_draw_cache{};
+  std::array<std::array<const NativeCommand*, 2>, kPreparedDrawCacheSize> prepared_draw_cache{};
   // With the worker's signatures on both draws, equal inputs are equal
   // signatures (a 64-bit hash of the same fields the full comparison reads).
   const auto prepared_inputs_equal = [](const NativeCommand& previous, const NativeCommand& next) {
@@ -20766,7 +20766,26 @@ NativeFrameTask Gta4NativeGraphicsSystem::PrepareFrameTexturesTask(
   uint32_t draw_count = 0;
   uint32_t resolve_count = 0;
   uint32_t depth_handoff_count = 0;
-  std::unordered_set<uint64_t> packed_alias_generations;
+  struct FlatAliasGenerations {
+    std::array<uint64_t, 16> items{};
+    size_t count = 0;
+    void insert(uint64_t val) {
+      for (size_t i = 0; i < count; ++i) {
+        if (items[i] == val) return;
+      }
+      if (count < items.size()) {
+        items[count++] = val;
+      }
+    }
+    void insert(const uint64_t* first, const uint64_t* last) {
+      for (const uint64_t* it = first; it != last; ++it) insert(*it);
+    }
+    void insert(std::vector<uint64_t>::const_iterator first, std::vector<uint64_t>::const_iterator last) {
+      for (auto it = first; it != last; ++it) insert(*it);
+    }
+    size_t size() const { return count; }
+  };
+  FlatAliasGenerations packed_alias_generations;
   std::vector<NativeCommand*> texture_commands;
   texture_commands.reserve((*recording_frame_).size());
   // The worker counted these while assembling; temporal prefilter draws are
@@ -20882,7 +20901,9 @@ if (!PrepareFrameDescriptorPool(descriptor_pool_draw_count, combined_descriptor_
   std::vector<std::pair<NativeCommand*, NativeDrawDescriptorKey>> cached_draws;
   std::vector<NativeCommand*> indexed_draw_commands;
   if (native_descriptor_backend_ == NativeDescriptorBackend::kIndexed) {
-    indexed_draw_commands.reserve(draw_count);
+    if (!native_descriptor_paging_) {
+      indexed_draw_commands.reserve(draw_count);
+    }
   } else {
     cached_draws.reserve(draw_count);
   }
@@ -20896,13 +20917,29 @@ if (!PrepareFrameDescriptorPool(descriptor_pool_draw_count, combined_descriptor_
   null_descriptor_key.samplers.fill(null_sampler_);
 
   const bool prefetch_commands = REXCVAR_GET(gta4_native_recorder_prefetch);
-  bool has_last_descriptor_key = false;
-  NativeDrawDescriptorKey last_descriptor_key{};
-  uint32_t last_descriptor_page = UINT32_MAX;
-  uint32_t last_descriptor_copy = 0;
-  std::array<uint32_t, kTextureStageCount> last_texture_indices{};
-  std::array<uint32_t, kTextureStageCount> last_sampler_indices{};
-  uint64_t last_descriptor_epoch = 0;
+  struct alignas(64) DescriptorKeyMRUEntry {
+    NativeDrawDescriptorKey key{};
+    uint64_t fingerprint = 0;
+    uint32_t page = UINT32_MAX;
+    uint32_t copy = 0;
+    std::array<uint32_t, kTextureStageCount> texture_indices{};
+    std::array<uint32_t, kTextureStageCount> sampler_indices{};
+    uint64_t epoch = 0;
+    bool valid = false;
+  };
+  std::array<DescriptorKeyMRUEntry, 4> descriptor_mru{};
+
+  const auto compute_descriptor_key_fingerprint = [](const NativeDrawDescriptorKey& key) -> uint64_t {
+    uint64_t fp = key.layout_epoch * 0x9E3779B97F4A7C15ull;
+    for (size_t i = 0; i < kShaderTextureCount; ++i) {
+      const uint64_t img = reinterpret_cast<uintptr_t>(key.images_2d[i]);
+      const uint64_t smp = reinterpret_cast<uintptr_t>(key.samplers[i]);
+      fp ^= (img + 0x517cc1b727220a95ull + (fp << 6) + (fp >> 2));
+      fp ^= (smp + 0x9e3779b97f4a7c15ull + (fp << 5) + (fp >> 3));
+      fp ^= (key.image_lifetimes[i] * 0xbf58476d1ce4e5b9ull);
+    }
+    return fp ? fp : 1;
+  };
   for (size_t command_index = 0;; ++command_index) {
     if (streaming) {
       // 60: take the commands assembled since the last resume; suspend when there are none.
@@ -20940,8 +20977,8 @@ if (!PrepareFrameDescriptorPool(descriptor_pool_draw_count, combined_descriptor_
     if (command.type == CommandType::kResolve && resolve_destination_image && !trace_reflections &&
         PlanResolveSwap(command, *resolve_destination_image, texture_commands, command_index)) {
       previous_prepared_draw = nullptr;
-      prepared_draw_cache.fill(nullptr);
-      has_last_descriptor_key = false;
+      prepared_draw_cache.fill({});
+      for (auto& entry : descriptor_mru) entry.valid = false;
     }
     if (command.depth_handoff_source &&
         !prepared_image(command.depth_handoff_source)) {
@@ -20960,11 +20997,18 @@ if (!PrepareFrameDescriptorPool(descriptor_pool_draw_count, combined_descriptor_
       if (previous_prepared_draw && !previous_prepared_draw->temporal_scene_binding &&
           prepared_inputs_equal(*previous_prepared_draw, command)) {
         source = previous_prepared_draw;
-      } else if (const NativeCommand* cached = use_prepared_draw_cache
-                                                   ? prepared_draw_cache[prepared_slot] : nullptr;
-                 cached && cached != previous_prepared_draw && !cached->temporal_scene_binding &&
-                 prepared_inputs_equal(*cached, command)) {
-        source = cached;
+      } else if (use_prepared_draw_cache) {
+        auto& ways = prepared_draw_cache[prepared_slot];
+        if (ways[0] && ways[0] != previous_prepared_draw && !ways[0]->temporal_scene_binding &&
+            prepared_inputs_equal(*ways[0], command)) {
+          source = ways[0];
+        } else if (ways[1] && ways[1] != previous_prepared_draw && !ways[1]->temporal_scene_binding &&
+                   prepared_inputs_equal(*ways[1], command)) {
+          source = ways[1];
+          // MRU promotion: promote way 1 to way 0
+          ways[1] = ways[0];
+          ways[0] = source;
+        }
       }
       if (source) {
         CopyNativePreparedTextureBindings(*source, command);
@@ -21387,26 +21431,53 @@ if (!PrepareFrameDescriptorPool(descriptor_pool_draw_count, combined_descriptor_
     //  descriptor_key.samplers[stage] = samplers[stage].sampler;
    // }
     if (native_descriptor_backend_ == NativeDescriptorBackend::kIndexed && native_descriptor_paging_) {
-      if (has_last_descriptor_key && descriptor_key == last_descriptor_key) {
-        command.descriptor_page = last_descriptor_page;
-        command.descriptor_copy = last_descriptor_copy;
-        command.texture_descriptor_indices = last_texture_indices;
-        command.sampler_descriptor_indices = last_sampler_indices;
-        command.image_descriptor_epoch = last_descriptor_epoch;
-        command.sampler_descriptor_epoch = last_descriptor_epoch;
+      const uint64_t key_fp = compute_descriptor_key_fingerprint(descriptor_key);
+      int hit_index = -1;
+      for (int i = 0; i < 4; ++i) {
+        if (descriptor_mru[i].valid && descriptor_mru[i].fingerprint == key_fp &&
+            descriptor_mru[i].key == descriptor_key) {
+          hit_index = i;
+          break;
+        }
+      }
+      if (hit_index >= 0) {
+        const auto& hit = descriptor_mru[hit_index];
+        command.descriptor_page = hit.page;
+        command.descriptor_copy = hit.copy;
+        command.texture_descriptor_indices = hit.texture_indices;
+        command.sampler_descriptor_indices = hit.sampler_indices;
+        command.image_descriptor_epoch = hit.epoch;
+        command.sampler_descriptor_epoch = hit.epoch;
         command.bindings_prepared = true;
+        if (hit_index > 0) {
+          const auto hit_copy = descriptor_mru[hit_index];
+          for (int j = hit_index; j > 0; --j) {
+            descriptor_mru[j] = descriptor_mru[j - 1];
+          }
+          descriptor_mru[0] = hit_copy;
+        }
       } else {
         if (!AssignIndexedWorkingSet(command, descriptor_key)) co_return false;
-        has_last_descriptor_key = true;
-        last_descriptor_key = descriptor_key;
-        last_descriptor_page = command.descriptor_page;
-        last_descriptor_copy = command.descriptor_copy;
-        last_texture_indices = command.texture_descriptor_indices;
-        last_sampler_indices = command.sampler_descriptor_indices;
-        last_descriptor_epoch = command.image_descriptor_epoch;
+        for (int j = 3; j > 0; --j) {
+          descriptor_mru[j] = descriptor_mru[j - 1];
+        }
+        descriptor_mru[0].valid = true;
+        descriptor_mru[0].fingerprint = key_fp;
+        descriptor_mru[0].key = descriptor_key;
+        descriptor_mru[0].page = command.descriptor_page;
+        descriptor_mru[0].copy = command.descriptor_copy;
+        descriptor_mru[0].texture_indices = command.texture_descriptor_indices;
+        descriptor_mru[0].sampler_indices = command.sampler_descriptor_indices;
+        descriptor_mru[0].epoch = command.image_descriptor_epoch;
       }
       previous_prepared_draw = &command;
-      if (use_prepared_draw_cache) prepared_draw_cache[prepared_slot] = &command;
+      if (use_prepared_draw_cache) {
+        auto& ways = prepared_draw_cache[prepared_slot];
+        if (ways[0] != &command) {
+          ways[1] = ways[0];
+          ways[0] = &command;
+        }
+      }
     } else {
       cached_draws.emplace_back(&command, std::move(descriptor_key));
     }
