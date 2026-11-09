@@ -1,0 +1,4 @@
+﻿thread,sleeps,lt_50us,us50_500,us500_1ms,ms1_2,ge_2ms,max_sleep_ms
+RageStream,9196,82,7877,38,62,1137,9.0
+AudioGuest,2117,645,215,79,203,975,20.05
+RenderGuest,889,389,415,17,5,63,5860.48

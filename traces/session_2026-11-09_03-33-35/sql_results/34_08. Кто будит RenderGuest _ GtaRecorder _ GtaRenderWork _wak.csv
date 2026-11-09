@@ -1,0 +1,9 @@
+﻿wakee,waker,wakeups,from_irq,avg_wake_to_run_us,max_wake_to_run_ms
+RenderGuest,swapper,371,371,475.5,14.725
+RenderGuest,<irq/unknown>,126,,39.2,0.282
+RenderGuest,RenderGuest,101,0,1051.1,11.604
+RenderGuest,GtaCmdRetirer,56,0,56.0,0.95
+RenderGuest,Main XThread (F,54,0,99.5,4.649
+RenderGuest,SDLThread,20,0,18.6,0.03
+RenderGuest,RageStream,1,0,20.9,0.021
+RenderGuest,stack-unwinding,1,1,3300.1,3.3

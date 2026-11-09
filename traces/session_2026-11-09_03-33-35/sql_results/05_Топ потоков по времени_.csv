@@ -1,0 +1,16 @@
+﻿thread_name,total_ms
+swapper,74032.6
+RenderGuest,19033.3
+RageStream,10328.5
+AudioGuest,7233.3
+Main XThread (F,6531.7
+traced_perf,3321.3
+RageJobWork,3214.5
+stack-unwinding,2426.7
+SDLThread,2088.6
+RagePhysics,1915.6
+traced_probes,1869.7
+writer,1813.5
+surfaceflinger,1446.8
+FastMixer,1400.3
+Rage_299490,1304.2

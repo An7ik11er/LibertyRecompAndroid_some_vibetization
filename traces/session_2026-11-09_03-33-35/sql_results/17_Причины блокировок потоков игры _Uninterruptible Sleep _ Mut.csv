@@ -1,0 +1,16 @@
+﻿thread_name,state,io_wait,count,total_ms
+RenderGuest,S,,889,42664.29
+RageFileIO,S,,1924,38255.18
+Main XThread (F,S,,2618,12661.72
+AudioGuest,S,,2117,11816.88
+RageStream,S,,9196,7972.48
+RageStream,R,,12175,977.58
+RenderGuest,R,,730,299.69
+AudioGuest,R,,1973,192.18
+RageFileIO,R,,1954,154.35
+Main XThread (F,R,,2306,68.16
+AudioGuest,R+,,702,14.37
+RageFileIO,R+,,37,6.82
+RageStream,R+,,10,2.16
+Main XThread (F,R+,,5,0.52
+RenderGuest,R+,,6,0.37

@@ -1,0 +1,16 @@
+﻿thread_name,state,count,total_time_ms
+usbtemp_kthread,D,1028,19041.99
+bcc_kthread,D,10,18143.01
+shortc_thread,D,4,15862.03
+crtc_commit:147,D,372,2884.55
+kworker/3:3,D,105,199.48
+kworker/u24:3,D,1586,87.04
+health@2.1-serv,D,58,86.14
+kworker/u24:5,D,1685,76.5
+kworker/u24:0,D,1028,52.57
+st-fitting,D,14,31.8
+kworker/u24:1,D,619,30.97
+vendor.oplus.ha,D,45,26.14
+stack-unwinding,D,5,11.41
+kworker/u24:4,D,182,9.5
+kworker/X26:2,D,294,9.1

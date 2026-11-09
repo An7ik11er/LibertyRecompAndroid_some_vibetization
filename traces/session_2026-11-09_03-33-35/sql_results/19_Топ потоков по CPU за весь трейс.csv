@@ -1,0 +1,31 @@
+﻿process,thread,cpu_ms
+com.libertyrecomp:game,RenderGuest,19033.295819
+com.libertyrecomp:game,RageStream,10328.521209
+com.libertyrecomp:game,AudioGuest,7233.279187
+com.libertyrecomp:game,Main XThread (F,6531.674654
+com.libertyrecomp:game,RageJobWork,3214.545287
+com.libertyrecomp:game,SDLThread,2088.607735
+com.libertyrecomp:game,RagePhysics,1915.62086
+com.libertyrecomp:game,Rage_299490,1304.152396
+com.libertyrecomp:game,SDLActivity,1294.982285
+com.libertyrecomp:game,GtaCmdRetirer,1151.053546
+com.libertyrecomp:game,Rage_556188,987.416646
+com.libertyrecomp:game,Rage_3A05E8,533.903514
+com.libertyrecomp:game,Audio Worker (F,267.145377
+com.libertyrecomp:game,Rage_1BA088,177.682698
+com.libertyrecomp:game,binder:18983_2,138.103657
+com.libertyrecomp:game,binder:18983_4,111.689124
+com.libertyrecomp:game,RageFileIO,106.757585
+com.libertyrecomp:game,Rage_9FF398,87.470383
+com.libertyrecomp:game,Rage_5FBB68,86.72562
+com.libertyrecomp:game,AudioTrack,84.88425
+com.libertyrecomp:game,GPU completion,71.205258
+com.libertyrecomp:game,Rage_212F38,44.247908
+com.libertyrecomp:game,SDLAudioP15,42.023393
+com.libertyrecomp:game,binder:18983_3,21.104947
+com.libertyrecomp:game,XMA Decoder (F8,13.230483
+com.libertyrecomp,m.libertyrecomp,1.707759
+com.libertyrecomp:game,UIMonitorThread,1.606563
+com.libertyrecomp,Jit thread pool,1.496719
+com.libertyrecomp,binder:18919_1,1.218438
+com.libertyrecomp:game,Kernel Host Tas,0.113698

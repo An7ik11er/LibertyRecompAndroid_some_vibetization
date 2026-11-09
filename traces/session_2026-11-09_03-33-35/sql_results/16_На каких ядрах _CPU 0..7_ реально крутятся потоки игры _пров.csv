@@ -1,0 +1,29 @@
+﻿thread_name,cpu_core,total_ms
+AudioGuest,5,3789.8
+AudioGuest,4,3443.5
+AudioTrack,4,32.5
+AudioTrack,5,31.9
+AudioTrack,6,20.1
+AudioTrack,7,0.3
+GtaCmdRetirer,3,321.3
+GtaCmdRetirer,0,319.5
+GtaCmdRetirer,1,275.3
+GtaCmdRetirer,2,235.0
+Main XThread (F,6,4778.4
+Main XThread (F,4,927.6
+Main XThread (F,5,740.0
+Main XThread (F,7,85.6
+RageJobWork,5,1299.7
+RageJobWork,4,1268.9
+RageJobWork,0,177.4
+RageJobWork,2,174.1
+RageJobWork,1,153.7
+RageJobWork,3,140.8
+RageStream,2,2747.5
+RageStream,3,2678.4
+RageStream,0,2637.4
+RageStream,1,2265.2
+RenderGuest,7,16903.8
+RenderGuest,6,2129.5
+XMA Decoder (F8,5,7.2
+XMA Decoder (F8,4,6.0
