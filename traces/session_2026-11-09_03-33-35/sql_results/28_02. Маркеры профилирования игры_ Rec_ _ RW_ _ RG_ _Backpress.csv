@@ -1,5 +1,0 @@
-﻿thread_name,name,cnt,total_ms,avg_ms,p50_ms,p90_ms,max_ms
-RenderGuest,Rec: FinishPresent,372,340.71,0.916,0.915,1.129,1.711
-RenderGuest,Rec: PublishFrame,372,292.45,0.786,0.792,0.978,1.361
-RenderGuest,RW: wait recorder free,372,1.96,0.005,0.005,0.006,0.104
-RenderGuest,Rec: BeginModernShaderFrame,372,1.03,0.003,0.003,0.003,0.005

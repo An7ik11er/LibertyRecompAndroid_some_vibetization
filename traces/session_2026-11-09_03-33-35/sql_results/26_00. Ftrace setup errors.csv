@@ -1,5 +1,0 @@
-﻿id,name,key,idx,severity,source,value,description,machine_id,trace_id
-35,ftrace_setup_errors,53,,info,trace,39,One or more atrace/ftrace categories were not found or failed to enable. See ftrace_setup_errors in the metadata table for details.,0,0
-28,ftrace_bundle_tokenizer_errors,23,,error,analysis,0,,0,0
-36,ftrace_abi_errors_skipped_zero_data_length,54,,info,analysis,0,,0,0
-37,ftrace_generic_descriptor_errors,55,,error,analysis,0,"The config is setting denser_generic_event_encoding, but there are issues with parsing or matching up the in-trace proto descriptors.",0,0

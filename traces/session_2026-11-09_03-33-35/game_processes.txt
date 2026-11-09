@@ -1,2 +1,0 @@
-18919 com.libertyrecomp
-18983 com.libertyrecomp:game
