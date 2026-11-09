@@ -2653,21 +2653,33 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   // Predictions for the next streamed frame: the previous Present's.
   uint32_t stream_next_frame_ = 0;
   uint32_t stream_last_width_ = 0, stream_last_height_ = 0;
-  std::shared_ptr<const NativeTextureResource> stream_last_present_source_;
-  // 61: the one before it. Batch 60/S1: the source differed from the previous Present's on every
-  // frame (the title alternates frontbuffers), so the previous frame predicted it wrong.
-  std::shared_ptr<const NativeTextureResource> stream_previous_present_source_;
+  // 63: the last presented sources, newest first. Batch 65: fb-handle-same=0, other on every
+  // frame and no new generation for the presented handles, so the title rotates three or more
+  // frontbuffers with stable generations; 61's "two Presents back" missed them all. The
+  // prediction is the source one period back: the smallest period after which the newest
+  // source repeats (one buffer: 1, two alternating: 2, a ring of N: N).
+  static constexpr size_t kStreamPresentHistory = 8;
+  std::array<std::shared_ptr<const NativeTextureResource>, kStreamPresentHistory>
+      stream_present_history_{};
   void RememberStreamPresentSource(const std::shared_ptr<const NativeTextureResource>& source) {
-    stream_previous_present_source_ = std::move(stream_last_present_source_);
-    stream_last_present_source_ = source;
+    for (size_t i = kStreamPresentHistory - 1; i > 0; --i)
+      stream_present_history_[i] = std::move(stream_present_history_[i - 1]);
+    stream_present_history_[0] = source;
   }
-  // Two alternating frontbuffers: this frame presents the one of two presents ago.
   std::shared_ptr<const NativeTextureResource> PredictStreamPresentSource() const {
-    if (stream_last_present_source_ && stream_previous_present_source_ &&
-        stream_last_present_source_->generation != stream_previous_present_source_->generation) {
-      return stream_previous_present_source_;
+    const auto& newest = stream_present_history_[0];
+    if (!newest) return newest;
+    for (size_t period = 1; period < kStreamPresentHistory; ++period) {
+      const auto& back = stream_present_history_[period];
+      if (!back) break;
+      if (back->generation == newest->generation) return stream_present_history_[period - 1];
     }
-    return stream_last_present_source_;
+    // No repeat within the history (warm-up, or a longer ring). Then the answer must not be
+    // the newest source while the Presents differ: the deferred frontbuffer resolve is dropped
+    // only for a frame that presents the same buffer again, and a wrong "same" would leave its
+    // texture stale. The one before it, as in 61.
+    const auto& before = stream_present_history_[1];
+    return before && before->generation != newest->generation ? before : newest;
   }
   uint64_t stream_deferred_frontbuffer_resolves_ = 0;
   // 62: frontbuffer diagnostics (batch 64: source-mismatches on every frame). The handle
@@ -2696,6 +2708,32 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
       if (recent.load(std::memory_order_relaxed) == handle) return true;
     return false;
   }
+
+  // 63: shadow of a draw-translation memo across frames (gta4_native_memo_shadow; rendering
+  // does not change). At each indexed draw's record: a key of what the record stage translates
+  // from (draw parameters, shaders, declaration, streams, fixed-function and pipeline-memo
+  // hashes, target, buffer and texture resources with their generations), looked up among the
+  // previous frame's keys, and what a memo would hand back: the pipeline and the texture and
+  // sampler descriptor indices. Hit: the key was in the previous frame; a hit whose pipeline
+  // or descriptors differ from the previous frame's means the key misses an input.
+  struct MemoShadowEntry {
+    uint64_t pipeline = 0;
+    uint64_t descriptors = 0;
+  };
+  struct MemoShadowCounters {
+    uint64_t frames = 0, draws = 0, hits = 0, pipeline_diffs = 0, descriptor_diffs = 0,
+             repeats_in_frame = 0, failed = 0, merged = 0, hit_ticks = 0, miss_ticks = 0;
+  };
+  std::unordered_map<uint64_t, MemoShadowEntry> memo_shadow_previous_, memo_shadow_current_;
+  MemoShadowCounters memo_shadow_{};
+  uint64_t memo_shadow_report_tick_ = 0;
+  bool memo_shadow_enabled_ = false;
+  VkPipeline memo_shadow_pipeline_ = VK_NULL_HANDLE;  // the last RecordIndexedPrimitive's
+  void MemoShadowBeginFrame();
+  uint64_t MemoShadowKey(const NativeCommand& command, const NativeRenderingTarget& target,
+                         uint32_t index_count) const;
+  void MemoShadowRecord(const NativeCommand& command, const NativeRenderingTarget& target,
+                        uint32_t index_count, bool merged, bool recorded, uint64_t ticks);
   bool stream_last_hdr_output_ = false;
   float stream_last_hdr_headroom_ = 0.0f;
   bool stream_presenter_seen_ = false;  // a callback ran since the last flush

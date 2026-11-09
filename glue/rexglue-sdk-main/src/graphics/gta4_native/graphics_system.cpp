@@ -175,6 +175,11 @@ REXCVAR_DEFINE_BOOL(gta4_native_direct_record, false, "GTA IV/Graphics/Native Re
                     "command right after capturing it and records the frame (RecordNativeFrame, "
                     "submit) itself at Present. Implies the inline recorder; GtaCapture is off");
 // 60: the direct emitter (native_stream_record.inc, разбор 60).
+REXCVAR_DEFINE_BOOL(gta4_native_memo_shadow, false, "GTA IV/Graphics/Native Renderer",
+                    "Diagnostics (63): shadow of a draw-translation memo across frames. Keys each "
+                    "indexed draw's record inputs, looks them up among the previous frame's and "
+                    "compares what a memo would reuse; logs gta4-native-memo-shadow every 10 s. "
+                    "Rendering does not change");
 REXCVAR_DEFINE_BOOL(gta4_native_stream_record, false, "GTA IV/Graphics/Native Renderer",
                     "With gta4_native_direct_record: prepare and record every command into the "
                     "frame's command buffer right after assembling it, instead of the whole frame "
@@ -26405,6 +26410,159 @@ void Gta4NativeGraphicsSystem::BindNativeIndexBuffer(VkCommandBuffer command_buf
                                                                      offset, index_type);
 }
 
+// 63: shadow of a draw-translation memo across frames (graphics_system.h).
+void Gta4NativeGraphicsSystem::MemoShadowBeginFrame() {
+  const bool enabled = REXCVAR_GET(gta4_native_memo_shadow);
+  if (!enabled) {
+    if (memo_shadow_enabled_) {
+      memo_shadow_previous_ = {};
+      memo_shadow_current_ = {};
+      memo_shadow_ = {};
+      memo_shadow_report_tick_ = 0;
+    }
+    memo_shadow_enabled_ = false;
+    return;
+  }
+  memo_shadow_enabled_ = true;
+  // The frame that just ended becomes the one the next frame looks its keys up in.
+  std::swap(memo_shadow_previous_, memo_shadow_current_);
+  memo_shadow_current_.clear();
+  if (memo_shadow_current_.bucket_count() < 8192) memo_shadow_current_.reserve(8192);
+  ++memo_shadow_.frames;
+
+  const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+  const uint64_t frequency = rex::chrono::Clock::QueryHostTickFrequency();
+  if (!memo_shadow_report_tick_) memo_shadow_report_tick_ = now;
+  if (!frequency || now - memo_shadow_report_tick_ < 10 * frequency) return;
+  const MemoShadowCounters& c = memo_shadow_;
+  const double frames = c.frames ? double(c.frames) : 1.0;
+  const double to_ms = 1000.0 / double(frequency);
+  const uint64_t misses = c.draws - c.hits;
+  const double hit_percent = c.draws ? 100.0 * double(c.hits) / double(c.draws) : 0.0;
+  const double hit_us = c.hits ? double(c.hit_ticks) * to_ms * 1000.0 / double(c.hits) : 0.0;
+  const double miss_us = misses ? double(c.miss_ticks) * to_ms * 1000.0 / double(misses) : 0.0;
+  REXLOG_WARN(
+      "gta4-native-memo-shadow: {:.1f} s: frames={} draws/frame={:.0f} hits={:.1f}% "
+      "pipeline-diffs={} descriptor-diffs={} repeats-in-frame={} merged={} failed={} "
+      "record-ms/frame hit={:.2f} miss={:.2f} us/draw hit={:.2f} miss={:.2f} keys={}",
+      double(now - memo_shadow_report_tick_) / double(frequency), c.frames,
+      double(c.draws) / frames, hit_percent, c.pipeline_diffs, c.descriptor_diffs,
+      c.repeats_in_frame, c.merged, c.failed, double(c.hit_ticks) * to_ms / frames,
+      double(c.miss_ticks) * to_ms / frames, hit_us, miss_us, memo_shadow_previous_.size());
+#if defined(__ANDROID__)
+  using ull = unsigned long long;
+  __android_log_print(
+      ANDROID_LOG_WARN, "LibertyRecomp",
+      "gta4-native-memo-shadow: %.1f s: frames=%llu draws/frame=%.0f hits=%.1f%% "
+      "pipeline-diffs=%llu descriptor-diffs=%llu repeats-in-frame=%llu merged=%llu failed=%llu "
+      "record-ms/frame hit=%.2f miss=%.2f us/draw hit=%.2f miss=%.2f keys=%llu",
+      double(now - memo_shadow_report_tick_) / double(frequency), ull(c.frames),
+      double(c.draws) / frames, hit_percent, ull(c.pipeline_diffs), ull(c.descriptor_diffs),
+      ull(c.repeats_in_frame), ull(c.merged), ull(c.failed), double(c.hit_ticks) * to_ms / frames,
+      double(c.miss_ticks) * to_ms / frames, hit_us, miss_us, ull(memo_shadow_previous_.size()));
+#endif
+  memo_shadow_report_tick_ = now;
+  memo_shadow_ = {};
+}
+
+uint64_t Gta4NativeGraphicsSystem::MemoShadowKey(const NativeCommand& command,
+                                                 const NativeRenderingTarget& target,
+                                                 uint32_t index_count) const {
+  std::array<uint64_t, 192> words{};
+  size_t n = 0;
+  const auto put = [&](uint64_t value) {
+    if (n < words.size()) words[n++] = value;
+  };
+  const auto ptr = [](const void* p) { return uint64_t(reinterpret_cast<uintptr_t>(p)); };
+  DrawIndexedPrimitiveCommand draw{};
+  std::memcpy(&draw, command.bytes.data(), std::min(sizeof(draw), command.bytes.size()));
+  // The draw, without its per-call identity (draw_id) and the light trace fields.
+  put(uint64_t(command.type) | (uint64_t(draw.primitive_type) << 16) |
+      (uint64_t(uint32_t(command.render_phase)) << 32));
+  put((uint64_t(uint32_t(draw.base_vertex)) << 32) | draw.start_index);
+  put((uint64_t(index_count) << 32) | draw.primitive_restart_enabled);
+  put((uint64_t(draw.primitive_restart_index) << 32) | draw.origin_flags);
+  put((uint64_t(draw.caller) << 32) | draw.command_list);
+  put(command.used_texture_mask);
+  put(command.recorded_fixed_function_state_hash);
+  put(command.pipeline_memo_signature);
+  put(command.texture_inputs_signature);
+  put(command.environmental_data_hash);
+  // The pipeline inputs.
+  const NativePipelineState& state = *command.pipeline_state;
+  put(ptr(state.vertex_shader_resource));
+  put(state.vertex_shader_resource ? state.vertex_shader_resource->hash : 0);
+  put(ptr(state.pixel_shader_resource));
+  put(state.pixel_shader_resource ? state.pixel_shader_resource->hash : 0);
+  put(ptr(state.vertex_declaration_resource.get()));
+  put(state.vertex_declaration_resource ? state.vertex_declaration_resource->content_hash : 0);
+  // The target.
+  for (const VkFormat format : target.color_formats) put(uint64_t(format));
+  put(uint64_t(target.depth_format) | (uint64_t(target.samples) << 32));
+  put((uint64_t(target.width) << 32) | target.height);
+  put((uint64_t(target.color_attachment_mask) << 32) | target.color_write_mask);
+  put(uint64_t(target.depth_stencil_attachment_active) | (uint64_t(target.uses_presenter) << 1) |
+      (uint64_t(target.temporal_shader) << 2));
+  // Streams and their resources, with generations (a resource rebuilt at the same address is
+  // another input).
+  for (uint32_t stream = 0; stream < kVertexStreamCount; ++stream) {
+    const auto& stream_state = state.vertex_streams[stream];
+    const auto& resource = command.vertex_buffers[stream];
+    if (!stream_state.stride && !resource) continue;
+    put((uint64_t(stream) << 56) ^ (uint64_t(stream_state.buffer) << 24) ^ stream_state.stride);
+    put(stream_state.offset);
+    put(ptr(resource.get()));
+    put(resource ? resource->generation : 0);
+  }
+  put(ptr(command.index_buffer.get()));
+  put(command.index_buffer ? command.index_buffer->generation : 0);
+  put(command.index_buffer ? command.index_buffer->flags : 0);
+  // Texture resources: the signature has their pointers and fetches; add the generations.
+  for (uint32_t mask = command.used_texture_mask; mask; mask &= mask - 1) {
+    const uint32_t stage = uint32_t(std::countr_zero(mask));
+    if (stage >= command.textures.size()) break;
+    const auto& texture = command.textures[stage];
+    put((uint64_t(stage) << 56) ^ (texture ? texture->generation : 0));
+  }
+  put(n);
+  return XXH3_64bits(words.data(), n * sizeof(uint64_t));
+}
+
+void Gta4NativeGraphicsSystem::MemoShadowRecord(const NativeCommand& command,
+                                                const NativeRenderingTarget& target,
+                                                uint32_t index_count, bool merged, bool recorded,
+                                                uint64_t ticks) {
+  if (!recorded || !command.pipeline_state || !command.shader_state || !command.index_buffer) {
+    ++memo_shadow_.failed;
+    return;
+  }
+  ++memo_shadow_.draws;
+  if (merged) ++memo_shadow_.merged;
+  const uint64_t key = MemoShadowKey(command, target, index_count);
+  // What a memo would hand back instead of translating.
+  MemoShadowEntry entry;
+  entry.pipeline = uint64_t(reinterpret_cast<uintptr_t>(memo_shadow_pipeline_));
+  std::array<uint32_t, 2 * kTextureStageCount> descriptors{};
+  size_t count = 0;
+  for (uint32_t mask = command.used_texture_mask; mask; mask &= mask - 1) {
+    const uint32_t stage = uint32_t(std::countr_zero(mask));
+    if (stage >= kTextureStageCount) break;
+    descriptors[count++] = command.texture_descriptor_indices[stage];
+    descriptors[count++] = command.sampler_descriptor_indices[stage];
+  }
+  entry.descriptors = XXH3_64bits(descriptors.data(), count * sizeof(uint32_t));
+  const auto previous = memo_shadow_previous_.find(key);
+  if (previous != memo_shadow_previous_.end()) {
+    ++memo_shadow_.hits;
+    memo_shadow_.hit_ticks += ticks;
+    if (previous->second.pipeline != entry.pipeline) ++memo_shadow_.pipeline_diffs;
+    if (previous->second.descriptors != entry.descriptors) ++memo_shadow_.descriptor_diffs;
+  } else {
+    memo_shadow_.miss_ticks += ticks;
+  }
+  if (!memo_shadow_current_.emplace(key, entry).second) ++memo_shadow_.repeats_in_frame;
+}
+
 bool Gta4NativeGraphicsSystem::RecordIndexedPrimitive(VkCommandBuffer command_buffer,
                                                       const NativeCommand& command, uint32_t width,
                                                       uint32_t height,
@@ -26446,6 +26604,7 @@ bool Gta4NativeGraphicsSystem::RecordIndexedPrimitive(VkCommandBuffer command_bu
 
   VkPipeline pipeline =
       GetOrCreateDrawPipeline(command, draw.primitive_type, target, 0, guest_restart_enabled);
+  memo_shadow_pipeline_ = pipeline;  // 63
   if (!pipeline) {
     return fail("pipeline");
   }
@@ -31952,6 +32111,7 @@ NativeFrameTask Gta4NativeGraphicsSystem::RecordNativeFrameTask(
   tv_frame_trace_.reset();
   phone_record_event_ = 0;
   native_draw_state_cache_.Reset(); ubo_bound_layout_ = VK_NULL_HANDLE;
+  MemoShadowBeginFrame();  // 63
   presenter_transfer_written = false;
   presenter_written = false;
   (void)environmental_data;
@@ -38600,8 +38760,22 @@ const bool keeps_draw_state =
         }
       }
       if (merged_count > 1) indexed_merge_count_override_ = merged_indices;
+      const uint64_t memo_shadow_start =
+          memo_shadow_enabled_ ? rex::chrono::Clock::QueryHostTickCount() : 0;  // 63
+      memo_shadow_pipeline_ = VK_NULL_HANDLE;
       command_recorded = RecordIndexedPrimitive(command_buffer, command, target.width,
                                                 target.height, target, resources);
+      if (memo_shadow_enabled_) {
+        uint32_t shadow_index_count = merged_indices;
+        if (merged_count <= 1) {
+          DrawIndexedPrimitiveCommand shadow_draw{};
+          std::memcpy(&shadow_draw, command.bytes.data(),
+                      std::min(sizeof(shadow_draw), command.bytes.size()));
+          shadow_index_count = shadow_draw.index_count;
+        }
+        MemoShadowRecord(command, target, shadow_index_count, merged_count > 1, command_recorded,
+                         rex::chrono::Clock::QueryHostTickCount() - memo_shadow_start);
+      }
       indexed_merge_count_override_ = 0;
       if (merged_count > 1) {
         if (command_recorded) {
