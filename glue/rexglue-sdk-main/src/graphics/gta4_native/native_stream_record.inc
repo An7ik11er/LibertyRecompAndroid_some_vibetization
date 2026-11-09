@@ -279,7 +279,7 @@ bool Gta4NativeGraphicsSystem::StreamOpenFrame() {
   const uint32_t resource_frame = NativeResourceFrameForBatch(active_texture_frame_, frame, true);
   active_texture_frame_ = resource_frame;
   ReleasePendingSurfaceImages();
-  ReleaseUnusedTextureImages(resource_frame, stream_last_present_source_);
+  ReleaseUnusedTextureImages(resource_frame, PredictStreamPresentSource());
   if (!ReleaseRetiredTextureImages()) return false;
   ReleaseUnusedBufferResources(resource_frame);
   ReleaseUnusedPersistentBuffers(completed_command_buffer_submission_);
@@ -397,7 +397,7 @@ bool Gta4NativeGraphicsSystem::StreamOpenFrame() {
   stream_.height = stream_last_height_ ? stream_last_height_ : kDefaultOutputHeight;
   stream_.presenter_image = VK_NULL_HANDLE;
   stream_.presenter_view = VK_NULL_HANDLE;
-  stream_.present_source = stream_last_present_source_;
+  stream_.present_source = PredictStreamPresentSource();  // 61
   stream_.environmental_data.reset();
   stream_.hdr_output = stream_last_hdr_output_;
   stream_.hdr_headroom = stream_last_hdr_headroom_;
@@ -521,8 +521,13 @@ bool Gta4NativeGraphicsSystem::ClearGuestOutputStreamed(
     stream_has_water_ = frame_constant_bound_.valid && frame_constant_bound_.has_water;
     if (submitted_frame != stream_.frame) ++stream_frame_mismatches_;
     stream_next_frame_ = submitted_frame + 1;
-    if (present_source.get() != stream_.present_source.get()) ++stream_source_mismatches_;
-    stream_last_present_source_ = present_source;
+    // 61: by generation (the object is the same while its generation is), and the prediction
+    // is two presents back when the title alternates two frontbuffers.
+    const uint64_t predicted = stream_.present_source ? stream_.present_source->generation : 0;
+    if ((present_source ? present_source->generation : 0) != predicted) {
+      ++stream_source_mismatches_;
+    }
+    RememberStreamPresentSource(present_source);
     stream_last_width_ = width;
     stream_last_height_ = height;
   }
@@ -620,22 +625,28 @@ void Gta4NativeGraphicsSystem::ReportStreamRecord() {
       uint64_t(stream_constant_reserve_ >> 10), stream_draw_reserve_, stream_resolve_reserve_,
       NativeFrameTaskMemory::Get().largest >> 10, stream_disabled_, stream_last_reason_);
 #if defined(__ANDROID__)
+  // 61: 64-bit counters with %llu (they were %u); deferred-fb: skipped frontbuffer resolves of
+  // the previous frame recorded at a streamed frame's start (alternating frontbuffers).
+  using ull = unsigned long long;
   __android_log_print(
       ANDROID_LOG_WARN, "LibertyRecomp",
-      "gta4-native-stream: %.1f s: streamed=%u classic=%u flushes=%u failed=%u "
-      "presenter-fallbacks=%u frame-mismatches=%u source-mismatches=%u pumps/frame=%.0f "
-      "lookahead=%u constant-reserve=%lluKB draw-reserve=%u resolve-reserve=%u task-frame=%lluKB "
-      "disabled=%d last=%s",
-      double(now - stream_report_tick_) / double(frequency), stream_frames_,
-      stream_classic_frames_, stream_flushes_, stream_failed_frames_,
-      stream_presenter_fallbacks_, stream_frame_mismatches_, stream_source_mismatches_,
+      "gta4-native-stream: %.1f s: streamed=%llu classic=%llu flushes=%llu failed=%llu "
+      "presenter-fallbacks=%llu frame-mismatches=%llu source-mismatches=%llu deferred-fb=%llu "
+      "pumps/frame=%.0f lookahead=%u constant-reserve=%lluKB draw-reserve=%u resolve-reserve=%u "
+      "task-frame=%lluKB disabled=%d last=%s",
+      double(now - stream_report_tick_) / double(frequency), ull(stream_frames_),
+      ull(stream_classic_frames_), ull(stream_flushes_), ull(stream_failed_frames_),
+      ull(stream_presenter_fallbacks_), ull(stream_frame_mismatches_),
+      ull(stream_source_mismatches_), ull(stream_deferred_frontbuffer_resolves_),
       stream_frames_ ? double(stream_pumps_) / double(stream_frames_) : 0.0,
-      stream_.lookahead, (unsigned long long)(stream_constant_reserve_ >> 10), stream_draw_reserve_,
-      stream_resolve_reserve_, (unsigned long long)(NativeFrameTaskMemory::Get().largest >> 10),
-      stream_disabled_ ? 1 : 0, stream_last_reason_ ? stream_last_reason_ : "none");
+      unsigned(stream_.lookahead), ull(stream_constant_reserve_ >> 10),
+      unsigned(stream_draw_reserve_), unsigned(stream_resolve_reserve_),
+      ull(NativeFrameTaskMemory::Get().largest >> 10), stream_disabled_ ? 1 : 0,
+      stream_last_reason_ ? stream_last_reason_ : "none");
 #endif
   stream_report_tick_ = now;
   stream_frames_ = stream_classic_frames_ = stream_flushes_ = stream_failed_frames_ = 0;
   stream_presenter_fallbacks_ = stream_frame_mismatches_ = stream_source_mismatches_ = 0;
   stream_pumps_ = 0;
+  stream_deferred_frontbuffer_resolves_ = 0;
 }

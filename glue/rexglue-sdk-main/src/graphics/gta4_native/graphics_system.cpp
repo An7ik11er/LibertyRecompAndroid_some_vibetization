@@ -5773,40 +5773,12 @@ std::shared_ptr<const Gta4NativeGraphicsSystem::NativeBufferResource>
 Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
   if (!handle) [[unlikely]] return {};
 
-  const uint64_t cache_epoch = buffer_resources_epoch_.load(std::memory_order_relaxed);
+  // 61: the MRU (batch 62/63) moved below the header read: like the slot, it must see the
+  // resource's flags / address / size and lock state. Before, it returned the old capture of a
+  // buffer re-pointed or locked without an unlock; the header read it skipped is three loads.
+  const uint64_t cache_epoch = buffer_resources_epoch_.load(std::memory_order_acquire);
   const uint32_t current_serial = capture_keepalive_serial_;
-
-  // Fast path 1: Instant L1 MRU hit for consecutive draws sharing vertex/index buffer
-  if (current_serial) [[likely]] {
-    for (const auto& entry : buffer_capture_mru_) {
-      if (entry.handle == handle && entry.epoch == cache_epoch &&
-          entry.alias_serial == current_serial && entry.alias) [[likely]] {
-        const uint32_t current_frame =
-            g_native_memory_profile_event_frame.load(std::memory_order_relaxed);
-        if (entry.alias->last_used_frame.load(std::memory_order_relaxed) != current_frame) {
-          entry.alias->last_used_frame.store(current_frame, std::memory_order_relaxed);
-        }
-        return AliasCaptured(entry.alias);
-      }
-    }
-  }
-
-  // Fast path 2: Direct 2-way slot check BEFORE expensive TranslateVirtual, bswaps, and metadata decoding!
   BufferCaptureCacheSlot& cache_slot = BufferCaptureSlot(handle);
-  if (current_serial && cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
-      cache_slot.alias && cache_slot.alias_serial == current_serial) [[likely]] {
-    const uint32_t current_frame =
-        g_native_memory_profile_event_frame.load(std::memory_order_relaxed);
-    if (cache_slot.alias->last_used_frame.load(std::memory_order_relaxed) != current_frame) {
-      cache_slot.alias->last_used_frame.store(current_frame, std::memory_order_relaxed);
-    }
-    auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & kBufferCaptureMruMask];
-    mru.handle = handle;
-    mru.alias_serial = current_serial;
-    mru.epoch = cache_epoch;
-    mru.alias = cache_slot.alias;
-    return AliasCaptured(cache_slot.alias);
-  }
 
   auto reject = [handle](const char* reason, uint32_t flags, uint32_t data_address,
                          uint32_t data_size) {
@@ -5844,6 +5816,31 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
   if (!metadata->HasValidPayload(kMaximumResourcePayloadSize)) {
     return reject("metadata", flags, data_address, data_size);
   }
+  // Remembered with the header it was captured with (the slot's condition below).
+  const auto note_mru = [&](const NativeBufferResource* alias) {
+    if (!alias) return;
+    auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & kBufferCaptureMruMask];
+    mru.handle = handle;
+    mru.alias_serial = capture_keepalive_serial_;
+    mru.epoch = cache_epoch;
+    mru.alias = alias;
+    mru.flags = flags;
+    mru.address = data_address;
+    mru.size = data_size;
+  };
+  if (current_serial && !metadata->guest_locked) [[likely]] {
+    for (const auto& entry : buffer_capture_mru_) {
+      if (entry.handle == handle && entry.epoch == cache_epoch &&
+          entry.alias_serial == current_serial && entry.alias && entry.flags == flags &&
+          entry.address == data_address && entry.size == data_size) [[likely]] {
+        const uint32_t frame = g_native_memory_profile_event_frame.load(std::memory_order_relaxed);
+        if (entry.alias->last_used_frame.load(std::memory_order_relaxed) != frame) {
+          entry.alias->last_used_frame.store(frame, std::memory_order_relaxed);
+        }
+        return AliasCaptured(entry.alias);
+      }
+    }
+  }
 
   const uint32_t current_frame =
       g_native_memory_profile_event_frame.load(std::memory_order_relaxed);
@@ -5870,11 +5867,7 @@ if (cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
     if (cache_slot.alias && cache_slot.alias_serial == capture_keepalive_serial_ &&
         capture_keepalive_serial_) {
       touch_frame(*cache_slot.alias);
-      auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & kBufferCaptureMruMask];
-      mru.handle = handle;
-      mru.alias_serial = capture_keepalive_serial_;
-      mru.epoch = cache_epoch;
-      mru.alias = cache_slot.alias;
+      note_mru(cache_slot.alias);
       return AliasCaptured(cache_slot.alias);
     }
     if (auto cached = cache_slot.resource.lock()) {
@@ -5882,11 +5875,7 @@ if (cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
       touch_frame(*cached);
       if (use_keepalive) {
         auto res = KeepCaptured(std::move(cached), cache_slot.alias, cache_slot.alias_serial);
-        auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & kBufferCaptureMruMask];
-        mru.handle = handle;
-        mru.alias_serial = capture_keepalive_serial_;
-        mru.epoch = cache_epoch;
-        mru.alias = cache_slot.alias;
+        note_mru(cache_slot.alias);
         return res;
       }
       return cached;
@@ -5920,13 +5909,7 @@ if (cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
     if (use_keepalive) {
       auto res = KeepCaptured(std::move(matching_cache_entry), cache_slot.alias,
                           cache_slot.alias_serial);
-      if (cache_slot.alias) {
-        auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & kBufferCaptureMruMask];
-        mru.handle = handle;
-        mru.alias_serial = capture_keepalive_serial_;
-        mru.epoch = cache_epoch;
-        mru.alias = cache_slot.alias;
-      }
+      note_mru(cache_slot.alias);
       return res;
     }
     return matching_cache_entry;
@@ -5949,13 +5932,7 @@ if (cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
       if (use_keepalive) {
         auto res = KeepCaptured(std::move(matching_cache_entry), cache_slot.alias,
                                 cache_slot.alias_serial);
-        if (cache_slot.alias) {
-          auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & kBufferCaptureMruMask];
-          mru.handle = handle;
-          mru.alias_serial = capture_keepalive_serial_;
-          mru.epoch = cache_epoch;
-          mru.alias = cache_slot.alias;
-        }
+        note_mru(cache_slot.alias);
         return res;
       }
       return matching_cache_entry;
@@ -5977,13 +5954,7 @@ if (cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
       if (use_keepalive) {
         std::shared_ptr<const NativeBufferResource> keep_resource = resource;
         auto res = KeepCaptured(std::move(keep_resource), cache_slot.alias, cache_slot.alias_serial);
-        if (cache_slot.alias) {
-          auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & kBufferCaptureMruMask];
-          mru.handle = handle;
-          mru.alias_serial = capture_keepalive_serial_;
-          mru.epoch = cache_epoch;
-          mru.alias = cache_slot.alias;
-        }
+        note_mru(cache_slot.alias);
         return res;
       }
       return resource;
@@ -6013,13 +5984,7 @@ if (cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
   if (use_keepalive) {
     std::shared_ptr<const NativeBufferResource> keep_resource = resource;
     auto res = KeepCaptured(std::move(keep_resource), cache_slot.alias, cache_slot.alias_serial);
-    if (cache_slot.alias) {
-      auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & kBufferCaptureMruMask];
-      mru.handle = handle;
-      mru.alias_serial = capture_keepalive_serial_;
-      mru.epoch = cache_epoch;
-      mru.alias = cache_slot.alias;
-    }
+    note_mru(cache_slot.alias);
     return res;
   }
   return resource;
@@ -7418,6 +7383,12 @@ void Gta4NativeGraphicsSystem::RenderWorkerLoop(WorkerLoopMode mode) {
       ++pipeline_sync_type_counts_[std::min<size_t>(size_t(command.type), 63)];
       ++pipelined_sync_waits_;
       SwapAssemblyFrame();
+      // 61: a texture lock flushes this half-assembled frame; its draws took their constants
+      // from this frame's ring segment, but recording_ring_serial_ still named the previous
+      // frame's (set per recorder job at Present), so BindCommonDrawState rejected them. The
+      // same as the stream fix in StreamOpenFrame. Only inline: GtaRecorder may still be
+      // recording the previous frame when WaitForFrameRecorderIdle times out.
+      if (inline_recording_) recording_ring_serial_ = worker_ring_serial_;
       RunReleaseEffects(assembly_release_effects_);
       if (assembly_modern_frame_pending_) {
         BeginModernShaderFrame();
@@ -20769,12 +20740,17 @@ NativeFrameTask Gta4NativeGraphicsSystem::PrepareFrameTexturesTask(
   struct FlatAliasGenerations {
     std::array<uint64_t, 16> items{};
     size_t count = 0;
+    // 61: past 16 the set dropped generations, so size() undercounted and the frame's alias
+    // descriptor budget (size x (resolves + 1)) came out short. The rare rest goes to a vector.
+    std::vector<uint64_t> overflow;
     void insert(uint64_t val) {
       for (size_t i = 0; i < count; ++i) {
         if (items[i] == val) return;
       }
       if (count < items.size()) {
         items[count++] = val;
+      } else if (std::find(overflow.begin(), overflow.end(), val) == overflow.end()) {
+        overflow.push_back(val);
       }
     }
     void insert(const uint64_t* first, const uint64_t* last) {
@@ -20783,7 +20759,7 @@ NativeFrameTask Gta4NativeGraphicsSystem::PrepareFrameTexturesTask(
     void insert(std::vector<uint64_t>::const_iterator first, std::vector<uint64_t>::const_iterator last) {
       for (auto it = first; it != last; ++it) insert(*it);
     }
-    size_t size() const { return count; }
+    size_t size() const { return count + overflow.size(); }
   };
   FlatAliasGenerations packed_alias_generations;
   std::vector<NativeCommand*> texture_commands;
@@ -33601,7 +33577,16 @@ NativeFrameTask Gta4NativeGraphicsSystem::RecordNativeFrameTask(
       resolved_again |= scan.type == CommandType::kResolve && scan.resolve_destination &&
                         scan.resolve_destination->generation == generation;
     }
-    if (!resolved_again && !streaming) RecordResolve(command_buffer, *deferred_frontbuffer_resolve_, submitted_frame);
+    // 61: a streamed frame cannot scan ahead (its commands are not assembled yet). The
+    // prediction tells which frontbuffer it will present: the same one -> it resolves it again,
+    // the copy is dropped (as 60 after PASTA did); another one (the title alternates its
+    // frontbuffers) -> it never resolves this one again, so the skipped resolve is recorded now,
+    // as the classic path does, or that texture would keep a frame from two presents ago.
+    const bool stream_resolves_again =
+        streaming && present_source && present_source->generation == generation;
+    if (streaming && !stream_resolves_again) ++stream_deferred_frontbuffer_resolves_;
+    if (!resolved_again && !stream_resolves_again)
+      RecordResolve(command_buffer, *deferred_frontbuffer_resolve_, submitted_frame);
     deferred_frontbuffer_resolve_.reset();
   }
   size_t merged_up_until = 0;
@@ -39755,7 +39740,7 @@ bool Gta4NativeGraphicsSystem::ClearGuestOutput(
     if (present.device) {
       stream_has_water_ = frame_constant_bound_.valid && frame_constant_bound_.has_water;
       stream_next_frame_ = submitted_frame + 1;
-      stream_last_present_source_ = present_source;
+      RememberStreamPresentSource(present_source);  // 61
       stream_last_width_ = width;
       stream_last_height_ = height;
     }

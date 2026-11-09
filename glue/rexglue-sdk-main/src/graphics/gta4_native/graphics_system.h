@@ -786,18 +786,20 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
       if (bulb_trace) bulb_trace.reset();
       if (phone_trace) phone_trace.reset();
       if (tv_trace) tv_trace.reset();
-      if (type != CommandType::kDrawIndexedPrimitive &&
-          type != CommandType::kDrawPrimitive &&
-          type != CommandType::kDrawPrimitiveUp) [[unlikely]] {
-        if (resolve_destination) resolve_destination.reset();
-        if (depth_handoff_source) depth_handoff_source.reset();
-        if (present_source) present_source.reset();
-        if (postfx_half_scene) postfx_half_scene.reset();
-        if (temporal_instance) temporal_instance.reset();
-        if (temporal_prefilter) temporal_prefilter.reset();
-        if (synchronous) synchronous.reset();
-        if (fixed_owner) fixed_owner.reset();  // 48
-      }
+      // 61: for every type again (batch 62 skipped them for draws). postfx_half_scene,
+      // temporal_instance, temporal_prefilter and fixed_owner are draw fields, and the capture
+      // relies on a recycled slot being empty: it assigns postfx_half_scene / temporal_instance
+      // only when it has one ("48: a recycled command's slot is already empty"). Skipped, a
+      // draw inherits the previous occupant's half-scene texture and keeps old resources alive.
+      // This runs on GtaCmdRetirer, off RenderGuest's path; the null tests are all it saves.
+      if (resolve_destination) resolve_destination.reset();
+      if (depth_handoff_source) depth_handoff_source.reset();
+      if (present_source) present_source.reset();
+      if (postfx_half_scene) postfx_half_scene.reset();
+      if (temporal_instance) temporal_instance.reset();
+      if (temporal_prefilter) temporal_prefilter.reset();
+      if (synchronous) synchronous.reset();
+      if (fixed_owner) fixed_owner.reset();  // 48
 
       for (uint32_t mask = stream_mask; mask; mask &= mask - 1) {
         const uint32_t stream = uint32_t(std::countr_zero(mask));
@@ -2652,6 +2654,22 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   uint32_t stream_next_frame_ = 0;
   uint32_t stream_last_width_ = 0, stream_last_height_ = 0;
   std::shared_ptr<const NativeTextureResource> stream_last_present_source_;
+  // 61: the one before it. Batch 60/S1: the source differed from the previous Present's on every
+  // frame (the title alternates frontbuffers), so the previous frame predicted it wrong.
+  std::shared_ptr<const NativeTextureResource> stream_previous_present_source_;
+  void RememberStreamPresentSource(const std::shared_ptr<const NativeTextureResource>& source) {
+    stream_previous_present_source_ = std::move(stream_last_present_source_);
+    stream_last_present_source_ = source;
+  }
+  // Two alternating frontbuffers: this frame presents the one of two presents ago.
+  std::shared_ptr<const NativeTextureResource> PredictStreamPresentSource() const {
+    if (stream_last_present_source_ && stream_previous_present_source_ &&
+        stream_last_present_source_->generation != stream_previous_present_source_->generation) {
+      return stream_previous_present_source_;
+    }
+    return stream_last_present_source_;
+  }
+  uint64_t stream_deferred_frontbuffer_resolves_ = 0;
   bool stream_last_hdr_output_ = false;
   float stream_last_hdr_headroom_ = 0.0f;
   bool stream_presenter_seen_ = false;  // a callback ran since the last flush
@@ -2820,6 +2838,8 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     uint32_t alias_serial = 0;
     uint64_t epoch = 0;
     const NativeBufferResource* alias = nullptr;
+    // 61: the resource header it was captured with (as BufferCaptureCacheSlot).
+    uint32_t flags = 0, address = 0, size = 0;
   };
   static constexpr size_t kBufferCaptureMruSize = 8;
   static constexpr uint32_t kBufferCaptureMruMask = kBufferCaptureMruSize - 1;
