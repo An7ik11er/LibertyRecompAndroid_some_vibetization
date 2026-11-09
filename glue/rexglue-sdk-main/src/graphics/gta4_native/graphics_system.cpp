@@ -4353,8 +4353,6 @@ bool Gta4NativeGraphicsSystem::CaptureTitleCommand(uint32_t abi_version, const v
     if (producer_waiting_) {
       TRACE_SCOPE("RG: backpressure wait");
       render_condition_.wait_for(lock, std::chrono::milliseconds(20), can_submit);
-    } else {
-      render_condition_.wait_for(lock, std::chrono::milliseconds(20), can_submit);
     }
     const uint64_t backpressure_end = profile_transport ? profile::CpuTick() : 0;
     producer_waiting_ = false;
@@ -9187,22 +9185,39 @@ bool Gta4NativeGraphicsSystem::SnapshotDrawConstants(NativeCommand& command,
           command.texture_fetches[stage],
       };
     }
-	static std::array<StageInputs, kTextureStageCount> last_stages{};
-    static size_t last_count = 0;
-    static uint32_t last_mask = 0;
-    static uint64_t last_sig = 0;
+    struct StageInputsCacheEntry {
+      std::array<StageInputs, kTextureStageCount> stages{};
+      size_t count = 0;
+      uint32_t mask = 0;
+      uint64_t sig = 0;
+    };
+    static std::array<StageInputsCacheEntry, 4> stage_mru{};
     const size_t bytes_len = count * sizeof(StageInputs);
-    if (last_sig != 0 && count == last_count && command.used_texture_mask == last_mask &&
-        std::memcmp(stages.data(), last_stages.data(), bytes_len) == 0) {
-      command.texture_inputs_signature = last_sig;
+    uint64_t matched_sig = 0;
+    for (size_t i = 0; i < stage_mru.size(); ++i) {
+      if (stage_mru[i].sig != 0 && stage_mru[i].count == count && stage_mru[i].mask == command.used_texture_mask &&
+          std::memcmp(stages.data(), stage_mru[i].stages.data(), bytes_len) == 0) {
+        matched_sig = stage_mru[i].sig;
+        if (i > 0) {
+          std::swap(stage_mru[0], stage_mru[i]);
+        }
+        break;
+      }
+    }
+    if (matched_sig != 0) {
+      command.texture_inputs_signature = matched_sig;
     } else {
       const uint64_t hash = XXH3_64bits_withSeed(stages.data(), bytes_len,
                                                  command.used_texture_mask);
-      last_sig = hash ? hash : 1;
-      last_count = count;
-      last_mask = command.used_texture_mask;
-      std::memcpy(last_stages.data(), stages.data(), bytes_len);
-      command.texture_inputs_signature = last_sig;
+      matched_sig = hash ? hash : 1;
+      for (size_t i = stage_mru.size() - 1; i > 0; --i) {
+        stage_mru[i] = stage_mru[i - 1];
+      }
+      stage_mru[0].sig = matched_sig;
+      stage_mru[0].count = count;
+      stage_mru[0].mask = command.used_texture_mask;
+      std::memcpy(stage_mru[0].stages.data(), stages.data(), bytes_len);
+      command.texture_inputs_signature = matched_sig;
     }
   }
   return true;
@@ -10982,14 +10997,23 @@ void Gta4NativeGraphicsSystem::WriteWorkerRingConstants(NativeCommand& command,
       return 0;
     }
     const uint64_t hash = version->content_hash ? version->content_hash : upload_hash;
-    WorkerRingLast& last = worker_ring_last_[kind];
-    if (hash && last.version == version.get() && last.hash == hash && last.bytes == bytes) {
-      return last.offset;
+    auto& mru = worker_ring_last_[kind];
+    if (hash) {
+      for (size_t i = 0; i < mru.size(); ++i) {
+        if (mru[i].version == version.get() && mru[i].hash == hash && mru[i].bytes == bytes) {
+          const uint32_t offset = mru[i].offset;
+          if (i > 0) {
+            std::swap(mru[0], mru[i]);
+          }
+          return offset;
+        }
+      }
     }
     const WorkerRingKey key{hash, bytes, kind};
     if (hash) {
       if (const uint32_t* found = worker_ring_dedupe_.Find(key)) {
-        last = {version.get(), hash, bytes, *found};
+        for (size_t i = mru.size() - 1; i > 0; --i) mru[i] = mru[i - 1];
+        mru[0] = {version.get(), hash, bytes, *found};
         return *found;
       }
     }
@@ -11001,7 +11025,8 @@ void Gta4NativeGraphicsSystem::WriteWorkerRingConstants(NativeCommand& command,
     SwapGuestConstantWords(worker_constant_ring_.mapping + offset, src_data, bytes);
     worker_ring_cursor_ = cursor + bytes;
     if (hash) worker_ring_dedupe_.Insert(key, uint32_t(offset));
-    last = {version.get(), hash, bytes, uint32_t(offset)};
+    for (size_t i = mru.size() - 1; i > 0; --i) mru[i] = mru[i - 1];
+    mru[0] = {version.get(), hash, bytes, uint32_t(offset)};
     return uint32_t(offset);
   };
   const uint32_t vertex_offset =

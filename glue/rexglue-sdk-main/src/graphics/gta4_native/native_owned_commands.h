@@ -102,7 +102,7 @@ class NativeCommandPool {
   // producer then reuses slots retired microseconds ago (still in the shared
   // L3) instead of ones a frame or more old (DRAM), and the pool needs fewer
   // frames' worth of slots.
-  static constexpr size_t kReturnChunk = 128;
+  static constexpr size_t kReturnChunk = 256;
   template <typename Owners>
   void RetireBatch(Owners& owners) noexcept {
     Slot* first = nullptr;
@@ -182,6 +182,7 @@ class NativeCommandPool {
       (void)last;
       std::lock_guard lock(mutex_);
       assert(count <= live_);
+      free_.reserve(free_.size() + count);
       for (Slot* slot = first; slot; slot = slot->next) free_.push_back(slot);
       live_ -= count;
     }

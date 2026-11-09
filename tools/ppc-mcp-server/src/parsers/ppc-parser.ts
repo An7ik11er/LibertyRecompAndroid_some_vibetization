@@ -187,7 +187,7 @@ export class PPCParser {
 
   private async parsePPCFiles(index: PPCIndex): Promise<void> {
     const files = fs.readdirSync(this.ppcDir)
-      .filter(f => f.startsWith('ppc_recomp.') && f.endsWith('.cpp'));
+      .filter(f => (f.startsWith('ppc_recomp.') || f.startsWith('gta4_recomp.')) && f.endsWith('.cpp'));
     
     for (const file of files) {
       console.log(`Parsing ${file}...`);
@@ -209,7 +209,7 @@ export class PPCParser {
       const lineNum = i + 1;
       
       // Check for function start
-      const implMatch = line.match(/PPC_FUNC_IMPL\(__imp__(sub_[0-9A-Fa-f]+)\)/);
+      const implMatch = line.match(/(?:PPC_FUNC_IMPL\(__imp__|DEFINE_REX_FUNC\()(sub_[0-9A-Fa-f]+)\)/);
       if (implMatch) {
         const name = implMatch[1];
         const addr = '0x' + name.substring(4).toLowerCase();

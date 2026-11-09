@@ -703,15 +703,53 @@ function deserializeIndex(data: Record<string, unknown>): PPCIndex {
   const hooks = data.hooks as [string, HookInfo][] | undefined;
   const vtables = data.vtables as [string, VTable][] | undefined;
   
+  const fByName = new Map<string, PPCFunction>();
+  if (functionsByName) {
+    for (const [k, v] of functionsByName) {
+      fByName.set(k, v);
+      fByName.set(k.toLowerCase(), v);
+      fByName.set(k.toUpperCase(), v);
+      if (k.startsWith('sub_') || k.startsWith('SUB_')) {
+        fByName.set('0x' + k.substring(4).toLowerCase(), v);
+        fByName.set('0x' + k.substring(4).toUpperCase(), v);
+      }
+    }
+  }
+
+  const hooksMap = new Map(hooks || []);
+  if (hooksMap.size === 0) {
+    const directHooked = 'G:/cod/LibertyRecompAndroid/glue/rexglue-sdk-main/gta4-recomp/tools/direct_calls_hooked.txt';
+    if (fs.existsSync(directHooked)) {
+      const lines = fs.readFileSync(directHooked, 'utf-8').split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (line.startsWith('sub_')) {
+          const info: HookInfo = {
+            type: 'GUEST_FUNCTION_HOOK',
+            file: 'direct_calls_hooked.txt',
+            line: i + 1,
+          };
+          hooksMap.set(line, info);
+          hooksMap.set(line.toLowerCase(), info);
+          const func = fByName.get(line) || fByName.get(line.toLowerCase());
+          if (func) {
+            func.isHooked = true;
+            func.hookInfo = info;
+          }
+        }
+      }
+    }
+  }
+
   return {
     functions: new Map(functions || []),
-    functionsByName: new Map(functionsByName || []),
+    functionsByName: fByName,
     callGraph: new Map((callGraph || []).map(([k, v]) => [k, new Set(v)])),
     reverseCallGraph: new Map((reverseCallGraph || []).map(([k, v]) => [k, new Set(v)])),
     globals: new Map(globals || []),
     syncPrimitives: new Map(syncPrimitives || []),
     kernelAPIs: new Map(kernelAPIs || []),
-    hooks: new Map(hooks || []),
+    hooks: hooksMap,
     vtables: new Map(vtables || []),
   };
 }

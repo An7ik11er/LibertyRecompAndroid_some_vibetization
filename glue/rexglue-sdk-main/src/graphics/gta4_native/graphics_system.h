@@ -786,14 +786,18 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
       if (bulb_trace) bulb_trace.reset();
       if (phone_trace) phone_trace.reset();
       if (tv_trace) tv_trace.reset();
-      if (resolve_destination) resolve_destination.reset();
-      if (depth_handoff_source) depth_handoff_source.reset();
-      if (present_source) present_source.reset();
-      if (postfx_half_scene) postfx_half_scene.reset();
-      if (temporal_instance) temporal_instance.reset();
-      if (temporal_prefilter) temporal_prefilter.reset();
-      if (synchronous) synchronous.reset();
-      if (fixed_owner) fixed_owner.reset();  // 48
+      if (type != CommandType::kDrawIndexedPrimitive &&
+          type != CommandType::kDrawPrimitive &&
+          type != CommandType::kDrawPrimitiveUp) [[unlikely]] {
+        if (resolve_destination) resolve_destination.reset();
+        if (depth_handoff_source) depth_handoff_source.reset();
+        if (present_source) present_source.reset();
+        if (postfx_half_scene) postfx_half_scene.reset();
+        if (temporal_instance) temporal_instance.reset();
+        if (temporal_prefilter) temporal_prefilter.reset();
+        if (synchronous) synchronous.reset();
+        if (fixed_owner) fixed_owner.reset();  // 48
+      }
 
       for (uint32_t mask = stream_mask; mask; mask &= mask - 1) {
         const uint32_t stream = uint32_t(std::countr_zero(mask));
@@ -3541,7 +3545,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   uint32_t worker_ring_segment_ = 0;
   VkDeviceSize worker_ring_cursor_ = 0;
   FrameGenerationMap<WorkerRingKey, uint32_t, WorkerRingKeyHash> worker_ring_dedupe_;
-  std::array<WorkerRingLast, 2> worker_ring_last_{};
+  std::array<std::array<WorkerRingLast, 4>, 2> worker_ring_last_{};
   // Recorder-thread: the ring frame of the frame being recorded.
   uint32_t recording_ring_serial_ = 0;
   // Whether a frame holds kTemporalUpdate commands (the worker marks the
