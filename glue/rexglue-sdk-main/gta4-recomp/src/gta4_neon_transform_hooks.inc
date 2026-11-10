@@ -62,14 +62,24 @@ static inline void ExecuteVectorMatrixTransform(PPCContext& ctx, uint8_t* base, 
   ctx.r8.s64 = 48;
   ctx.r9.s64 = 32;
   ctx.r10.s64 = ctx.r1.s64 - 16;
+  ctx.r11.u64 = matrix_ea;
   ctx.f0.f64 = static_cast<double>(scale_val);
 
-  // Sync vector registers in ctx
-  StoreBigEndianFloat4(&ctx.v0, res);
-  StoreBigEndianFloat4(&ctx.v7, row0);
-  StoreBigEndianFloat4(&ctx.v8, row1);
-  StoreBigEndianFloat4(&ctx.v9, row2);
-  StoreBigEndianFloat4(&ctx.v13, vdupq_n_f32(scale_val));
+  // Sync vector registers in ctx.
+  // Note: PPCContext vector registers hold native host IEEE-754 floats (Little Endian on ARM64).
+  // Writing them via StoreBigEndianFloat4 byte-swapped floats into NaNs/denormals, breaking 3D audio rolloff!
+  vst1q_f32(ctx.v0.f32, res);
+  vst1q_f32(ctx.v7.f32, row0);
+  vst1q_f32(ctx.v8.f32, row1);
+  vst1q_f32(ctx.v9.f32, row2);
+  vst1q_f32(ctx.v10.f32, vdupq_laneq_f32(v_in, 1));
+  vst1q_f32(ctx.v11.f32, vdupq_laneq_f32(v_in, 2));
+
+  float32x4_t v12_acc = vmulq_laneq_f32(row3, v_in, 3);
+  v12_acc = vfmaq_laneq_f32(v12_acc, row2, v_in, 2);
+  v12_acc = vfmaq_laneq_f32(v12_acc, row1, v_in, 1);
+  vst1q_f32(ctx.v12.f32, v12_acc);
+  vst1q_f32(ctx.v13.f32, vdupq_n_f32(scale_val));
 }
 
 } // namespace gta4::neon_transform
