@@ -179,9 +179,8 @@ REXCVAR_DEFINE_BOOL(gta4_native_direct_record, false, "GTA IV/Graphics/Native Re
                     "submit) itself at Present. Implies the inline recorder; GtaCapture is off");
 // 60: the direct emitter (native_stream_record.inc, разбор 60).
 REXCVAR_DEFINE_BOOL(gta4_native_intern_pipeline_snapshots, false, "GTA IV/Graphics/Native Renderer",
-                    "64, off by default (batch 67: dynamic offsets cause ~95% miss rate; off to avoid freeze): "
-                    "a draw whose pipeline state equals an interned one takes that snapshot. "
-                    "Table capped at 4096 states");
+                    "No effect since 66 (kept so that old command lines still parse): there are "
+                    "no pipeline snapshot objects to intern, a command carries its bindings");
 REXCVAR_DEFINE_UINT32(gta4_native_direct_stage_batch, 8, "GTA IV/Graphics/Native Renderer",
                       "64: with direct record, commands are assembled in batches of this many "
                       "(1: each right after its capture, as before; at most 64). Presents, "
@@ -7478,8 +7477,8 @@ void Gta4NativeGraphicsSystem::RenderWorkerLoop(WorkerLoopMode mode) {
         environmental_data_hash_by_device_.erase(device.device);
         if (device.mode != 2) {
           pipeline_state_ = {};
-          last_pipeline_snapshot_.reset();
-          ClearPipelineSnapshotIntern();  // 64
+          last_pipeline_valid_ = false;  // 66
+          last_pipeline_declaration_.reset();
           last_shader_snapshot_.reset();
           ClearNativeFrameCommands();
           modern_shader_frame_.Reset();
@@ -8118,16 +8117,14 @@ void Gta4NativeGraphicsSystem::RenderWorkerLoop(WorkerLoopMode mode) {
                          CommandTypeName(command.type), device);
             break;
           }
-          command.pipeline_state = KeepSnapshot(SnapshotPipeline(command, true),
-                                                snapshot_keepalive_last_pipeline_, command);
+          SnapshotPipeline(command, true);  // 66: into the command
           if (!SnapshotDrawConstants(command, device)) {
             REXLOG_ERROR("gta4-native-constants: draw constant snapshot failed type={} device={:08X}",
                          CommandTypeName(command.type), device);
             break;
           }
         } else {
-          command.pipeline_state = KeepSnapshot(SnapshotPipeline(command, false),
-                                                snapshot_keepalive_last_pipeline_, command);
+          SnapshotPipeline(command, false);  // 66: into the command
         }
         if (command.render_phase == RenderPhase::kCompositePostFx &&
             (command.type == CommandType::kDrawPrimitive ||
@@ -8580,187 +8577,75 @@ void Gta4NativeGraphicsSystem::ApplyReleaseResourceEffects(const NativeReleaseEf
   }
 }
 
-std::shared_ptr<const Gta4NativeGraphicsSystem::NativePipelineState>
-Gta4NativeGraphicsSystem::SnapshotPipeline(const NativeCommand& command, bool draw) {
-  // 64: last_pipeline_snapshot_version_, not the snapshot's own version (an interned snapshot
-  // has the version of the frame that made it).
-  const bool version_unchanged =
-      last_pipeline_snapshot_ && last_pipeline_snapshot_version_ == pipeline_state_.version;
-  if (!draw && version_unchanged) {
-    ++pipeline_snapshot_reuses_;
-    ++pipeline_snapshot_intern_counters_.version_reuses;
-    return last_pipeline_snapshot_;
-  }
+// 66: the command's pipeline bindings, written into the command itself
+// (NativeCommandPipelineState). Render worker.
+void Gta4NativeGraphicsSystem::SnapshotPipeline(NativeCommand& command, bool draw) {
   const auto& colors = draw ? command.snapshot_targets->colors : pipeline_state_.render_targets;
   const auto& depth = draw ? command.snapshot_targets->depth : pipeline_state_.depth_stencil;
-  if (version_unchanged &&
-      last_pipeline_snapshot_->vertex_shader_resource == pipeline_state_.vertex_shader_resource &&
-      last_pipeline_snapshot_->pixel_shader_resource == pipeline_state_.pixel_shader_resource &&
-      last_pipeline_snapshot_->vertex_declaration_resource == pipeline_state_.vertex_declaration_resource) {
-    if (draw) {
-      const NativeTargetSnapshot* targets_ptr = command.snapshot_targets.get();
-      if (targets_ptr == last_pipeline_snapshot_targets_ ||
-          (NativeSurfaceStateEqual(last_pipeline_snapshot_->depth_stencil, depth) &&
-           std::equal(colors.begin(), colors.end(), last_pipeline_snapshot_->render_targets.begin(),
-                      [](const auto& a, const auto& b) { return NativeSurfaceStateEqual(a, b); }))) {
-        last_pipeline_snapshot_targets_ = targets_ptr;
-        ++pipeline_snapshot_reuses_;
-        ++pipeline_snapshot_intern_counters_.version_reuses;
-        return last_pipeline_snapshot_;
-      }
-    } else {
-      ++pipeline_snapshot_reuses_;
-      ++pipeline_snapshot_intern_counters_.version_reuses;
-      return last_pipeline_snapshot_;
+  // The same bindings as the last command's? These are the tests that used to hand out the
+  // last snapshot object again; now they keep the serial (what pointer equality was) and the
+  // counter.
+  bool same = last_pipeline_valid_ && last_pipeline_version_ == pipeline_state_.version;
+  if (same && draw) {
+    const NativeTargetSnapshot* targets_ptr = command.snapshot_targets.get();
+    same = last_pipeline_vertex_shader_ == pipeline_state_.vertex_shader_resource &&
+           last_pipeline_pixel_shader_ == pipeline_state_.pixel_shader_resource &&
+           last_pipeline_declaration_ == pipeline_state_.vertex_declaration_resource &&
+           (targets_ptr == last_pipeline_snapshot_targets_ ||
+            (NativeSurfaceStateEqual(last_pipeline_depth_, depth) &&
+             std::equal(colors.begin(), colors.end(), last_pipeline_colors_.begin(),
+                        [](const auto& a, const auto& b) { return NativeSurfaceStateEqual(a, b); })));
+    if (same) last_pipeline_snapshot_targets_ = targets_ptr;
+  }
+  if (same) {
+    ++pipeline_snapshot_reuses_;
+  } else {
+    last_pipeline_valid_ = true;
+    last_pipeline_version_ = pipeline_state_.version;
+    last_pipeline_serial_ = ++pipeline_serial_;
+    last_pipeline_snapshot_targets_ = draw ? command.snapshot_targets.get() : nullptr;
+    last_pipeline_vertex_shader_ = pipeline_state_.vertex_shader_resource;
+    last_pipeline_pixel_shader_ = pipeline_state_.pixel_shader_resource;
+    if (last_pipeline_declaration_ != pipeline_state_.vertex_declaration_resource)
+      last_pipeline_declaration_ = pipeline_state_.vertex_declaration_resource;
+    last_pipeline_colors_ = colors;
+    last_pipeline_depth_ = depth;
+  }
+  // "same" commands shared one object: they get its targets, shaders and declaration (the
+  // last ones remembered), not this command's.
+  NativePipelineState& state = command.pipeline_state.Begin(last_pipeline_serial_);
+  state.textures = pipeline_state_.textures;
+  state.render_targets = last_pipeline_colors_;
+  state.vertex_streams = pipeline_state_.vertex_streams;
+  state.pixel_shader = pipeline_state_.pixel_shader;
+  state.vertex_shader = pipeline_state_.vertex_shader;
+  state.pixel_shader_resource = last_pipeline_pixel_shader_;
+  state.vertex_shader_resource = last_pipeline_vertex_shader_;
+  state.vertex_declaration = pipeline_state_.vertex_declaration;
+  // The declaration is owned by the frame keep-alive the command holds (as every other
+  // snapshot the command refers to); the command's own reference owns nothing, so neither
+  // filling the command nor retiring it touches the declaration's reference count. Without
+  // a keep-alive (gta4_native_worker_snapshot_keepalive=false) the command's reference owns.
+  // (KeepSnapshot's rules, without its by-value copy of the owning reference.)
+  const NativeVertexDeclaration* declaration = last_pipeline_declaration_.get();
+  if (declaration && snapshot_keepalive_) {
+    if (declaration != snapshot_keepalive_last_pipeline_) {
+      snapshot_keepalive_->refs.push_back(last_pipeline_declaration_);
+      snapshot_keepalive_last_pipeline_ = declaration;
     }
+    if (!command.snapshot_keepalive) command.snapshot_keepalive = snapshot_keepalive_;
+    state.vertex_declaration_resource = std::shared_ptr<const NativeVertexDeclaration>(
+        std::shared_ptr<const NativeVertexDeclaration>{}, declaration);
+  } else {
+    state.vertex_declaration_resource = last_pipeline_declaration_;
   }
-  // 64: a state this or an earlier frame already has a snapshot of.
-  PipelineSnapshotIntern* intern_slot = nullptr;
-  if (pipeline_snapshot_intern_enabled_) {
-    const NativePipelineState& state = pipeline_state_;
-    struct Scalars {
-      uint64_t pixel_shader_resource, vertex_shader_resource, vertex_declaration_resource;
-      uint32_t pixel_shader, vertex_shader, vertex_declaration, depth_stencil_trace_wrapper,
-          depth_stencil_trace_caller, index_buffer;
-    };
-    static_assert(sizeof(Scalars) == 48, "No padding in Scalars");
-    static_assert(sizeof(SurfaceDescriptor) == 36 &&
-                  sizeof(NativePipelineState::VertexStream) == 16);
-    struct Packed {
-      std::array<uint32_t, kTextureStageCount> textures;
-      std::array<NativePipelineState::VertexStream, kVertexStreamCount> vertex_streams;
-      std::array<SurfaceDescriptor, kRenderTargetCount> colors;
-      SurfaceDescriptor depth;
-      uint32_t zero;
-      Scalars scalars;
-    };
-    static_assert(sizeof(Packed) == sizeof(uint32_t) * kTextureStageCount +
-                                        16 * kVertexStreamCount + 36 * kRenderTargetCount + 36 +
-                                        4 + 48,
-                  "No padding in Packed");
-    Packed packed;
-    packed.textures = state.textures;
-    packed.vertex_streams = state.vertex_streams;
-    packed.colors = colors;
-    packed.depth = depth;
-    packed.zero = 0;
-    packed.scalars = Scalars{
-        uint64_t(reinterpret_cast<uintptr_t>(state.pixel_shader_resource)),
-        uint64_t(reinterpret_cast<uintptr_t>(state.vertex_shader_resource)),
-        uint64_t(reinterpret_cast<uintptr_t>(state.vertex_declaration_resource.get())),
-        state.pixel_shader, state.vertex_shader, state.vertex_declaration,
-        state.depth_stencil_trace_wrapper, state.depth_stencil_trace_caller, state.index_buffer};
-    const uint64_t hash = XXH3_64bits(&packed, sizeof(packed));
-    auto found = pipeline_snapshot_intern_.find(hash);
-    if (found == pipeline_snapshot_intern_.end() && pipeline_snapshot_intern_.size() < 4096)
-      found = pipeline_snapshot_intern_.try_emplace(hash).first;
-    if (found != pipeline_snapshot_intern_.end()) {
-      PipelineSnapshotIntern& slot = found->second;
-      const uint64_t vertex_hash = state.vertex_shader_resource ? state.vertex_shader_resource->hash : 0;
-      const uint64_t pixel_hash = state.pixel_shader_resource ? state.pixel_shader_resource->hash : 0;
-      if (slot.snapshot) {
-        const NativePipelineState& have = *slot.snapshot;
-        // Every field of the state, not the hash, decides.
-        const bool equal =
-            slot.vertex_shader_hash == vertex_hash && slot.pixel_shader_hash == pixel_hash &&
-            have.pixel_shader_resource == state.pixel_shader_resource &&
-            have.vertex_shader_resource == state.vertex_shader_resource &&
-            have.vertex_declaration_resource == state.vertex_declaration_resource &&
-            have.pixel_shader == state.pixel_shader && have.vertex_shader == state.vertex_shader &&
-            have.vertex_declaration == state.vertex_declaration &&
-            have.depth_stencil_trace_wrapper == state.depth_stencil_trace_wrapper &&
-            have.depth_stencil_trace_caller == state.depth_stencil_trace_caller &&
-            have.index_buffer == state.index_buffer &&
-            std::memcmp(have.textures.data(), state.textures.data(), sizeof(state.textures)) == 0 &&
-            std::memcmp(have.vertex_streams.data(), state.vertex_streams.data(),
-                        sizeof(state.vertex_streams)) == 0 &&
-            std::memcmp(have.render_targets.data(), colors.data(), sizeof(colors)) == 0 &&
-            std::memcmp(&have.depth_stencil, &depth, sizeof(depth)) == 0;
-        if (equal) {
-          if (slot.last_frame != pipeline_snapshot_intern_frame_) {
-            // First use in this frame: the pipeline memo starts empty, as a new copy's does.
-            slot.last_frame = pipeline_snapshot_intern_frame_;
-            have.pipeline_lookup_memo = {};
-          }
-          ++pipeline_snapshot_intern_counters_.interned;
-          last_pipeline_snapshot_targets_ = draw ? command.snapshot_targets.get() : nullptr;
-          last_pipeline_snapshot_ = slot.snapshot;
-          last_pipeline_snapshot_version_ = pipeline_state_.version;
-          return last_pipeline_snapshot_;
-        }
-        ++pipeline_snapshot_intern_counters_.collisions;  // the newer state takes the slot
-      }
-      intern_slot = &slot;
-      slot.vertex_shader_hash = vertex_hash;
-      slot.pixel_shader_hash = pixel_hash;
-      slot.last_frame = pipeline_snapshot_intern_frame_;
-    }
-  }
-  auto snapshot = std::allocate_shared<NativePipelineState>(
-      std::pmr::polymorphic_allocator<NativePipelineState>(&snapshot_pool_), pipeline_state_);
-  snapshot->render_targets = colors;
-  snapshot->depth_stencil = depth;
-  ++pipeline_snapshot_intern_counters_.created;
-  last_pipeline_snapshot_targets_ = draw ? command.snapshot_targets.get() : nullptr;
-  last_pipeline_snapshot_ = std::move(snapshot);
-  last_pipeline_snapshot_version_ = pipeline_state_.version;
-  if (intern_slot) intern_slot->snapshot = last_pipeline_snapshot_;
-  return last_pipeline_snapshot_;
-}
-
-void Gta4NativeGraphicsSystem::ClearPipelineSnapshotIntern() {
-  pipeline_snapshot_intern_.clear();
-  last_pipeline_snapshot_version_ = UINT64_MAX;
-}
-
-// 64: render worker, at every Present (RollSnapshotKeepAlive).
-void Gta4NativeGraphicsSystem::RollPipelineSnapshotIntern() {
-  // Where assembly and recording share a thread (direct record, GtaBackend): the recorder
-  // writes a snapshot's pipeline memo, and assembly restarts it.
-  const bool enabled = inline_recording_ && REXCVAR_GET(gta4_native_intern_pipeline_snapshots);
-  if (!enabled && pipeline_snapshot_intern_enabled_) pipeline_snapshot_intern_.clear();
-  pipeline_snapshot_intern_enabled_ = enabled;
-  PipelineSnapshotInternCounters& c = pipeline_snapshot_intern_counters_;
-  ++c.frames;
-  ++pipeline_snapshot_intern_frame_;
-  if (!enabled) {
-    c = {};
-    return;
-  }
-  // States no frame used for two seconds of frames go; a table that still grows is dropped.
-  if ((pipeline_snapshot_intern_frame_ & 63) == 0) {
-    for (auto it = pipeline_snapshot_intern_.begin(); it != pipeline_snapshot_intern_.end();) {
-      if (pipeline_snapshot_intern_frame_ - it->second.last_frame > 64)
-        it = pipeline_snapshot_intern_.erase(it);
-      else
-        ++it;
-    }
-    if (pipeline_snapshot_intern_.size() > 32768) pipeline_snapshot_intern_.clear();
-  }
-  if ((c.frames & 31) != 0) return;  // the clock only every 32 frames
-  const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
-  const uint64_t frequency = rex::chrono::Clock::QueryHostTickFrequency();
-  if (!pipeline_snapshot_intern_report_tick_) pipeline_snapshot_intern_report_tick_ = now;
-  if (!frequency || now - pipeline_snapshot_intern_report_tick_ < 10 * frequency) return;
-  const double frames = double(c.frames);
-  REXLOG_WARN("gta4-native-snapshot-intern: {:.1f} s: frames={} per frame: unchanged={:.0f} "
-              "interned={:.0f} created={:.0f} collisions={:.1f} table={}",
-              double(now - pipeline_snapshot_intern_report_tick_) / double(frequency), c.frames,
-              double(c.version_reuses) / frames, double(c.interned) / frames,
-              double(c.created) / frames, double(c.collisions) / frames,
-              pipeline_snapshot_intern_.size());
-#if defined(__ANDROID__)
-  __android_log_print(
-      ANDROID_LOG_WARN, "LibertyRecomp",
-      "gta4-native-snapshot-intern: %.1f s: frames=%llu per frame: unchanged=%.0f interned=%.0f "
-      "created=%.0f collisions=%.1f table=%llu",
-      double(now - pipeline_snapshot_intern_report_tick_) / double(frequency),
-      static_cast<unsigned long long>(c.frames), double(c.version_reuses) / frames,
-      double(c.interned) / frames, double(c.created) / frames, double(c.collisions) / frames,
-      static_cast<unsigned long long>(pipeline_snapshot_intern_.size()));
-#endif
-  pipeline_snapshot_intern_report_tick_ = now;
-  c = {};
+  state.depth_stencil = last_pipeline_depth_;
+  state.depth_stencil_trace_wrapper = pipeline_state_.depth_stencil_trace_wrapper;
+  state.depth_stencil_trace_caller = pipeline_state_.depth_stencil_trace_caller;
+  state.index_buffer = pipeline_state_.index_buffer;
+  state.version = pipeline_state_.version;
+  state.translucent_range_memo = 0xFFFF;
+  state.shader_category_memo = 0xFFFF;
 }
 
 // 34: the absorbed state bytes move into the command by swapping buffers
@@ -22164,7 +22049,6 @@ Gta4NativeGraphicsSystem::SnapshotKeepAlive::~SnapshotKeepAlive() = default;
 
 // 33: render worker, at every Present it processes.
 void Gta4NativeGraphicsSystem::RollSnapshotKeepAlive() {
-  RollPipelineSnapshotIntern();  // 64
   size_t previous = 0;
   if (snapshot_keepalive_) {
     previous = snapshot_keepalive_->refs.size();
@@ -23791,32 +23675,10 @@ const uint64_t memo_signature = command.pipeline_memo_signature;
       AddNativeGpuProfileCounter(performance::Counter::kPipelineRequestReuses);
       return s_last_lookup.pipeline;
     }
-    if (VkPipeline pipeline =
-            state.pipeline_lookup_memo.FindSigned(&state, memo_signature, context)) {
-      for (uint32_t s = 0; s < kVertexStreamCount; ++s) {
-        s_last_lookup.strides[s] = state.vertex_streams[s].stride;
-      }
-      s_last_lookup.vs = state.vertex_shader_resource;
-      s_last_lookup.ps = state.pixel_shader_resource;
-      s_last_lookup.vdecl = state.vertex_declaration_resource.get();
-      s_last_lookup.vs_hash = state.vertex_shader_resource->hash;
-      s_last_lookup.ps_hash = ps_hash_now;
-      s_last_lookup.vdecl_hash = state.vertex_declaration_resource->content_hash;
-      s_last_lookup.memo_sig = memo_signature;
-      s_last_lookup.ctx = context;
-      s_last_lookup.pipeline = pipeline;
-      AddNativeGpuProfileCounter(performance::Counter::kPipelineRequestReuses);
-      return pipeline;
-    }
+    // 66: no per-snapshot memo (FindSigned / Find / Store): it lived in the snapshot object,
+    // which no longer exists. The last-lookup above and draw_pipeline_cache_ below answer.
   }
   const auto memo_state = NativePipelineMemoState(*command.fixed_function_state);
-  if (!trace_pipeline && !target.temporal_shader && !memo_signature) {
-    if (VkPipeline pipeline =
-            state.pipeline_lookup_memo.Find(&state, memo_state, context)) {
-      AddNativeGpuProfileCounter(performance::Counter::kPipelineRequestReuses);
-      return pipeline;
-    }
-  }
   // Per-stream strides, used by both the fast-path memo (s_last_lookup.strides)
 // and the pipeline-cache hash/comparison below.
 std::array<uint32_t, kVertexStreamCount> strides{};
@@ -23863,8 +23725,6 @@ for (uint32_t s = 0; s < kVertexStreamCount; ++s) {
   VkPipeline pipeline = GetOrCreatePipeline(state, *command.fixed_function_state, primitive_type,
                                               target, user_pointer_stride,
                                               primitive_restart_enable, prewarm);
-  if (!target.temporal_shader)
-    state.pipeline_lookup_memo.Store(&state, memo_state, context, pipeline, memo_signature);
   if (cache_entry && pipeline) {
     cache_entry->vertex_shader = state.vertex_shader_resource;
     cache_entry->pixel_shader = state.pixel_shader_resource;
@@ -26582,6 +26442,99 @@ void Gta4NativeGraphicsSystem::BindNativeIndexBuffer(VkCommandBuffer command_buf
                                                                      offset, index_type);
 }
 
+// 66: what a frame's rendering scopes are (gta4-native-scopes). The renderer has no
+// VkRenderPass or subpasses: every scope is a vkCmdBeginRendering, and on a tiler in GMEM
+// mode each one loads every attachment it opens with LOAD into tile memory and stores every
+// one it closes with STORE, per tile. Recorder thread.
+void Gta4NativeGraphicsSystem::NoteRenderingScope(const VkRenderingInfo& info, uint32_t site) {
+  RenderingScopeStats& c = rendering_scope_stats_;
+  ++c.scopes;
+  if (site < c.by_site.size()) ++c.by_site[site];
+  const uint64_t area = uint64_t(info.renderArea.extent.width) * info.renderArea.extent.height;
+  uint64_t loads = 0, stores = 0;
+  for (uint32_t i = 0; i < info.colorAttachmentCount; ++i) {
+    const VkRenderingAttachmentInfo& attachment = info.pColorAttachments[i];
+    if (!attachment.imageView) continue;
+    if (attachment.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+      ++c.color_load;
+      ++loads;
+    } else if (attachment.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+      ++c.color_clear;
+    } else {
+      ++c.color_dont_care;
+    }
+    if (attachment.storeOp == VK_ATTACHMENT_STORE_OP_STORE) ++stores;
+  }
+  // Depth and stencil are one attachment in tile memory.
+  const VkRenderingAttachmentInfo* depth = info.pDepthAttachment;
+  const VkRenderingAttachmentInfo* stencil = info.pStencilAttachment;
+  const bool has_depth = depth && depth->imageView;
+  const bool has_stencil = stencil && stencil->imageView;
+  if (has_depth || has_stencil) {
+    const bool load = (has_depth && depth->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) ||
+                      (has_stencil && stencil->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD);
+    const bool clear = (has_depth && depth->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) ||
+                       (has_stencil && stencil->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR);
+    if (load) {
+      ++c.depth_load;
+      ++loads;
+    } else if (clear) {
+      ++c.depth_clear;
+    } else {
+      ++c.depth_dont_care;
+    }
+    if ((has_depth && depth->storeOp == VK_ATTACHMENT_STORE_OP_STORE) ||
+        (has_stencil && stencil->storeOp == VK_ATTACHMENT_STORE_OP_STORE))
+      ++stores;
+  }
+  c.attachment_stores += stores;
+  c.load_pixels += area * loads;
+  c.store_pixels += area * stores;
+}
+
+void Gta4NativeGraphicsSystem::ReportRenderingScopes() {
+  RenderingScopeStats& c = rendering_scope_stats_;
+  ++c.frames;
+  if ((c.frames & 31) != 0) return;  // the clock only every 32 frames
+  const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+  const uint64_t frequency = rex::chrono::Clock::QueryHostTickFrequency();
+  if (!rendering_scope_report_tick_) rendering_scope_report_tick_ = now;
+  if (!frequency || now - rendering_scope_report_tick_ < 10 * frequency) return;
+  const double f = double(c.frames);
+  const auto per = [f](uint64_t value) { return double(value) / f; };
+  // Sites, in the order of the vkCmdBeginRendering calls in this file: packed depth alias,
+  // resolve conversion, depth resolve conversion (2), surface materialization, depth surface
+  // handoff (2), resolve clears, present, the frame's draws (2).
+  const auto& s = c.by_site;
+  REXLOG_WARN(
+      "gta4-native-scopes: {:.1f} s: frames={} per frame: scopes={:.1f} "
+      "[alias={:.1f} resolve={:.1f} depth-resolve={:.1f}/{:.1f} materialize={:.1f} "
+      "handoff={:.1f}/{:.1f} clears={:.1f} present={:.1f} draws={:.1f}/{:.1f}] "
+      "color load/clear/dont-care={:.1f}/{:.1f}/{:.1f} depth load/clear/dont-care="
+      "{:.1f}/{:.1f}/{:.1f} stores={:.1f} Mpx loaded={:.2f} stored={:.2f}",
+      double(now - rendering_scope_report_tick_) / double(frequency), c.frames, per(c.scopes),
+      per(s[0]), per(s[1]), per(s[2]), per(s[3]), per(s[4]), per(s[5]), per(s[6]), per(s[7]),
+      per(s[8]), per(s[9]), per(s[10]), per(c.color_load), per(c.color_clear),
+      per(c.color_dont_care), per(c.depth_load), per(c.depth_clear), per(c.depth_dont_care),
+      per(c.attachment_stores), per(c.load_pixels) / 1e6, per(c.store_pixels) / 1e6);
+#if defined(__ANDROID__)
+  __android_log_print(
+      ANDROID_LOG_WARN, "LibertyRecomp",
+      "gta4-native-scopes: %.1f s: frames=%llu per frame: scopes=%.1f "
+      "[alias=%.1f resolve=%.1f depth-resolve=%.1f/%.1f materialize=%.1f handoff=%.1f/%.1f "
+      "clears=%.1f present=%.1f draws=%.1f/%.1f] color load/clear/dont-care=%.1f/%.1f/%.1f "
+      "depth load/clear/dont-care=%.1f/%.1f/%.1f stores=%.1f Mpx loaded=%.2f stored=%.2f",
+      double(now - rendering_scope_report_tick_) / double(frequency),
+      static_cast<unsigned long long>(c.frames), per(c.scopes), per(s[0]), per(s[1]), per(s[2]),
+      per(s[3]), per(s[4]), per(s[5]), per(s[6]), per(s[7]), per(s[8]), per(s[9]), per(s[10]),
+      per(c.color_load), per(c.color_clear), per(c.color_dont_care), per(c.depth_load),
+      per(c.depth_clear), per(c.depth_dont_care), per(c.attachment_stores),
+      per(c.load_pixels) / 1e6, per(c.store_pixels) / 1e6);
+#endif
+  rendering_scope_report_tick_ = now;
+  c = {};
+}
+
 // 63: shadow of a draw-translation memo across frames (graphics_system.h).
 // Batch 67: Flat open-addressed zero-allocation table with epoch tagging.
 // Eliminates std::unordered_map node allocations and Scudo 128-bit CAS atomics.
@@ -28244,6 +28197,7 @@ bool Gta4NativeGraphicsSystem::RecordPackedDepthAlias(
   rendering.colorAttachmentCount = 1;
   rendering.pColorAttachments = &attachment;
   gpu_labels::BeginRendering(vulkan_device, command_buffer, rendering, __func__, diagnostic_submitted_frame_, diagnostic_command_index_);
+  NoteRenderingScope(rendering, 0);  // 66
   profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdBeginRendering(command_buffer, &rendering); });
   const VkViewport viewport{0.0f, 0.0f, float(destination.width), float(destination.height), 0.0f, 1.0f};
   const VkRect2D scissor{{0, 0}, {destination.width, destination.height}};
@@ -28516,6 +28470,7 @@ bool Gta4NativeGraphicsSystem::RecordResolveConversion(
   rendering_info.colorAttachmentCount = hdr_mirror ? 2 : 1;
   rendering_info.pColorAttachments = color_attachments.data();
   gpu_labels::BeginRendering(vulkan_device, command_buffer, rendering_info, __func__, diagnostic_submitted_frame_, diagnostic_command_index_);
+  NoteRenderingScope(rendering_info, 1);  // 66
   profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdBeginRendering(command_buffer, &rendering_info); });
   VkViewport viewport{};
   viewport.width = float(mip_width);
@@ -29042,6 +28997,7 @@ bool Gta4NativeGraphicsSystem::RecordDepthResolveConversion(
       rendering_info.pDepthAttachment = &depth_attachment;
       rendering_info.pStencilAttachment = &stencil_attachment;
       gpu_labels::BeginRendering(vulkan_device, command_buffer, rendering_info, __func__, diagnostic_submitted_frame_, diagnostic_command_index_);
+      NoteRenderingScope(rendering_info, 2);  // 66
       profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdBeginRendering(command_buffer, &rendering_info); });
       profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdEndRendering(command_buffer); });
       gpu_labels::End(vulkan_device, command_buffer);
@@ -29194,6 +29150,7 @@ bool Gta4NativeGraphicsSystem::RecordDepthResolveConversion(
   rendering_info.layerCount = 1;
   rendering_info.pDepthAttachment = &depth_attachment;
   gpu_labels::BeginRendering(vulkan_device, command_buffer, rendering_info, __func__, diagnostic_submitted_frame_, diagnostic_command_index_);
+  NoteRenderingScope(rendering_info, 3);  // 66
   profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdBeginRendering(command_buffer, &rendering_info); });
   VkViewport viewport{};
   viewport.width = float(mip_width);
@@ -29500,6 +29457,7 @@ bool Gta4NativeGraphicsSystem::RecordSurfaceMaterialization(
   rendering_info.colorAttachmentCount = 1;
   rendering_info.pColorAttachments = &attachment;
   gpu_labels::BeginRendering(vulkan_device, command_buffer, rendering_info, __func__, diagnostic_submitted_frame_, diagnostic_command_index_);
+  NoteRenderingScope(rendering_info, 4);  // 66
   profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdBeginRendering(command_buffer, &rendering_info); });
   VkViewport viewport{};
   viewport.width = float(destination.width);
@@ -29843,6 +29801,7 @@ bool Gta4NativeGraphicsSystem::RecordDepthSurfaceHandoff(VkCommandBuffer command
     rendering_info.pDepthAttachment = &depth_attachment;
     rendering_info.pStencilAttachment = &stencil_attachment;
     gpu_labels::BeginRendering(vulkan_device, command_buffer, rendering_info, __func__, diagnostic_submitted_frame_, diagnostic_command_index_);
+    NoteRenderingScope(rendering_info, 5);  // 66
     profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdBeginRendering(command_buffer, &rendering_info); });
     VkViewport viewport{};
     viewport.width = float(destination->width);
@@ -30045,6 +30004,7 @@ bool Gta4NativeGraphicsSystem::RecordDepthSurfaceHandoff(VkCommandBuffer command
     stencil_rendering.layerCount = 1;
     stencil_rendering.pStencilAttachment = &stencil_initialization;
     gpu_labels::BeginRendering(vulkan_device, command_buffer, stencil_rendering, __func__, diagnostic_submitted_frame_, diagnostic_command_index_);
+    NoteRenderingScope(stencil_rendering, 6);  // 66
     profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdBeginRendering(command_buffer, &stencil_rendering); });
     profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdEndRendering(command_buffer); });
     gpu_labels::End(vulkan_device, command_buffer);
@@ -30471,6 +30431,7 @@ bool Gta4NativeGraphicsSystem::RecordResolveClears(VkCommandBuffer command_buffe
     SetNativeRenderingAttachmentBindings(rendering_info, surface->aspect, attachment,
                                          stencil_attachment);
     gpu_labels::BeginRendering(vulkan_provider->vulkan_device(), command_buffer, rendering_info, __func__, diagnostic_submitted_frame_, diagnostic_command_index_);
+    NoteRenderingScope(rendering_info, 7);  // 66
     profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdBeginRendering(command_buffer, &rendering_info); });
 
     if (primary_plan.explicit_clear) {
@@ -31609,6 +31570,7 @@ bool Gta4NativeGraphicsSystem::RecordPresent(
       rendering_info.colorAttachmentCount = 1;
       rendering_info.pColorAttachments = &color_attachment;
       gpu_labels::BeginRendering(vulkan_device, command_buffer, rendering_info, __func__, diagnostic_submitted_frame_, diagnostic_command_index_);
+      NoteRenderingScope(rendering_info, 8);  // 66
       profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdBeginRendering(command_buffer, &rendering_info); });
       VkViewport viewport{};
       viewport.width = float(presenter_width);
@@ -32378,6 +32340,7 @@ NativeFrameTask Gta4NativeGraphicsSystem::RecordNativeFrameTask(
   phone_record_event_ = 0;
   native_draw_state_cache_.Reset(); ubo_bound_layout_ = VK_NULL_HANDLE;
   MemoShadowBeginFrame();  // 63
+  ReportRenderingScopes();  // 66
   presenter_transfer_written = false;
   presenter_written = false;
   (void)environmental_data;
@@ -37981,6 +37944,7 @@ const bool keeps_draw_state =
         }
       }
       gpu_labels::BeginSceneScope(vulkan_provider->vulkan_device(), command_buffer, rendering_info, native_gpu_scope_summary_, submitted_frame, uint32_t(command_index));
+      NoteRenderingScope(rendering_info, 9);  // 66
       profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdBeginRendering(command_buffer, &rendering_info); });
       // A load-op clear is itself a complete attachment write. Record it
       // immediately so a later scope break in the same reflection capture may
@@ -38060,6 +38024,7 @@ const bool keeps_draw_state =
         depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         stencil_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         gpu_labels::BeginSceneScope(vulkan_provider->vulkan_device(), command_buffer, rendering_info, native_gpu_scope_summary_, submitted_frame, uint32_t(command_index));
+        NoteRenderingScope(rendering_info, 10);  // 66
         profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdBeginRendering(command_buffer, &rendering_info); });
       }
       rendering = true;

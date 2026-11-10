@@ -502,13 +502,54 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     uint32_t depth_stencil_trace_caller = 0;
     uint32_t index_buffer = 0;
     uint64_t version = 0;
-    // Only the render worker updates memoization on an immutable snapshot.
-    mutable NativeSnapshotPipelineMemo<NativeFixedFunctionState, kRenderTargetCount, VkPipeline>
-        pipeline_lookup_memo;
+    // 66: no pipeline memo here. It was 1512 of this struct's 2144 bytes, for a lookup that
+    // could only hit between draws sharing one snapshot object; the lookups it backed go to
+    // GetOrCreateDrawPipeline's own caches.
     // Recorder-only memos of the shader-name classifications behind GPU range
     // attribution (string searches over both filenames); 0xFFFF: not computed.
     mutable uint16_t translucent_range_memo = 0xFFFF;
     mutable uint16_t shader_category_memo = 0xFFFF;
+  };
+
+  // 66: a command's pipeline bindings are part of the command. Until 66 the worker made a
+  // separate NativePipelineState object for nearly every draw (batch 67: ~4400 a frame, 2144
+  // bytes each from the snapshot pool, released one by one when the frame's commands were
+  // retired) and the command held a pointer to it. Now the bindings are written into the
+  // command the draw already is: nothing is allocated, kept alive or destroyed for them, and
+  // they live exactly as long as the command (a copied command has its own).
+  // Reads as the pointer did: ->, *, get(), bool.
+  class NativeCommandPipelineState {
+   public:
+    const NativePipelineState* operator->() const { return &state_; }
+    const NativePipelineState& operator*() const { return state_; }
+    const NativePipelineState* get() const { return present_ ? &state_ : nullptr; }
+    explicit operator bool() const { return present_; }
+    void reset() {
+      if (!present_) return;
+      state_.vertex_declaration_resource.reset();
+      present_ = false;
+    }
+    // The worker fills the bindings in place (SnapshotPipeline). serial: equal for commands
+    // that would have shared one snapshot object (nothing changed between them).
+    NativePipelineState& Begin(uint64_t serial) {
+      present_ = true;
+      serial_ = serial;
+      return state_;
+    }
+    // What equality of two commands' snapshot pointers was.
+    friend bool operator==(const NativeCommandPipelineState& a,
+                           const NativeCommandPipelineState& b) {
+      return a.present_ == b.present_ && (!a.present_ || a.serial_ == b.serial_);
+    }
+    friend bool operator!=(const NativeCommandPipelineState& a,
+                           const NativeCommandPipelineState& b) {
+      return !(a == b);
+    }
+
+   private:
+    NativePipelineState state_{};
+    uint64_t serial_ = 0;
+    bool present_ = false;
   };
 
   struct NativePersistentBufferEntry;
@@ -1009,7 +1050,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     NativeQueueProtectionEpochs::Epoch* queue_epoch = nullptr;
     // Owned references. Typical draws: the first four.
     std::shared_ptr<const NativeShaderState> shader_state;
-    std::shared_ptr<const NativePipelineState> pipeline_state;
+    NativeCommandPipelineState pipeline_state;  // 66: in the command, see the class
     std::shared_ptr<const NativeBufferResource> index_buffer;
     std::shared_ptr<CaptureKeepAlive> capture_keepalive;
     std::shared_ptr<SnapshotKeepAlive> snapshot_keepalive;
@@ -2746,6 +2787,17 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   bool memo_shadow_enabled_ = false;
   VkPipeline memo_shadow_pipeline_ = VK_NULL_HANDLE;  // the last RecordIndexedPrimitive's
   void MemoShadowBeginFrame();
+  // 66: rendering scope statistics (gta4-native-scopes), recorder thread.
+  struct RenderingScopeStats {
+    uint64_t frames = 0, scopes = 0, color_load = 0, color_clear = 0, color_dont_care = 0,
+             depth_load = 0, depth_clear = 0, depth_dont_care = 0, attachment_stores = 0,
+             load_pixels = 0, store_pixels = 0;
+    std::array<uint64_t, 11> by_site{};
+  };
+  RenderingScopeStats rendering_scope_stats_{};
+  uint64_t rendering_scope_report_tick_ = 0;
+  void NoteRenderingScope(const VkRenderingInfo& info, uint32_t site);
+  void ReportRenderingScopes();
   const MemoShadowSlot* MemoShadowFindPrevious(uint64_t key) const;
   bool MemoShadowInsertCurrent(uint64_t key, const MemoShadowEntry& entry);
   uint64_t MemoShadowKey(const NativeCommand& command, const NativeRenderingTarget& target,
@@ -2777,33 +2829,18 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   NativePipelineState pipeline_state_{};
   uint64_t pipeline_snapshot_reuses_=0,shader_snapshot_reuses_=0;
   uint64_t zero_dof_skips_=0,postfx_direct_writes_=0;
-  std::shared_ptr<const NativePipelineState> last_pipeline_snapshot_;
-  // 64: the version of pipeline_state_ the last snapshot was taken at. An interned snapshot
-  // carries the version of the frame that made it, so the snapshot's own field cannot say
-  // "nothing changed since the last draw".
-  uint64_t last_pipeline_snapshot_version_ = UINT64_MAX;
-  // 64: pipeline snapshots interned across frames (gta4_native_intern_pipeline_snapshots).
-  // Batch 65: SnapshotPipeline 1.8 ms + the destruction of a frame's snapshots 1.25 ms of a
-  // 50 ms RenderGuest frame, for ~3000 copies a frame of states the previous frame also had.
-  // A draw whose state equals an interned one (every field, verified after the hash) takes
-  // that immutable object: no allocation, no copy, no destruction. Only where assembly and
-  // recording share a thread (inline_recording_): the recorder writes the snapshot's pipeline
-  // memo, which is restarted at the snapshot's first use in a frame, as a new copy's is.
-  struct PipelineSnapshotIntern {
-    std::shared_ptr<const NativePipelineState> snapshot;
-    uint64_t vertex_shader_hash = 0;  // the shaders are raw pointers: an address reused by
-    uint64_t pixel_shader_hash = 0;   // another shader must not match
-    uint32_t last_frame = 0;
-  };
-  std::unordered_map<uint64_t, PipelineSnapshotIntern> pipeline_snapshot_intern_;
-  uint32_t pipeline_snapshot_intern_frame_ = 1;
-  bool pipeline_snapshot_intern_enabled_ = false;
-  struct PipelineSnapshotInternCounters {
-    uint64_t frames = 0, version_reuses = 0, interned = 0, created = 0, collisions = 0;
-  } pipeline_snapshot_intern_counters_{};
-  uint64_t pipeline_snapshot_intern_report_tick_ = 0;
-  void RollPipelineSnapshotIntern();
-  void ClearPipelineSnapshotIntern();
+  // 66: what SnapshotPipeline remembers of the bindings it wrote last, to tell when the next
+  // command's are the same (the same serial), and to hand such a command the very same
+  // targets, shaders and declaration the last one got, as sharing its snapshot object did.
+  bool last_pipeline_valid_ = false;
+  uint64_t last_pipeline_version_ = 0;
+  uint64_t last_pipeline_serial_ = 0;
+  uint64_t pipeline_serial_ = 0;
+  const NativeShader* last_pipeline_vertex_shader_ = nullptr;
+  const NativeShader* last_pipeline_pixel_shader_ = nullptr;
+  std::shared_ptr<const NativeVertexDeclaration> last_pipeline_declaration_;
+  std::array<SurfaceDescriptor, kRenderTargetCount> last_pipeline_colors_{};
+  SurfaceDescriptor last_pipeline_depth_{};
   // 64: the hash of worker_fixed_variant_ (SetWorkerFixedState). The worker's depth-clamp
   // variant is one object for a run of draws; its hash was computed again for each of them
   // (XXH3 over the whole fixed state, 0.4 ms a frame in batch 65).
@@ -2831,6 +2868,8 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   std::shared_ptr<SnapshotKeepAlive> snapshot_keepalive_;
   std::deque<std::shared_ptr<SnapshotKeepAlive>> retired_snapshot_keepalives_;
   const void* snapshot_keepalive_last_shader_ = nullptr;
+  // 66: the last vertex declaration the frame keep-alive took (the commands' bindings refer
+  // to declarations without owning them; before 66: the last pipeline snapshot it took).
   const void* snapshot_keepalive_last_pipeline_ = nullptr;
   std::atomic<uint32_t> snapshot_keepalives_waiting_{0};  // diagnostics (retire stats line)
   void RollSnapshotKeepAlive();
@@ -2858,7 +2897,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     uint64_t hash = 0;
   };
   std::array<ConstantUploadHashMemo, 2> constant_upload_hash_memo_{};
-  std::shared_ptr<const NativePipelineState> SnapshotPipeline(const NativeCommand&, bool);
+  void SnapshotPipeline(NativeCommand& command, bool draw);  // 66: into the command
   NativeOwnedCommands<NativeCommand> current_frame_;
   DirtyStateDelta producer_dirty_delta_;     // command_capture_mutex_
   struct CapacityPointerHash {
