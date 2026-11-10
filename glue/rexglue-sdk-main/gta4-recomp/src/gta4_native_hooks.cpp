@@ -4588,10 +4588,13 @@ extern "C" void sub_828C64C8(PPCContext& ctx, uint8_t* base) {
   __imp__sub_828C64C8(ctx, base);
 }
 
+extern "C" void FastSub828C6620(PPCContext& ctx, uint8_t* base);
+extern "C" void FastSub828C4338(PPCContext& ctx, uint8_t* base);
+
 extern "C" void sub_828C6620(PPCContext& ctx, uint8_t* base) {
   ScopedFireMaterial fire_scope(ctx, base);
   TraceKnownOffscreenTransformTransition("offscreen-transition-material-list-render", ctx, base,
-                                         __imp__sub_828C6620);
+                                         FastSub828C6620);
 }
 
 extern "C" void sub_828C4338(PPCContext& ctx, uint8_t* base) {
@@ -4601,7 +4604,7 @@ extern "C" void sub_828C4338(PPCContext& ctx, uint8_t* base) {
                                       temporal_host::instance.pose);
   FireModelEntry(ctx, base);
   TraceKnownOffscreenTransformTransition("offscreen-transition-model-materials", ctx, base,
-                                         __imp__sub_828C4338);
+                                         FastSub828C4338);
 }
 
 extern "C" void sub_828C4578(PPCContext& ctx, uint8_t* base) {
@@ -7708,3 +7711,4 @@ extern "C" void sub_82A467D8(PPCContext& ctx, uint8_t* base) {
 #include "gta4_fade_trace_hooks.inc"
 #include "gta4_phone_trace_hooks.inc"
 // #include "gta4_neon_transform_hooks.inc"
+#include "gta4_main_and_drawable_hooks.inc"
