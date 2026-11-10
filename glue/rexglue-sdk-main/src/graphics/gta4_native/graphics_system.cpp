@@ -7,6 +7,9 @@
 #include <android/log.h>
 #include <pthread.h>
 #endif
+#if defined(__ARM_FEATURE_CRC32)
+#include <arm_acle.h>
+#endif
 #include "native_pipeline_stats.h"
 #include "native_gpu_counters.h"
 #include "native_spirv_descriptor_remap.h"
@@ -175,6 +178,14 @@ REXCVAR_DEFINE_BOOL(gta4_native_direct_record, false, "GTA IV/Graphics/Native Re
                     "command right after capturing it and records the frame (RecordNativeFrame, "
                     "submit) itself at Present. Implies the inline recorder; GtaCapture is off");
 // 60: the direct emitter (native_stream_record.inc, разбор 60).
+REXCVAR_DEFINE_BOOL(gta4_native_intern_pipeline_snapshots, false, "GTA IV/Graphics/Native Renderer",
+                    "64, off by default (batch 67: dynamic offsets cause ~95% miss rate; off to avoid freeze): "
+                    "a draw whose pipeline state equals an interned one takes that snapshot. "
+                    "Table capped at 4096 states");
+REXCVAR_DEFINE_UINT32(gta4_native_direct_stage_batch, 8, "GTA IV/Graphics/Native Renderer",
+                      "64: with direct record, commands are assembled in batches of this many "
+                      "(1: each right after its capture, as before; at most 64). Presents, "
+                      "device and synchronous commands publish the batch at once");
 REXCVAR_DEFINE_BOOL(gta4_native_memo_shadow, false, "GTA IV/Graphics/Native Renderer",
                     "Diagnostics (63): shadow of a draw-translation memo across frames. Keys each "
                     "indexed draw's record inputs, looks them up among the previous frame's and "
@@ -4337,11 +4348,17 @@ bool Gta4NativeGraphicsSystem::CaptureTitleCommand(uint32_t abi_version, const v
     StageTextureProtection(native_command);
   }
   // 58: direct record assembles every command right after its capture: no staging.
-  if (stageable && !direct_record_ && !phone_envelope && !tv_envelope && !fire_envelope &&
+  // 64: direct record stages too, in its own smaller batch (direct_stage_batch_; 1: off).
+  // Batch 65: ~12 lock / unlock pairs for every command assembled alone (queue, pump, batch
+  // and protection locks, all uncontended) were 2.3 ms of a 50 ms RenderGuest frame; a batch
+  // pays the queue and pump locks once. The path is the worker thread's: a batch is published
+  // in order, before anything that is not staged.
+  const size_t stage_batch = direct_record_ ? direct_stage_batch_ : kStagedDrawBatch;
+  if (stageable && stage_batch > 1 && !phone_envelope && !tv_envelope && !fire_envelope &&
       (!profile_transport || REXCVAR_GET(gta4_profile_native_real_stream)) &&
       REXCVAR_GET(gta4_native_stage_draw_commands)) {
     staged_draw_commands_.push_back(std::move(native_command_owner));
-    if (staged_draw_commands_.size() < kStagedDrawBatch) {
+    if (staged_draw_commands_.size() < stage_batch) {
       return true;
     }
   }
@@ -6876,6 +6893,8 @@ void Gta4NativeGraphicsSystem::StartRenderWorker() {
   }
   // 58: direct record — no thread; the first pump initializes the worker state.
   direct_record_ = REXCVAR_GET(gta4_native_direct_record);
+  direct_stage_batch_ =
+      size_t(std::clamp<uint32_t>(REXCVAR_GET(gta4_native_direct_stage_batch), 1, 64));  // 64
   stream_record_ = direct_record_ && REXCVAR_GET(gta4_native_stream_record);  // 60
   if (direct_record_) {
     REXLOG_WARN(
@@ -7460,6 +7479,7 @@ void Gta4NativeGraphicsSystem::RenderWorkerLoop(WorkerLoopMode mode) {
         if (device.mode != 2) {
           pipeline_state_ = {};
           last_pipeline_snapshot_.reset();
+          ClearPipelineSnapshotIntern();  // 64
           last_shader_snapshot_.reset();
           ClearNativeFrameCommands();
           modern_shader_frame_.Reset();
@@ -8083,8 +8103,12 @@ void Gta4NativeGraphicsSystem::RenderWorkerLoop(WorkerLoopMode mode) {
             command.recorded_fixed_function_state_hash = command.captured_fixed_function_state_hash;
           } else {
             // Если состояние изменилось (например, сработал forced_clamp) — пересчитываем
-            command.recorded_fixed_function_state_hash = 
-                HashFixedFunctionState(*command.fixed_function_state);
+            // 64: the worker's variant is hashed once, when it is made.
+            command.recorded_fixed_function_state_hash =
+                (worker_fixed_variant_ &&
+                 &*command.fixed_function_state == worker_fixed_variant_.get())
+                    ? worker_fixed_variant_hash_
+                    : HashFixedFunctionState(*command.fixed_function_state);
           }
           // === КОНЕЦ ПАТЧА ===
           const uint32_t device = CommandDevice(command.type, command.bytes.data());
@@ -8558,14 +8582,18 @@ void Gta4NativeGraphicsSystem::ApplyReleaseResourceEffects(const NativeReleaseEf
 
 std::shared_ptr<const Gta4NativeGraphicsSystem::NativePipelineState>
 Gta4NativeGraphicsSystem::SnapshotPipeline(const NativeCommand& command, bool draw) {
-  if (!draw && last_pipeline_snapshot_ &&
-      last_pipeline_snapshot_->version == pipeline_state_.version) {
+  // 64: last_pipeline_snapshot_version_, not the snapshot's own version (an interned snapshot
+  // has the version of the frame that made it).
+  const bool version_unchanged =
+      last_pipeline_snapshot_ && last_pipeline_snapshot_version_ == pipeline_state_.version;
+  if (!draw && version_unchanged) {
     ++pipeline_snapshot_reuses_;
+    ++pipeline_snapshot_intern_counters_.version_reuses;
     return last_pipeline_snapshot_;
   }
   const auto& colors = draw ? command.snapshot_targets->colors : pipeline_state_.render_targets;
   const auto& depth = draw ? command.snapshot_targets->depth : pipeline_state_.depth_stencil;
-  if (last_pipeline_snapshot_ && last_pipeline_snapshot_->version == pipeline_state_.version &&
+  if (version_unchanged &&
       last_pipeline_snapshot_->vertex_shader_resource == pipeline_state_.vertex_shader_resource &&
       last_pipeline_snapshot_->pixel_shader_resource == pipeline_state_.pixel_shader_resource &&
       last_pipeline_snapshot_->vertex_declaration_resource == pipeline_state_.vertex_declaration_resource) {
@@ -8577,20 +8605,162 @@ Gta4NativeGraphicsSystem::SnapshotPipeline(const NativeCommand& command, bool dr
                       [](const auto& a, const auto& b) { return NativeSurfaceStateEqual(a, b); }))) {
         last_pipeline_snapshot_targets_ = targets_ptr;
         ++pipeline_snapshot_reuses_;
+        ++pipeline_snapshot_intern_counters_.version_reuses;
         return last_pipeline_snapshot_;
       }
     } else {
       ++pipeline_snapshot_reuses_;
+      ++pipeline_snapshot_intern_counters_.version_reuses;
       return last_pipeline_snapshot_;
+    }
+  }
+  // 64: a state this or an earlier frame already has a snapshot of.
+  PipelineSnapshotIntern* intern_slot = nullptr;
+  if (pipeline_snapshot_intern_enabled_) {
+    const NativePipelineState& state = pipeline_state_;
+    struct Scalars {
+      uint64_t pixel_shader_resource, vertex_shader_resource, vertex_declaration_resource;
+      uint32_t pixel_shader, vertex_shader, vertex_declaration, depth_stencil_trace_wrapper,
+          depth_stencil_trace_caller, index_buffer;
+    };
+    static_assert(sizeof(Scalars) == 48, "No padding in Scalars");
+    static_assert(sizeof(SurfaceDescriptor) == 36 &&
+                  sizeof(NativePipelineState::VertexStream) == 16);
+    struct Packed {
+      std::array<uint32_t, kTextureStageCount> textures;
+      std::array<NativePipelineState::VertexStream, kVertexStreamCount> vertex_streams;
+      std::array<SurfaceDescriptor, kRenderTargetCount> colors;
+      SurfaceDescriptor depth;
+      uint32_t zero;
+      Scalars scalars;
+    };
+    static_assert(sizeof(Packed) == sizeof(uint32_t) * kTextureStageCount +
+                                        16 * kVertexStreamCount + 36 * kRenderTargetCount + 36 +
+                                        4 + 48,
+                  "No padding in Packed");
+    Packed packed;
+    packed.textures = state.textures;
+    packed.vertex_streams = state.vertex_streams;
+    packed.colors = colors;
+    packed.depth = depth;
+    packed.zero = 0;
+    packed.scalars = Scalars{
+        uint64_t(reinterpret_cast<uintptr_t>(state.pixel_shader_resource)),
+        uint64_t(reinterpret_cast<uintptr_t>(state.vertex_shader_resource)),
+        uint64_t(reinterpret_cast<uintptr_t>(state.vertex_declaration_resource.get())),
+        state.pixel_shader, state.vertex_shader, state.vertex_declaration,
+        state.depth_stencil_trace_wrapper, state.depth_stencil_trace_caller, state.index_buffer};
+    const uint64_t hash = XXH3_64bits(&packed, sizeof(packed));
+    auto found = pipeline_snapshot_intern_.find(hash);
+    if (found == pipeline_snapshot_intern_.end() && pipeline_snapshot_intern_.size() < 4096)
+      found = pipeline_snapshot_intern_.try_emplace(hash).first;
+    if (found != pipeline_snapshot_intern_.end()) {
+      PipelineSnapshotIntern& slot = found->second;
+      const uint64_t vertex_hash = state.vertex_shader_resource ? state.vertex_shader_resource->hash : 0;
+      const uint64_t pixel_hash = state.pixel_shader_resource ? state.pixel_shader_resource->hash : 0;
+      if (slot.snapshot) {
+        const NativePipelineState& have = *slot.snapshot;
+        // Every field of the state, not the hash, decides.
+        const bool equal =
+            slot.vertex_shader_hash == vertex_hash && slot.pixel_shader_hash == pixel_hash &&
+            have.pixel_shader_resource == state.pixel_shader_resource &&
+            have.vertex_shader_resource == state.vertex_shader_resource &&
+            have.vertex_declaration_resource == state.vertex_declaration_resource &&
+            have.pixel_shader == state.pixel_shader && have.vertex_shader == state.vertex_shader &&
+            have.vertex_declaration == state.vertex_declaration &&
+            have.depth_stencil_trace_wrapper == state.depth_stencil_trace_wrapper &&
+            have.depth_stencil_trace_caller == state.depth_stencil_trace_caller &&
+            have.index_buffer == state.index_buffer &&
+            std::memcmp(have.textures.data(), state.textures.data(), sizeof(state.textures)) == 0 &&
+            std::memcmp(have.vertex_streams.data(), state.vertex_streams.data(),
+                        sizeof(state.vertex_streams)) == 0 &&
+            std::memcmp(have.render_targets.data(), colors.data(), sizeof(colors)) == 0 &&
+            std::memcmp(&have.depth_stencil, &depth, sizeof(depth)) == 0;
+        if (equal) {
+          if (slot.last_frame != pipeline_snapshot_intern_frame_) {
+            // First use in this frame: the pipeline memo starts empty, as a new copy's does.
+            slot.last_frame = pipeline_snapshot_intern_frame_;
+            have.pipeline_lookup_memo = {};
+          }
+          ++pipeline_snapshot_intern_counters_.interned;
+          last_pipeline_snapshot_targets_ = draw ? command.snapshot_targets.get() : nullptr;
+          last_pipeline_snapshot_ = slot.snapshot;
+          last_pipeline_snapshot_version_ = pipeline_state_.version;
+          return last_pipeline_snapshot_;
+        }
+        ++pipeline_snapshot_intern_counters_.collisions;  // the newer state takes the slot
+      }
+      intern_slot = &slot;
+      slot.vertex_shader_hash = vertex_hash;
+      slot.pixel_shader_hash = pixel_hash;
+      slot.last_frame = pipeline_snapshot_intern_frame_;
     }
   }
   auto snapshot = std::allocate_shared<NativePipelineState>(
       std::pmr::polymorphic_allocator<NativePipelineState>(&snapshot_pool_), pipeline_state_);
   snapshot->render_targets = colors;
   snapshot->depth_stencil = depth;
+  ++pipeline_snapshot_intern_counters_.created;
   last_pipeline_snapshot_targets_ = draw ? command.snapshot_targets.get() : nullptr;
   last_pipeline_snapshot_ = std::move(snapshot);
+  last_pipeline_snapshot_version_ = pipeline_state_.version;
+  if (intern_slot) intern_slot->snapshot = last_pipeline_snapshot_;
   return last_pipeline_snapshot_;
+}
+
+void Gta4NativeGraphicsSystem::ClearPipelineSnapshotIntern() {
+  pipeline_snapshot_intern_.clear();
+  last_pipeline_snapshot_version_ = UINT64_MAX;
+}
+
+// 64: render worker, at every Present (RollSnapshotKeepAlive).
+void Gta4NativeGraphicsSystem::RollPipelineSnapshotIntern() {
+  // Where assembly and recording share a thread (direct record, GtaBackend): the recorder
+  // writes a snapshot's pipeline memo, and assembly restarts it.
+  const bool enabled = inline_recording_ && REXCVAR_GET(gta4_native_intern_pipeline_snapshots);
+  if (!enabled && pipeline_snapshot_intern_enabled_) pipeline_snapshot_intern_.clear();
+  pipeline_snapshot_intern_enabled_ = enabled;
+  PipelineSnapshotInternCounters& c = pipeline_snapshot_intern_counters_;
+  ++c.frames;
+  ++pipeline_snapshot_intern_frame_;
+  if (!enabled) {
+    c = {};
+    return;
+  }
+  // States no frame used for two seconds of frames go; a table that still grows is dropped.
+  if ((pipeline_snapshot_intern_frame_ & 63) == 0) {
+    for (auto it = pipeline_snapshot_intern_.begin(); it != pipeline_snapshot_intern_.end();) {
+      if (pipeline_snapshot_intern_frame_ - it->second.last_frame > 64)
+        it = pipeline_snapshot_intern_.erase(it);
+      else
+        ++it;
+    }
+    if (pipeline_snapshot_intern_.size() > 32768) pipeline_snapshot_intern_.clear();
+  }
+  if ((c.frames & 31) != 0) return;  // the clock only every 32 frames
+  const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+  const uint64_t frequency = rex::chrono::Clock::QueryHostTickFrequency();
+  if (!pipeline_snapshot_intern_report_tick_) pipeline_snapshot_intern_report_tick_ = now;
+  if (!frequency || now - pipeline_snapshot_intern_report_tick_ < 10 * frequency) return;
+  const double frames = double(c.frames);
+  REXLOG_WARN("gta4-native-snapshot-intern: {:.1f} s: frames={} per frame: unchanged={:.0f} "
+              "interned={:.0f} created={:.0f} collisions={:.1f} table={}",
+              double(now - pipeline_snapshot_intern_report_tick_) / double(frequency), c.frames,
+              double(c.version_reuses) / frames, double(c.interned) / frames,
+              double(c.created) / frames, double(c.collisions) / frames,
+              pipeline_snapshot_intern_.size());
+#if defined(__ANDROID__)
+  __android_log_print(
+      ANDROID_LOG_WARN, "LibertyRecomp",
+      "gta4-native-snapshot-intern: %.1f s: frames=%llu per frame: unchanged=%.0f interned=%.0f "
+      "created=%.0f collisions=%.1f table=%llu",
+      double(now - pipeline_snapshot_intern_report_tick_) / double(frequency),
+      static_cast<unsigned long long>(c.frames), double(c.version_reuses) / frames,
+      double(c.interned) / frames, double(c.created) / frames, double(c.collisions) / frames,
+      static_cast<unsigned long long>(pipeline_snapshot_intern_.size()));
+#endif
+  pipeline_snapshot_intern_report_tick_ = now;
+  c = {};
 }
 
 // 34: the absorbed state bytes move into the command by swapping buffers
@@ -21931,6 +22101,7 @@ void Gta4NativeGraphicsSystem::SetWorkerFixedState(NativeCommand& command,
   if (!worker_fixed_variant_ ||
       std::memcmp(worker_fixed_variant_.get(), &value, sizeof(NativeFixedFunctionState)) != 0) {
     worker_fixed_variant_ = std::make_shared<const NativeFixedFunctionState>(value);
+    worker_fixed_variant_hash_ = HashFixedFunctionState(value);  // 64
   }
   command.fixed_owner = worker_fixed_variant_;
   command.fixed_function_state =
@@ -21993,6 +22164,7 @@ Gta4NativeGraphicsSystem::SnapshotKeepAlive::~SnapshotKeepAlive() = default;
 
 // 33: render worker, at every Present it processes.
 void Gta4NativeGraphicsSystem::RollSnapshotKeepAlive() {
+  RollPipelineSnapshotIntern();  // 64
   size_t previous = 0;
   if (snapshot_keepalive_) {
     previous = snapshot_keepalive_->refs.size();
@@ -26411,12 +26583,19 @@ void Gta4NativeGraphicsSystem::BindNativeIndexBuffer(VkCommandBuffer command_buf
 }
 
 // 63: shadow of a draw-translation memo across frames (graphics_system.h).
+// Batch 67: Flat open-addressed zero-allocation table with epoch tagging.
+// Eliminates std::unordered_map node allocations and Scudo 128-bit CAS atomics.
 void Gta4NativeGraphicsSystem::MemoShadowBeginFrame() {
   const bool enabled = REXCVAR_GET(gta4_native_memo_shadow);
   if (!enabled) {
     if (memo_shadow_enabled_) {
-      memo_shadow_previous_ = {};
-      memo_shadow_current_ = {};
+      memo_shadow_epoch_ = 1;
+      memo_shadow_previous_count_ = 0;
+      memo_shadow_current_count_ = 0;
+      if (!memo_shadow_table_a_.empty()) {
+        std::memset(memo_shadow_table_a_.data(), 0, memo_shadow_table_a_.size() * sizeof(MemoShadowSlot));
+        std::memset(memo_shadow_table_b_.data(), 0, memo_shadow_table_b_.size() * sizeof(MemoShadowSlot));
+      }
       memo_shadow_ = {};
       memo_shadow_report_tick_ = 0;
     }
@@ -26424,10 +26603,22 @@ void Gta4NativeGraphicsSystem::MemoShadowBeginFrame() {
     return;
   }
   memo_shadow_enabled_ = true;
+  if (memo_shadow_table_a_.empty()) {
+    memo_shadow_table_a_.resize(kMemoShadowCapacity);
+    memo_shadow_table_b_.resize(kMemoShadowCapacity);
+    memo_shadow_previous_ = memo_shadow_table_a_.data();
+    memo_shadow_current_ = memo_shadow_table_b_.data();
+  }
   // The frame that just ended becomes the one the next frame looks its keys up in.
   std::swap(memo_shadow_previous_, memo_shadow_current_);
-  memo_shadow_current_.clear();
-  if (memo_shadow_current_.bucket_count() < 8192) memo_shadow_current_.reserve(8192);
+  memo_shadow_previous_count_ = memo_shadow_current_count_;
+  memo_shadow_current_count_ = 0;
+  ++memo_shadow_epoch_;
+  if (memo_shadow_epoch_ == 0) {
+    memo_shadow_epoch_ = 1;
+    std::memset(memo_shadow_table_a_.data(), 0, memo_shadow_table_a_.size() * sizeof(MemoShadowSlot));
+    std::memset(memo_shadow_table_b_.data(), 0, memo_shadow_table_b_.size() * sizeof(MemoShadowSlot));
+  }
   ++memo_shadow_.frames;
 
   const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
@@ -26448,7 +26639,7 @@ void Gta4NativeGraphicsSystem::MemoShadowBeginFrame() {
       double(now - memo_shadow_report_tick_) / double(frequency), c.frames,
       double(c.draws) / frames, hit_percent, c.pipeline_diffs, c.descriptor_diffs,
       c.repeats_in_frame, c.merged, c.failed, double(c.hit_ticks) * to_ms / frames,
-      double(c.miss_ticks) * to_ms / frames, hit_us, miss_us, memo_shadow_previous_.size());
+      double(c.miss_ticks) * to_ms / frames, hit_us, miss_us, memo_shadow_previous_count_);
 #if defined(__ANDROID__)
   using ull = unsigned long long;
   __android_log_print(
@@ -26459,20 +26650,76 @@ void Gta4NativeGraphicsSystem::MemoShadowBeginFrame() {
       double(now - memo_shadow_report_tick_) / double(frequency), ull(c.frames),
       double(c.draws) / frames, hit_percent, ull(c.pipeline_diffs), ull(c.descriptor_diffs),
       ull(c.repeats_in_frame), ull(c.merged), ull(c.failed), double(c.hit_ticks) * to_ms / frames,
-      double(c.miss_ticks) * to_ms / frames, hit_us, miss_us, ull(memo_shadow_previous_.size()));
+      double(c.miss_ticks) * to_ms / frames, hit_us, miss_us, ull(memo_shadow_previous_count_));
 #endif
   memo_shadow_report_tick_ = now;
   memo_shadow_ = {};
 }
 
+const Gta4NativeGraphicsSystem::MemoShadowSlot*
+Gta4NativeGraphicsSystem::MemoShadowFindPrevious(uint64_t key) const {
+  if (!memo_shadow_previous_) return nullptr;
+  const uint32_t target_epoch = memo_shadow_epoch_ - 1;
+  const size_t mask = kMemoShadowCapacity - 1;
+  size_t idx = static_cast<size_t>(key) & mask;
+  for (size_t probe = 0; probe < 16; ++probe) {
+    const MemoShadowSlot& slot = memo_shadow_previous_[(idx + probe) & mask];
+    if (slot.epoch != target_epoch) {
+      return nullptr;
+    }
+    if (slot.key == key) {
+      return &slot;
+    }
+  }
+  return nullptr;
+}
+
+bool Gta4NativeGraphicsSystem::MemoShadowInsertCurrent(uint64_t key, const MemoShadowEntry& entry) {
+  if (!memo_shadow_current_) return false;
+  const uint32_t current_epoch = memo_shadow_epoch_;
+  const size_t mask = kMemoShadowCapacity - 1;
+  size_t idx = static_cast<size_t>(key) & mask;
+  for (size_t probe = 0; probe < 16; ++probe) {
+    MemoShadowSlot& slot = memo_shadow_current_[(idx + probe) & mask];
+    if (slot.epoch != current_epoch) {
+      slot.epoch = current_epoch;
+      slot.key = key;
+      slot.pipeline = entry.pipeline;
+      slot.descriptors = entry.descriptors;
+      ++memo_shadow_current_count_;
+      return true;
+    }
+    if (slot.key == key) {
+      slot.pipeline = entry.pipeline;
+      slot.descriptors = entry.descriptors;
+      return false;
+    }
+  }
+  return false;
+}
+
 uint64_t Gta4NativeGraphicsSystem::MemoShadowKey(const NativeCommand& command,
                                                  const NativeRenderingTarget& target,
                                                  uint32_t index_count) const {
+#if defined(__ARM_FEATURE_CRC32)
+  uint32_t c0 = 0x12345678, c1 = 0x9abcdef0, c2 = 0xfedcba98, c3 = 0x76543210;
+  uint32_t n = 0;
+  const auto put = [&](uint64_t value) {
+    switch (n & 3) {
+      case 0: c0 = __crc32cd(c0, value); break;
+      case 1: c1 = __crc32cd(c1, value); break;
+      case 2: c2 = __crc32cd(c2, value); break;
+      case 3: c3 = __crc32cd(c3, value); break;
+    }
+    ++n;
+  };
+#else
   std::array<uint64_t, 192> words{};
   size_t n = 0;
   const auto put = [&](uint64_t value) {
     if (n < words.size()) words[n++] = value;
   };
+#endif
   const auto ptr = [](const void* p) { return uint64_t(reinterpret_cast<uintptr_t>(p)); };
   DrawIndexedPrimitiveCommand draw{};
   std::memcpy(&draw, command.bytes.data(), std::min(sizeof(draw), command.bytes.size()));
@@ -26487,7 +26734,9 @@ uint64_t Gta4NativeGraphicsSystem::MemoShadowKey(const NativeCommand& command,
   put(command.recorded_fixed_function_state_hash);
   put(command.pipeline_memo_signature);
   put(command.texture_inputs_signature);
-  put(command.environmental_data_hash);
+  // Batch 66 fix: environmental_data_hash removed because it contains source_sequence
+  // and time_step_seconds which change every frame, guaranteeing 0% cache hits.
+  // Environmental lighting/fog parameters are passed via uniform registers, not VkPipeline/descriptors.
   // The pipeline inputs.
   const NativePipelineState& state = *command.pipeline_state;
   put(ptr(state.vertex_shader_resource));
@@ -26524,8 +26773,20 @@ uint64_t Gta4NativeGraphicsSystem::MemoShadowKey(const NativeCommand& command,
     const auto& texture = command.textures[stage];
     put((uint64_t(stage) << 56) ^ (texture ? texture->generation : 0));
   }
+#if defined(__ARM_FEATURE_CRC32)
+  uint64_t h = static_cast<uint64_t>(c0) ^ 
+               (static_cast<uint64_t>(c1) << 16) ^ 
+               (static_cast<uint64_t>(c2) << 32) ^ 
+               (static_cast<uint64_t>(c3) << 48);
+  h ^= (static_cast<uint64_t>(n) << 24);
+  h ^= h >> 33; h *= 0xff51afd7ed558ccdULL;
+  h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL;
+  h ^= h >> 33;
+  return h ? h : 1;
+#else
   put(n);
   return XXH3_64bits(words.data(), n * sizeof(uint64_t));
+#endif
 }
 
 void Gta4NativeGraphicsSystem::MemoShadowRecord(const NativeCommand& command,
@@ -26542,25 +26803,30 @@ void Gta4NativeGraphicsSystem::MemoShadowRecord(const NativeCommand& command,
   // What a memo would hand back instead of translating.
   MemoShadowEntry entry;
   entry.pipeline = uint64_t(reinterpret_cast<uintptr_t>(memo_shadow_pipeline_));
-  std::array<uint32_t, 2 * kTextureStageCount> descriptors{};
-  size_t count = 0;
+  uint32_t desc_crc = 0;
   for (uint32_t mask = command.used_texture_mask; mask; mask &= mask - 1) {
     const uint32_t stage = uint32_t(std::countr_zero(mask));
     if (stage >= kTextureStageCount) break;
-    descriptors[count++] = command.texture_descriptor_indices[stage];
-    descriptors[count++] = command.sampler_descriptor_indices[stage];
+#if defined(__ARM_FEATURE_CRC32)
+    desc_crc = __crc32cw(desc_crc, command.texture_descriptor_indices[stage]);
+    desc_crc = __crc32cw(desc_crc, command.sampler_descriptor_indices[stage]);
+#else
+    desc_crc = desc_crc * 33 + command.texture_descriptor_indices[stage];
+    desc_crc = desc_crc * 33 + command.sampler_descriptor_indices[stage];
+#endif
   }
-  entry.descriptors = XXH3_64bits(descriptors.data(), count * sizeof(uint32_t));
-  const auto previous = memo_shadow_previous_.find(key);
-  if (previous != memo_shadow_previous_.end()) {
+  entry.descriptors = desc_crc;
+
+  const MemoShadowSlot* previous = MemoShadowFindPrevious(key);
+  if (previous) {
     ++memo_shadow_.hits;
     memo_shadow_.hit_ticks += ticks;
-    if (previous->second.pipeline != entry.pipeline) ++memo_shadow_.pipeline_diffs;
-    if (previous->second.descriptors != entry.descriptors) ++memo_shadow_.descriptor_diffs;
+    if (previous->pipeline != entry.pipeline) ++memo_shadow_.pipeline_diffs;
+    if (previous->descriptors != entry.descriptors) ++memo_shadow_.descriptor_diffs;
   } else {
     memo_shadow_.miss_ticks += ticks;
   }
-  if (!memo_shadow_current_.emplace(key, entry).second) ++memo_shadow_.repeats_in_frame;
+  if (!MemoShadowInsertCurrent(key, entry)) ++memo_shadow_.repeats_in_frame;
 }
 
 bool Gta4NativeGraphicsSystem::RecordIndexedPrimitive(VkCommandBuffer command_buffer,
