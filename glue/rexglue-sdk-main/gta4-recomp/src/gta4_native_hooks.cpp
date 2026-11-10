@@ -7707,3 +7707,4 @@ extern "C" void sub_82A467D8(PPCContext& ctx, uint8_t* base) {
 #include "gta4_help_trace_hooks.inc"
 #include "gta4_fade_trace_hooks.inc"
 #include "gta4_phone_trace_hooks.inc"
+#include "gta4_neon_transform_hooks.inc"
