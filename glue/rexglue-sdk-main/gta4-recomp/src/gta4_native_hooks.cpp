@@ -4296,11 +4296,8 @@ void InitializeNativeCommandScratch(uint8_t* base, uint32_t device) {
 NativeDirtyState ConsumeNativeDrawDirtyState(uint8_t* base, uint32_t device) {
   NativeDirtyState dirty_state{};
   for (uint32_t index = 0; index < dirty_state.words.size(); ++index) {
-    const uint64_t w = LoadU64(base, device + index * sizeof(uint64_t));
-    if (w != 0) {
-      dirty_state.words[index] = w;
-      StoreU64(base, device + index * sizeof(uint64_t), 0);
-    }
+    dirty_state.words[index] = LoadU64(base, device + index * sizeof(uint64_t));
+    StoreU64(base, device + index * sizeof(uint64_t), 0);
   }
   return dirty_state;
 }
@@ -4687,9 +4684,10 @@ extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
     __imp__sub_828BFC00(ctx, base);
     return;
   }
-  // Native C++ unified geometry draw (Batch 80 - D3D9 bypass):
+  // Native C++ unified geometry draw (Batch 74 - D3D9 bypass):
   // Directly batches VertexDeclaration, IndexBuffer, StreamSource 0, and DrawIndexedPrimitive
-  // into a single NativeCommand submission with thread-local zero-copy state caching.
+  // into a single NativeCommand submission. Eliminates 3 separate D3D9 calls, 3 mutex locks,
+  // and guest stack frame overhead for ~1,500 draws per frame (-4,500 commands/frame).
   uint32_t primitive_count = ctx.r7.u32;
   const uint32_t index_buf = ctx.r6.u32;
   const uint32_t index_buf_prims = LoadU32(base, index_buf + 4);
@@ -4698,44 +4696,23 @@ extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
   }
 
   constexpr uint32_t kGlobalBase = 0x831C0000u;
-  static uint32_t s_device = 0;
-  if (!s_device) [[unlikely]] {
-    s_device = LoadU32(base, kGlobalBase + 8868);  // 0x831C22A4 (g_pD3DDevice)
-  }
-  const uint32_t device = s_device;
+  const uint32_t device = LoadU32(base, kGlobalBase + 8868);  // 0x831C22A4 (g_pD3DDevice)
 
   // 1. Batched Vertex Declaration:
   const uint32_t vdecl = ctx.r4.u32;
   uint32_t decl_val = 0;
   if (vdecl != 0) {
-    static uint32_t s_last_vdecl = 0;
-    static uint32_t s_last_decl_val = 0;
-    if (vdecl == s_last_vdecl) [[likely]] {
-      decl_val = s_last_decl_val;
-    } else {
-      decl_val = LoadU32(base, vdecl);
-      s_last_vdecl = vdecl;
-      s_last_decl_val = decl_val;
-      if (vdecl != LoadU32(base, kGlobalBase + 9236 - 364)) {  // 0x831C22A8
-        StoreU32(base, kGlobalBase + 9236 - 364, vdecl);
-        StoreU32(base, device + kVertexDeclarationOffset, decl_val);
-        StoreU64(base, device + 16, LoadU64(base, device + 16) | uint64_t(0x00080000));
-        SubmitNativeVertexDeclaration(base, device, decl_val);
-      }
+    decl_val = LoadU32(base, vdecl);
+    if (vdecl != LoadU32(base, kGlobalBase + 9236 - 364)) {  // 0x831C22A8
+      StoreU32(base, kGlobalBase + 9236 - 364, vdecl);
+      StoreU32(base, device + kVertexDeclarationOffset, decl_val);
+      StoreU64(base, device + 16, LoadU64(base, device + 16) | uint64_t(0x00080000));
+      SubmitNativeVertexDeclaration(base, device, decl_val);
     }
   }
 
   // 2. Batched Indices:
-  static uint32_t s_last_index_buf = 0;
-  static uint32_t s_last_ib_buf = 0;
-  uint32_t ib_buf = 0;
-  if (index_buf == s_last_index_buf) [[likely]] {
-    ib_buf = s_last_ib_buf;
-  } else {
-    ib_buf = LoadU32(base, index_buf + 12);
-    s_last_index_buf = index_buf;
-    s_last_ib_buf = ib_buf;
-  }
+  const uint32_t ib_buf = LoadU32(base, index_buf + 12);
   const uint32_t ib_slot = device + kIndexBufferOffset;
   const uint32_t prev_ib = LoadU32(base, ib_slot);
   if (prev_ib != ib_buf) {
@@ -4745,24 +4722,11 @@ extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
 
   // 3. Batched Stream Source 0:
   const uint32_t stream_buf = ctx.r5.u32;
-  static uint32_t s_last_stream_buf = 0;
-  static uint32_t s_last_vb_buf = 0;
-  static uint32_t s_last_vb_stride = 0;
-  uint32_t vb_buf = 0;
-  uint32_t vb_stride = 0;
-  if (stream_buf == s_last_stream_buf) [[likely]] {
-    vb_buf = s_last_vb_buf;
-    vb_stride = s_last_vb_stride;
-  } else {
-    s_last_stream_buf = stream_buf;
-    if (stream_buf != LoadU32(base, kGlobalBase + 9236)) {
-      StoreU32(base, kGlobalBase + 9236, stream_buf);  // 0x831C2414
-    }
-    vb_buf = LoadU32(base, stream_buf + 28);
-    vb_stride = LoadU32(base, stream_buf + 12);
-    s_last_vb_buf = vb_buf;
-    s_last_vb_stride = vb_stride;
+  if (stream_buf != LoadU32(base, kGlobalBase + 9236)) {
+    StoreU32(base, kGlobalBase + 9236, stream_buf);  // 0x831C2414
   }
+  const uint32_t vb_buf = LoadU32(base, stream_buf + 28);
+  const uint32_t vb_stride = LoadU32(base, stream_buf + 12);
   const uint32_t vb_slot = device + kStreamBufferBase;
   const uint32_t prev_vb = LoadU32(base, vb_slot);
   if (prev_vb != vb_buf) {
@@ -4785,8 +4749,8 @@ extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
   }
 
   // 4. Batched Draw Submission (Unified Direct to Native Queue):
-  const uint32_t r3_val = ctx.r3.u32;
-  const uint32_t prim_type = (r3_val <= 6) ? r3_val : LoadU32(base, 0x82B0B4F4u + (r3_val << 2));
+  constexpr uint32_t kPrimTypeTable = 0x82B0B4F4u;
+  const uint32_t prim_type = LoadU32(base, kPrimTypeTable + (ctx.r3.u32 << 2));
 
   static std::atomic<uint64_t> call_count{0};
   const uint64_t call = NextNativeHookDiagnosticCall(call_count);
@@ -4798,10 +4762,8 @@ extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
   command.base_vertex = 0;
   command.start_index = 0;
   command.index_count = primitive_count;
-  const uint32_t pr_flag_word = LoadU32(base, device + 10568);
-  const bool pr_enabled = (pr_flag_word & uint32_t(1u << 21)) != 0;
-  command.primitive_restart_enabled = pr_enabled;
-  command.primitive_restart_index = pr_enabled ? (LoadU32(base, device + 10444) & 0x00FFFFFF) : 0;
+  command.primitive_restart_enabled = (LoadU32(base, device + 10568) & uint32_t(1u << 21)) != 0;
+  command.primitive_restart_index = LoadU32(base, device + 10444) & 0x00FFFFFF;
   command.caller = static_cast<uint32_t>(ctx.lr);
   command.origin_flags = kDrawCommandOriginDirect;
   command.command_list = 0;
