@@ -4449,7 +4449,9 @@ extern "C" void sub_82A42168(PPCContext& ctx, uint8_t* base) {
 void LogKnownOffscreenTransformBoundary(std::string_view point, const PPCContext& ctx,
                                         uint8_t* base, uint32_t object,
                                         uint32_t explicit_device = 0) {
-  if (!IsNativeMode() || !rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeTrace)) {
+  static const bool trace_enabled =
+      rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeTrace);
+  if (!IsNativeMode() || !trace_enabled) {
     return;
   }
   const uint32_t device = explicit_device ? explicit_device : LoadU32(base, kDeferredDeviceGlobal);
@@ -4634,7 +4636,9 @@ extern "C" void sub_828D4268(PPCContext& ctx, uint8_t* base) {
 }
 
 extern "C" void sub_828BD250(PPCContext& ctx, uint8_t* base) {
-  if (!IsNativeMode() || !rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeTrace)) {
+  static const bool trace_enabled =
+      rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeTrace);
+  if (!IsNativeMode() || !trace_enabled) {
     __imp__sub_828BD250(ctx, base);
     return;
   }
@@ -4681,9 +4685,72 @@ extern "C" void sub_828E7000(PPCContext& ctx, uint8_t* base) {
   __imp__sub_828E7000(ctx, base);
 }
 
+extern "C" void sub_82A42930(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_82A3B7B0(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_82A3B690(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_82A3E348(PPCContext& ctx, uint8_t* base);
+
 extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
-  LogKnownOffscreenTransformBoundary("offscreen-boundary-indexed-entry", ctx, base, ctx.r3.u32);
-  __imp__sub_828BFC00(ctx, base);
+  if (!IsNativeMode()) {
+    LogKnownOffscreenTransformBoundary("offscreen-boundary-indexed-entry", ctx, base, ctx.r3.u32);
+    __imp__sub_828BFC00(ctx, base);
+    return;
+  }
+  // Native C++ fast-path (Batch 72):
+  // Eliminates guest PowerPC stack frame allocation (-144 bytes) and register save/restore overhead
+  // across the 4 inner D3D calls for ~1,500 indexed draws per frame.
+  uint32_t primitive_count = ctx.r7.u32;
+  const uint32_t index_buf = ctx.r6.u32;
+  const uint32_t index_buf_prims = LoadU32(base, index_buf + 4);
+  if (primitive_count == 0 || primitive_count > index_buf_prims) {
+    primitive_count = index_buf_prims;
+  }
+
+  constexpr uint32_t kGlobalBase = 0x831C0000u;
+  const uint32_t device = LoadU32(base, kGlobalBase + 8868);  // 0x831C22A4 (g_pD3DDevice)
+  const uint32_t vdecl = ctx.r4.u32;
+  if (vdecl != 0 && vdecl != LoadU32(base, kGlobalBase + 9236 - 364)) {  // 0x831C22A8
+    StoreU32(base, kGlobalBase + 9236 - 364, vdecl);
+    PPCContext sub_ctx = ctx;
+    sub_ctx.r3.u64 = device;
+    sub_ctx.r4.u64 = LoadU32(base, vdecl);
+    sub_82A42930(sub_ctx, base);
+  }
+
+  // SetIndices: sub_82A3B7B0(device, index_buf->buffer)
+  {
+    PPCContext sub_ctx = ctx;
+    sub_ctx.r3.u64 = device;
+    sub_ctx.r4.u64 = LoadU32(base, index_buf + 12);
+    sub_82A3B7B0(sub_ctx, base);
+  }
+
+  // SetStreamSource: sub_82A3B690(device, 0, stream_buf->buffer, 0, stride, 1)
+  const uint32_t stream_buf = ctx.r5.u32;
+  StoreU32(base, kGlobalBase + 9236, stream_buf);  // 0x831C2414
+  {
+    PPCContext sub_ctx = ctx;
+    sub_ctx.r3.u64 = device;
+    sub_ctx.r4.u64 = 0;
+    sub_ctx.r5.u64 = LoadU32(base, stream_buf + 28);
+    sub_ctx.r6.u64 = 0;
+    sub_ctx.r7.u64 = LoadU32(base, stream_buf + 12);
+    sub_ctx.r8.u64 = 1;
+    sub_82A3B690(sub_ctx, base);
+  }
+
+  // DrawIndexedPrimitive: sub_82A3E348(device, primitive_type, 0, 0, primitive_count)
+  {
+    constexpr uint32_t kPrimTypeTable = 0x82B0B4F4u;
+    const uint32_t prim_type = LoadU32(base, kPrimTypeTable + (ctx.r3.u32 << 2));
+    PPCContext sub_ctx = ctx;
+    sub_ctx.r3.u64 = device;
+    sub_ctx.r4.u64 = prim_type;
+    sub_ctx.r5.u64 = 0;
+    sub_ctx.r6.u64 = 0;
+    sub_ctx.r7.u64 = primitive_count;
+    sub_82A3E348(sub_ctx, base);
+  }
 }
 
 extern "C" void sub_828C8DB0(PPCContext& ctx, uint8_t* base) {

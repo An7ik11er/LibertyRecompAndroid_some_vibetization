@@ -101,6 +101,7 @@ public class LauncherActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         // The app icon over a running game: some home screens start a second
         // launcher on top of the task instead of bringing it forward. Step
         // aside so the game underneath comes back.

@@ -3048,7 +3048,10 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   TextureCaptureCacheSlot& TextureCaptureSlot(uint32_t handle) {
     return CaptureCacheWay(texture_capture_cache_, handle);
   }
-  void ForgetTextureCapture(uint32_t handle) { ForgetCaptureCache(texture_capture_cache_, handle); }
+  void ForgetTextureCapture(uint32_t handle) {
+    ForgetCaptureCache(texture_capture_cache_, handle);
+    InvalidateProducerTextureMemo(handle);
+  }
   // 32: capture keep-alive. Every command used to hold its own reference to
   // each captured texture / vertex / index buffer: the title thread took it
   // with weak_ptr::lock (a CAS) and the retirer dropped it, both on the
@@ -3255,6 +3258,25 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   alignas(64) gta4::InlineMutex command_capture_mutex_;
   // State commands absorbed since the last queued command (command_capture_mutex_).
   std::vector<uint8_t> producer_pending_state_;
+  // Batch 72: Consecutive draw texture memoization (command_capture_mutex_).
+  // Avoids redundant CaptureTextureResource slot hashing and weak_ptr locking
+  // when consecutive draws bind identical texture handles and fetch descriptors.
+  struct ProducerTextureMemo {
+    uint32_t handle = 0;
+    uint32_t epoch = 0;
+    xenos::xe_gpu_texture_fetch_t fetch{};
+    std::shared_ptr<const NativeTextureResource> resource;
+  };
+  [[maybe_unused]] std::array<ProducerTextureMemo, kTextureStageCount> producer_texture_memo_{};
+  void InvalidateProducerTextureMemo(uint32_t handle = 0) {
+    if (!handle) {
+      for (auto& memo : producer_texture_memo_) memo.handle = 0;
+    } else {
+      for (auto& memo : producer_texture_memo_) {
+        if (memo.handle == handle) memo.handle = 0;
+      }
+    }
+  }
   // 29.10: texture references of captured commands until they are published
   // (StageTextureProtection / PublishStagedTextureProtectionLocked). The worker
   // never takes this lock; readers take it after render_mutex_.

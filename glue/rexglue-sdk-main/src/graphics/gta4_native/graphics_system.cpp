@@ -4433,6 +4433,7 @@ bool Gta4NativeGraphicsSystem::CaptureTitleCommand(uint32_t abi_version, const v
     if (title_header.type == CommandType::kPresent) {
       ++queued_title_presents_;
       ++diagnostic_producer_epoch_;
+      InvalidateProducerTextureMemo();
     }
     }
   }
@@ -5666,7 +5667,20 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
         if (vertex_texture_rechecks_.size() > 4096) vertex_texture_rechecks_.clear();
         continue;
       }
-      native_command.textures[stage] = CaptureTextureResource(handle, fetch, stage);
+      const uint32_t current_texture_epoch =
+          uint32_t(texture_resources_epoch_.load(std::memory_order_relaxed));
+      auto& memo = producer_texture_memo_[stage];
+      if (memo.handle == handle && memo.epoch == current_texture_epoch &&
+          memo.resource && NativeTextureImageFetchEqual(memo.fetch, fetch)) [[likely]] {
+        native_command.textures[stage] = memo.resource;
+      } else {
+        auto captured = CaptureTextureResource(handle, fetch, stage);
+        memo.handle = handle;
+        memo.epoch = current_texture_epoch;
+        memo.fetch = fetch;
+        memo.resource = captured;
+        native_command.textures[stage] = std::move(captured);
+      }
     }
   }
 
