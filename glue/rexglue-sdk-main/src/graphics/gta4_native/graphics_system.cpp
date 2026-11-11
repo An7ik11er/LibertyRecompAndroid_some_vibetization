@@ -1940,9 +1940,9 @@ constexpr uint32_t kSpirvMagic = 0x07230203;
 // implementation audit.
 constexpr VkDeviceSize kNativeUploadBufferSize = 0x1000000;
 constexpr VkDeviceSize kNativeUploadGrowthGranularity = 0x1000000;
-// Derived and checked by Python: 16 MiB is 16,777,216 bytes and is exactly
+// Derived and checked by Python: 64 MiB is 67,108,864 bytes and is exactly
 // divisible by the 16-byte binding/upload alignment used by this arena.
-constexpr VkDeviceSize kNativePersistentBufferBlockSize = 16777216;
+constexpr VkDeviceSize kNativePersistentBufferBlockSize = 67108864;
 constexpr VkDeviceSize kNativePersistentBufferAlignment = 16;
 constexpr uint32_t kContentProbeAxis = 16;
 constexpr uint32_t kContentProbeSampleCount = 256;
@@ -5875,6 +5875,7 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
     fast_entry.flags = flags;
     fast_entry.address = data_address;
     fast_entry.size = data_size;
+    fast_entry.sentinel_5 = alias->sentinel_5;
   };
   if (current_serial && !metadata->guest_locked) [[likely]] {
     if (fast_entry.handle == handle && fast_entry.epoch == cache_epoch &&
@@ -5969,6 +5970,7 @@ if (cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
 
   // Сюда попадают ТОЛЬКО буферы после ResourceUnlock (реально грязные):
   if (matching_cache_entry &&
+      (data_size < 40 || FastBufferSentinel5(data, data_size) == matching_cache_entry->sentinel_5) &&
       NativeBufferShadowPayloadMatches(data, matching_cache_entry->payload.data(), data_size)) {
     std::lock_guard lock(buffer_resource_mutex_);
     const auto existing = buffer_resources_.find(handle);
@@ -5992,7 +5994,9 @@ if (cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
   if (existing != buffer_resources_.end()) {
     const auto& resource = existing->second;
     if (resource && resource->flags == flags && resource->guest_address == data_address &&
-        resource->guest_size == data_size && resource->content_hash == content_hash &&
+        resource->guest_size == data_size &&
+        (data_size < 40 || FastBufferSentinel5(data, data_size) == resource->sentinel_5) &&
+        resource->content_hash == content_hash &&
         resource->payload.size() == data_size &&
         !std::memcmp(resource->payload.data(), data, data_size)) {
       dirty_buffer_handles_.erase(handle);
@@ -6016,6 +6020,7 @@ if (cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
   resource->guest_address = data_address;
   resource->guest_size = data_size;
   resource->content_hash = content_hash;
+  resource->sentinel_5 = FastBufferSentinel5(payload.data(), data_size);
   resource->generation = next_buffer_generation_++;
   resource->created_frame = current_frame;
   resource->last_used_frame.store(current_frame, std::memory_order_relaxed);
@@ -24703,29 +24708,6 @@ bool Gta4NativeGraphicsSystem::UploadBufferResource(
   const bool memo_first = command_buffer && REXCVAR_GET(gta4_native_upload_memo_first) &&
                           REXCVAR_GET(gta4_native_persistent_buffers);
   if (index_buffer) {
-    if (memo_first) {
-      const std::vector<uint8_t>& host =
-          index32 ? resource->host_index32_payload : resource->host_index16_payload;
-      NativePersistentBufferKey memo_key{};
-      memo_key.generation = resource->generation;
-      memo_key.kind =
-          index32 ? NativePersistentBufferKind::kIndex32 : NativePersistentBufferKind::kIndex16;
-      if (!host.empty()) {
-        if (NativePersistentBufferEntry* entry = UsePersistentMemo(*resource, memo_key)) {
-          allocation = {};
-          allocation.buffer = entry->buffer;
-          allocation.offset = entry->offset;
-          allocation.host_data = host.data();
-          return true;
-        }
-      }
-    }
-    auto& uploads = index32 ? resources.index32_uploads : resources.index16_uploads;
-    const auto* existing = uploads.Find(resource->generation);
-    if (existing) {
-      allocation = *existing;
-      return true;
-    }
     std::vector<uint8_t>& host_payload =
         index32 ? resource->host_index32_payload : resource->host_index16_payload;
     if (host_payload.empty()) {
@@ -24738,6 +24720,59 @@ bool Gta4NativeGraphicsSystem::UploadBufferResource(
           resource->handle, host_payload.size(), host_payload.capacity(), 0, active_texture_frame_,
           index32 ? 32 : 16);
     }
+
+    if (memo_first) {
+      if (index32) {
+        if (resource->cached_index32_entry &&
+            resource->cached_index32_generation == resource->generation &&
+            resource->cached_index32_epoch == persistent_buffer_epoch_) {
+          TouchPersistentEntry(*resource->cached_index32_entry);
+          allocation = {};
+          allocation.buffer = resource->cached_index32_entry->buffer;
+          allocation.offset = resource->cached_index32_entry->offset;
+          allocation.host_data = host_payload.data();
+          return true;
+        }
+      } else {
+        if (resource->cached_index16_entry &&
+            resource->cached_index16_generation == resource->generation &&
+            resource->cached_index16_epoch == persistent_buffer_epoch_) {
+          TouchPersistentEntry(*resource->cached_index16_entry);
+          allocation = {};
+          allocation.buffer = resource->cached_index16_entry->buffer;
+          allocation.offset = resource->cached_index16_entry->offset;
+          allocation.host_data = host_payload.data();
+          return true;
+        }
+      }
+
+      NativePersistentBufferKey memo_key{};
+      memo_key.generation = resource->generation;
+      memo_key.kind =
+          index32 ? NativePersistentBufferKind::kIndex32 : NativePersistentBufferKind::kIndex16;
+      if (NativePersistentBufferEntry* entry = UsePersistentMemo(*resource, memo_key)) {
+        allocation = {};
+        allocation.buffer = entry->buffer;
+        allocation.offset = entry->offset;
+        allocation.host_data = host_payload.data();
+        if (index32) {
+          resource->cached_index32_entry = entry;
+          resource->cached_index32_generation = resource->generation;
+          resource->cached_index32_epoch = persistent_buffer_epoch_;
+        } else {
+          resource->cached_index16_entry = entry;
+          resource->cached_index16_generation = resource->generation;
+          resource->cached_index16_epoch = persistent_buffer_epoch_;
+        }
+        return true;
+      }
+    }
+    auto& uploads = index32 ? resources.index32_uploads : resources.index16_uploads;
+    const auto* existing = uploads.Find(resource->generation);
+    if (existing) {
+      allocation = *existing;
+      return true;
+    }
     NativePersistentBufferKey persistent_key{};
     persistent_key.generation = resource->generation;
     persistent_key.kind =
@@ -24745,6 +24780,15 @@ bool Gta4NativeGraphicsSystem::UploadBufferResource(
     if (GetOrCreatePersistentBuffer(command_buffer, resource, persistent_key, host_payload.data(),
                                     VkDeviceSize(host_payload.size()), NativeUploadKind::kIndex,
                                     allocation)) {
+      if (index32) {
+        resource->cached_index32_entry = resource->persistent_memo_entry;
+        resource->cached_index32_generation = resource->generation;
+        resource->cached_index32_epoch = persistent_buffer_epoch_;
+      } else {
+        resource->cached_index16_entry = resource->persistent_memo_entry;
+        resource->cached_index16_generation = resource->generation;
+        resource->cached_index16_epoch = persistent_buffer_epoch_;
+      }
       if (!uploads.Insert(resource->generation, allocation)) return false;
       return true;
     }
@@ -24765,6 +24809,34 @@ bool Gta4NativeGraphicsSystem::UploadBufferResource(
   const NativeShader& shader = *vertex_state->vertex_shader_resource;
   const NativePipelineState::VertexStream& stream_state =
       vertex_state->vertex_streams[vertex_stream];
+
+  if (!stream_state.stride || stream_state.offset >= resource->payload.size()) {
+    return false;
+  }
+
+  const NativeBufferResource::ConvertedVertexPayload* converted_payload = nullptr;
+  for (const auto& candidate : resource->converted_vertex_payloads) {
+    if (candidate.declaration_hash == declaration.content_hash &&
+        candidate.shader_hash == shader.input_signature_hash && candidate.stream == vertex_stream &&
+        candidate.stream_offset == stream_state.offset && candidate.stride == stream_state.stride) {
+      converted_payload = &candidate;
+      const_cast<NativeBufferResource::ConvertedVertexPayload&>(candidate).last_used_frame =
+          active_texture_frame_;
+      break;
+    }
+  }
+
+  if (memo_first && converted_payload && converted_payload->cached_persistent_entry &&
+      converted_payload->cached_vk_generation == resource->generation &&
+      converted_payload->cached_vk_epoch == persistent_buffer_epoch_) {
+    TouchPersistentEntry(*converted_payload->cached_persistent_entry);
+    allocation = {};
+    allocation.buffer = converted_payload->cached_persistent_entry->buffer;
+    allocation.offset = converted_payload->cached_persistent_entry->offset;
+    allocation.host_data = converted_payload->payload.data();
+    return true;
+  }
+
   NativePersistentBufferKey persistent_key{};
   persistent_key.generation = resource->generation;
   persistent_key.declaration_hash = declaration.content_hash;
@@ -24778,6 +24850,13 @@ bool Gta4NativeGraphicsSystem::UploadBufferResource(
       allocation = {};
       allocation.buffer = entry->buffer;
       allocation.offset = entry->offset;
+      if (converted_payload) {
+        auto* mutable_payload = const_cast<NativeBufferResource::ConvertedVertexPayload*>(converted_payload);
+        mutable_payload->cached_persistent_entry = entry;
+        mutable_payload->cached_vk_generation = resource->generation;
+        mutable_payload->cached_vk_epoch = persistent_buffer_epoch_;
+        allocation.host_data = converted_payload->payload.data();
+      }
       return true;
     }
   }
@@ -24787,20 +24866,6 @@ bool Gta4NativeGraphicsSystem::UploadBufferResource(
     return true;
   }
 
-  if (!stream_state.stride || stream_state.offset >= resource->payload.size()) {
-    return false;
-  }
-  const NativeBufferResource::ConvertedVertexPayload* converted_payload = nullptr;
-  for (const auto& candidate : resource->converted_vertex_payloads) {
-    if (candidate.declaration_hash == declaration.content_hash &&
-        candidate.shader_hash == shader.input_signature_hash && candidate.stream == vertex_stream &&
-        candidate.stream_offset == stream_state.offset && candidate.stride == stream_state.stride) {
-      converted_payload = &candidate;
-      const_cast<NativeBufferResource::ConvertedVertexPayload&>(candidate).last_used_frame =
-          active_texture_frame_;
-      break;
-    }
-  }
   VertexPayloadConversionCounts conversions{};
   if (!converted_payload) {
     if (resource->converted_vertex_payloads.size() >= kNativeMaximumVertexConversionsPerBuffer) {
@@ -24861,6 +24926,11 @@ bool Gta4NativeGraphicsSystem::UploadBufferResource(
     }
     std::memcpy(allocation.mapping, converted_payload->payload.data(),
                 converted_payload->payload.size());
+  } else if (converted_payload) {
+    auto* mutable_payload = const_cast<NativeBufferResource::ConvertedVertexPayload*>(converted_payload);
+    mutable_payload->cached_persistent_entry = resource->persistent_memo_entry;
+    mutable_payload->cached_vk_generation = resource->generation;
+    mutable_payload->cached_vk_epoch = persistent_buffer_epoch_;
   }
   if (!uploads.Insert(persistent_key, allocation)) return false;
   return true;

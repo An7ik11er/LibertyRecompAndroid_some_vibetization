@@ -109,6 +109,17 @@ inline bool NativeBufferShadowPayloadMatches(const uint8_t* guest_payload,
   return !std::memcmp(guest_payload, captured_payload, payload_size);
 }
 
+inline uint64_t FastBufferSentinel5(const uint8_t* p, size_t size) {
+  if (!p || size < 40) return uint64_t(size);
+  uint64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0;
+  std::memcpy(&s0, p, 8);
+  std::memcpy(&s1, p + (size >> 2), 8);
+  std::memcpy(&s2, p + (size >> 1), 8);
+  std::memcpy(&s3, p + ((size * 3) >> 2), 8);
+  std::memcpy(&s4, p + size - 8, 8);
+  return s0 ^ (s1 << 7) ^ (s2 << 17) ^ (s3 << 31) ^ (s4 << 43);
+}
+
 inline bool NativeBufferShadowPayloadRangeMatches(
     const uint8_t* guest_payload, const uint8_t* captured_payload, size_t payload_size,
     const NativeBufferShadowValidationRange& range) {

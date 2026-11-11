@@ -564,6 +564,9 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
       std::vector<uint8_t> payload;
       uint32_t created_frame = 0;
       uint32_t last_used_frame = 0;
+      NativePersistentBufferEntry* cached_persistent_entry = nullptr;
+      uint64_t cached_vk_generation = 0;
+      uint64_t cached_vk_epoch = 0;
     };
 
     uint32_t handle = 0;
@@ -571,6 +574,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     uint32_t guest_address = 0;
     uint32_t guest_size = 0;
     uint64_t content_hash = 0;
+    uint64_t sentinel_5 = 0;
     uint64_t generation = 0;
     uint32_t created_frame = 0;
     mutable uint32_t keepalive_serial = 0;
@@ -583,6 +587,12 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     mutable std::vector<ConvertedVertexPayload> converted_vertex_payloads;
     mutable std::vector<uint8_t> host_index16_payload;
     mutable std::vector<uint8_t> host_index32_payload;
+    mutable NativePersistentBufferEntry* cached_index16_entry = nullptr;
+    mutable uint64_t cached_index16_generation = 0;
+    mutable uint64_t cached_index16_epoch = 0;
+    mutable NativePersistentBufferEntry* cached_index32_entry = nullptr;
+    mutable uint64_t cached_index32_generation = 0;
+    mutable uint64_t cached_index32_epoch = 0;
     mutable NativeTriangleFanCache triangle_fan_cache;
     // Recorder-only: host-endian index ranges reordered for the vertex cache
     // (NativeVertexCacheOptimizer), keyed by start << 32 | count.
@@ -2993,6 +3003,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     const NativeBufferResource* alias = nullptr;
     // 61: the resource header it was captured with (as BufferCaptureCacheSlot).
     uint32_t flags = 0, address = 0, size = 0;
+    uint64_t sentinel_5 = 0;
   };
   static constexpr size_t kBufferCaptureFastTableSize = 4096;
   static constexpr uint32_t kBufferCaptureFastTableMask = kBufferCaptureFastTableSize - 1;
