@@ -1,4 +1,5 @@
 #include "gta4_init.h"
+#include "gta4_teleport_bridge.h"
 #include "gta4_frontend_hooks.h"
 #include "gta4_input_action_routing.h"
 #include "gta4_map_pan_policy.h"
@@ -2106,6 +2107,7 @@ extern "C" void sub_828CCD60(PPCContext& ctx, uint8_t* base) {
   const gta4::input::InputEpoch epoch =
       gta4::input::CaptureEpoch(ctx, base, caller, helicopter_controls);
   GTA4_SonyEndPoll(ctx, base);
+  gta4::teleport::PollTeleportBridge(ctx, base);
   gta4::input::ProcessPauseTabShoulders(ctx, base, epoch);
   gta4::GTA4MotionBridge::Get().SetReloadContextActive(
       !epoch.frontend_active && !epoch.phone_visible && !GTA4_TouchTitleInputOwned() &&

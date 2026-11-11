@@ -5861,31 +5861,33 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
   if (!metadata->HasValidPayload(kMaximumResourcePayloadSize)) {
     return reject("metadata", flags, data_address, data_size);
   }
+  // Direct-mapped O(1) buffer capture table (Batch 70: 4096 slots, replaces O(N) 64-entry scan)
+  const uint32_t fast_slot_idx = (handle ^ (data_address >> 4)) & kBufferCaptureFastTableMask;
+  auto& fast_entry = buffer_capture_fast_table_[fast_slot_idx];
+
   // Remembered with the header it was captured with (the slot's condition below).
   const auto note_mru = [&](const NativeBufferResource* alias) {
     if (!alias) return;
-    auto& mru = buffer_capture_mru_[buffer_capture_mru_cursor_++ & kBufferCaptureMruMask];
-    mru.handle = handle;
-    mru.alias_serial = capture_keepalive_serial_;
-    mru.epoch = cache_epoch;
-    mru.alias = alias;
-    mru.flags = flags;
-    mru.address = data_address;
-    mru.size = data_size;
+    fast_entry.handle = handle;
+    fast_entry.alias_serial = capture_keepalive_serial_;
+    fast_entry.epoch = cache_epoch;
+    fast_entry.alias = alias;
+    fast_entry.flags = flags;
+    fast_entry.address = data_address;
+    fast_entry.size = data_size;
   };
   if (current_serial && !metadata->guest_locked) [[likely]] {
-    for (const auto& entry : buffer_capture_mru_) {
-      if (entry.handle == handle && entry.epoch == cache_epoch &&
-          entry.alias_serial == current_serial && entry.alias && entry.flags == flags &&
-          entry.address == data_address && entry.size == data_size) [[likely]] {
-        const uint32_t frame = g_native_memory_profile_event_frame.load(std::memory_order_relaxed);
-        if (entry.alias->last_used_frame.load(std::memory_order_relaxed) != frame) {
-          entry.alias->last_used_frame.store(frame, std::memory_order_relaxed);
-        }
-        return AliasCaptured(entry.alias);
+    if (fast_entry.handle == handle && fast_entry.epoch == cache_epoch &&
+        fast_entry.alias_serial == current_serial && fast_entry.alias && fast_entry.flags == flags &&
+        fast_entry.address == data_address && fast_entry.size == data_size) [[likely]] {
+      const uint32_t frame = g_native_memory_profile_event_frame.load(std::memory_order_relaxed);
+      if (fast_entry.alias->last_used_frame.load(std::memory_order_relaxed) != frame) {
+        fast_entry.alias->last_used_frame.store(frame, std::memory_order_relaxed);
       }
+      return AliasCaptured(fast_entry.alias);
     }
   }
+
 
   const uint32_t current_frame =
       g_native_memory_profile_event_frame.load(std::memory_order_relaxed);
@@ -5984,15 +5986,15 @@ if (cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
     }
   }
 
-  std::vector<uint8_t> payload(data, data + data_size);
-  const uint64_t content_hash = XXH3_64bits(payload.data(), payload.size());
+  const uint64_t content_hash = XXH3_64bits(data, data_size);
   std::lock_guard lock(buffer_resource_mutex_);
   auto existing = buffer_resources_.find(handle);
   if (existing != buffer_resources_.end()) {
     const auto& resource = existing->second;
     if (resource && resource->flags == flags && resource->guest_address == data_address &&
         resource->guest_size == data_size && resource->content_hash == content_hash &&
-        resource->payload == payload) {
+        resource->payload.size() == data_size &&
+        !std::memcmp(resource->payload.data(), data, data_size)) {
       dirty_buffer_handles_.erase(handle);
       resource->last_used_frame.store(current_frame, std::memory_order_relaxed);
       remember(resource);
@@ -6005,6 +6007,8 @@ if (cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
       return resource;
     }
   }
+
+  std::vector<uint8_t> payload(data, data + data_size);
 
   auto resource = std::make_shared<NativeBufferResource>();
   resource->handle = handle;
@@ -6453,7 +6457,7 @@ Gta4NativeGraphicsSystem::CaptureTextureResourceUncached(
         // image's shape; the draw's current fetch still supplies sampler state.
         if (cache_font_identity_matches && (cache_reusable_vector_font || cache_gpu_image_matches ||
                                             (cache_fetch_matches && !cache_entry_dirty))) {
-          cacheable = !virtual_handle && !stock_font_shape && !vector_font_id;
+          cacheable = !virtual_handle;
           return resource;
         }
       }
@@ -6792,6 +6796,7 @@ Gta4NativeGraphicsSystem::CaptureTextureResourceUncached(
       if (ShouldClearNativeTextureDirtyFlag(cache_entry_dirty, true)) {
         dirty_texture_handles_.erase(handle);
       }
+      cacheable = !virtual_handle;
       return resource;
     }
   }

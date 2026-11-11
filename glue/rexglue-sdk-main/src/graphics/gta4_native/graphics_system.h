@@ -2994,10 +2994,10 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     // 61: the resource header it was captured with (as BufferCaptureCacheSlot).
     uint32_t flags = 0, address = 0, size = 0;
   };
-  static constexpr size_t kBufferCaptureMruSize = 8;
-  static constexpr uint32_t kBufferCaptureMruMask = kBufferCaptureMruSize - 1;
-  std::array<BufferMruEntry, kBufferCaptureMruSize> buffer_capture_mru_{};  // command_capture_mutex_
-  uint32_t buffer_capture_mru_cursor_ = 0;
+  static constexpr size_t kBufferCaptureFastTableSize = 4096;
+  static constexpr uint32_t kBufferCaptureFastTableMask = kBufferCaptureFastTableSize - 1;
+  std::array<BufferMruEntry, kBufferCaptureFastTableSize> buffer_capture_fast_table_{};  // command_capture_mutex_
+
 
   std::array<BufferCaptureCacheSlot, 8192> buffer_capture_cache_{};  // command_capture_mutex_
   std::atomic<uint64_t> buffer_resources_epoch_{1};
@@ -3005,7 +3005,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     return CaptureCacheWay(buffer_capture_cache_, handle);
   }
   void ForgetBufferCapture(uint32_t handle) {
-    for (auto& entry : buffer_capture_mru_) {
+    for (auto& entry : buffer_capture_fast_table_) {
       if (entry.handle == handle) {
         entry.handle = 0;
         entry.alias = nullptr;
@@ -3014,6 +3014,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     }
     ForgetCaptureCache(buffer_capture_cache_, handle);
   }
+
   // Producer-only memo of clean texture captures: same handle and identical
   // image fetch words with no texture-map change since give the same resource, so
   // Prepare, both texture_resource_mutex_ acquisitions and three hash lookups

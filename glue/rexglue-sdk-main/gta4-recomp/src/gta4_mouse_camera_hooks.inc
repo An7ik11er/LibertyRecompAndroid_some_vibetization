@@ -29,6 +29,7 @@ bool MouseHoldingAim(uint8_t* base, uint32_t control) {
 void AcceptMouseAngles(uint8_t* base, uint32_t camera, const MouseRotation& mouse,
                        uint32_t pitch, uint32_t yaw, uint32_t previous_pitch,
                        uint32_t previous_yaw) {
+  gta4::teleport::OnCameraUpdate(base, camera, pitch, yaw, previous_pitch, previous_yaw);
   // Retail final-angle jitter suppression snaps small rotations back to the
   // previous angle. Accept axes moved by the mouse before that comparison;
   // untouched controller axes retain their original comparison and state.

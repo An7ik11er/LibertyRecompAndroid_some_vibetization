@@ -22,6 +22,7 @@ set(GTA4_APP_SOURCES
     src/gta4_presentation_hooks.cpp
     src/gta4_aspect_hooks.cpp
     src/gta4_quicksave_hooks.cpp
+    src/gta4_teleport_bridge.cpp
     src/gta4_input_hooks.cpp
     src/gta4_sony_feedback.cpp
     src/gta4_sony_event_hooks.cpp

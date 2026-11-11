@@ -796,3 +796,101 @@ extern "C" void sub_821DA9C8(PPCContext& ctx, uint8_t* base) {
 
   ctx.r1.s64 = static_cast<int64_t>(sp) + 240;
 }
+
+// -----------------------------------------------------------------------------
+// 7. sub_821D9518: Sector Coarse Visibility Accumulator 48x48
+// -----------------------------------------------------------------------------
+extern "C" void sub_821D9518(PPCContext& ctx, uint8_t* base) {
+  REX_FUNC_PROLOGUE();
+  const uint32_t r11 = ctx.r3.u32;
+  const uint32_t r9_0 = REX_LOAD_U32(r11 + 0);
+  const uint32_t r8_4 = REX_LOAD_U32(r11 + 4);
+
+  int32_t r4 = static_cast<int32_t>(ctx.r4.u32) - static_cast<int32_t>(r9_0);
+  int32_t r10 = static_cast<int32_t>(ctx.r5.u32) - static_cast<int32_t>(r8_4);
+  int32_t r31 = static_cast<int32_t>(ctx.r6.u32) - static_cast<int32_t>(r9_0);
+  int32_t r8 = static_cast<int32_t>(ctx.r7.u32) - static_cast<int32_t>(r8_4);
+
+  if (r4 < 0) r4 = 0; else if (r4 > 47) r4 = 47;
+  const int32_t lim_min_y = static_cast<int32_t>(REX_LOAD_U32(r11 + 9616)) - static_cast<int32_t>(r8_4);
+  const int32_t lim_max_y = static_cast<int32_t>(REX_LOAD_U32(r11 + 9620)) - static_cast<int32_t>(r8_4);
+
+  if (r10 < lim_min_y) r10 = lim_min_y; else if (r10 > lim_max_y) r10 = lim_max_y;
+  if (r31 < 0) r31 = 0; else if (r31 > 47) r31 = 47;
+  if (r8 < lim_min_y) r8 = lim_min_y; else if (r8 > lim_max_y) r8 = lim_max_y;
+
+  if (r10 > r8) {
+    ctx.r3.u64 = 0;
+    return;
+  }
+
+  const int32_t col_count = r31 - r4;
+  int32_t row_count = r8 - r10 + 1;
+  uint32_t cur_row = r11 + (static_cast<uint32_t>(r10 * 48 + r4 + 2) * 4u);
+  uint32_t result = 0;
+
+  do {
+    const uint32_t next_row = cur_row + 192u;
+    int32_t c = col_count;
+    uint32_t ptr = cur_row;
+    do {
+      result |= REX_LOAD_U32(ptr);
+      ptr += 4u;
+      c -= 1;
+    } while (c >= 0);
+    cur_row = next_row;
+    row_count -= 1;
+  } while (row_count > 0);
+
+  ctx.r3.u64 = result;
+}
+
+// -----------------------------------------------------------------------------
+// 8. sub_821D9770: Sector Fine Visibility Accumulator 120x120
+// -----------------------------------------------------------------------------
+extern "C" void sub_821D9770(PPCContext& ctx, uint8_t* base) {
+  REX_FUNC_PROLOGUE();
+  const uint32_t r11 = ctx.r3.u32;
+  const uint32_t r10_0 = REX_LOAD_U32(r11 + 0);
+  const uint32_t r9_4 = REX_LOAD_U32(r11 + 4);
+
+  int32_t r4 = static_cast<int32_t>(ctx.r4.u32) - static_cast<int32_t>(r10_0);
+  int32_t r8 = static_cast<int32_t>(ctx.r5.u32) - static_cast<int32_t>(r9_4);
+  int32_t r31 = static_cast<int32_t>(ctx.r6.u32) - static_cast<int32_t>(r10_0);
+  int32_t r7 = static_cast<int32_t>(ctx.r7.u32) - static_cast<int32_t>(r9_4);
+
+  if (r4 < 0) r4 = 0; else if (r4 > 119) r4 = 119;
+  const int32_t lim_min_y = static_cast<int32_t>(REX_LOAD_U32(r11 + 58576)) - static_cast<int32_t>(r9_4);
+  const int32_t lim_max_y = static_cast<int32_t>(REX_LOAD_U32(r11 + 58580)) - static_cast<int32_t>(r9_4);
+
+  if (r8 < lim_min_y) r8 = lim_min_y; else if (r8 > lim_max_y) r8 = lim_max_y;
+  if (r31 < 0) r31 = 0; else if (r31 > 119) r31 = 119;
+  if (r7 < lim_min_y) r7 = lim_min_y; else if (r7 > lim_max_y) r7 = lim_max_y;
+
+  if (r8 > r7) {
+    ctx.r3.u64 = 0;
+    return;
+  }
+
+  const int32_t col_count = r31 - r4;
+  int32_t row_count = r7 - r8 + 1;
+  uint32_t cur_row = r11 + (static_cast<uint32_t>(r8 * 120 + r4 + 2) * 4u);
+  uint32_t result = 0;
+
+  do {
+    const uint32_t next_row = cur_row + 480u;
+    int32_t c = col_count;
+    uint32_t ptr = cur_row;
+    do {
+      result |= REX_LOAD_U32(ptr);
+      ptr += 4u;
+      c -= 1;
+    } while (c >= 0);
+    cur_row = next_row;
+    row_count -= 1;
+  } while (row_count > 0);
+
+  ctx.r3.u64 = result;
+}
+
+
