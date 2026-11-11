@@ -5891,8 +5891,6 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
     }
   }
 
-  BufferCaptureCacheSlot& cache_slot = BufferCaptureSlot(handle);
-
   auto reject = [handle](const char* reason, uint32_t flags, uint32_t data_address,
                          uint32_t data_size) {
     static std::atomic<uint64_t> rejection_count{0};
@@ -5970,6 +5968,7 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
   const uint32_t current_frame =
       g_native_memory_profile_event_frame.load(std::memory_order_relaxed);
   static const bool use_keepalive = REXCVAR_GET(gta4_native_capture_keepalive);
+  BufferCaptureCacheSlot& cache_slot = BufferCaptureSlot(handle);
   auto touch_frame = [current_frame](const NativeBufferResource& resource) {
     if (resource.last_used_frame.load(std::memory_order_relaxed) != current_frame) {
       resource.last_used_frame.store(current_frame, std::memory_order_relaxed);

@@ -3016,12 +3016,11 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     return CaptureCacheWay(buffer_capture_cache_, handle);
   }
   void ForgetBufferCapture(uint32_t handle) {
-    for (auto& entry : buffer_capture_fast_table_) {
-      if (entry.handle == handle) {
-        entry.handle = 0;
-        entry.alias = nullptr;
-        entry.alias_serial = 0;
-      }
+    auto& entry = buffer_capture_fast_table_[(handle >> 2) & kBufferCaptureFastTableMask];
+    if (entry.handle == handle) {
+      entry.handle = 0;
+      entry.alias = nullptr;
+      entry.alias_serial = 0;
     }
     ForgetCaptureCache(buffer_capture_cache_, handle);
   }

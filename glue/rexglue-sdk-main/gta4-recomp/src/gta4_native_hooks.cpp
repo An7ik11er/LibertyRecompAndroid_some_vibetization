@@ -4377,73 +4377,107 @@ void ApplyNativeShaderState(PPCContext& ctx, uint8_t* base, GuestFunction implem
 }
 
 extern "C" void sub_82A42168(PPCContext& ctx, uint8_t* base) {
-  if (!IsNativeMode() || !rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeTrace)) {
-    __imp__sub_82A42168(ctx, base);
-    return;
-  }
-
   const uint32_t device = ctx.r3.u32;
   const uint32_t first_register = ctx.r4.u32;
   const uint32_t source = ctx.r5.u32;
   const uint32_t register_count = ctx.r6.u32;
-  const uint32_t caller = uint32_t(ctx.lr);
-  const uint64_t register_end = uint64_t(first_register) + uint64_t(register_count);
-  const bool touches_gbuffer_transform = register_count && first_register < 12 && register_end > 8;
+  const uint64_t dirty_mask = ctx.r7.u64;
 
-  std::array<uint32_t, 16> transform_before{};
-  if (touches_gbuffer_transform) {
-    for (uint32_t index = 0; index < transform_before.size(); ++index) {
-      transform_before[index] =
-          LoadU32(base, device + kReplayVertexTransformConstantsOffset + index * sizeof(uint32_t));
-    }
+  if (register_count && source) {
+    std::memcpy(base + device + 1920 + (first_register << 4), base + source, size_t(register_count) << 4);
   }
+  StoreU64(base, device, LoadU64(base, device) | dirty_mask);
+}
 
-  __imp__sub_82A42168(ctx, base);
+extern "C" void sub_82A42250(PPCContext& ctx, uint8_t* base) {
+  const uint32_t device = ctx.r3.u32;
+  const uint32_t first_register = ctx.r4.u32;
+  const uint32_t source = ctx.r5.u32;
+  const uint32_t register_count = ctx.r6.u32;
+  const uint64_t dirty_mask = ctx.r7.u64;
 
-  if (!touches_gbuffer_transform) {
-    return;
+  if (register_count && source) {
+    std::memcpy(base + device + 6016 + (first_register << 4), base + source, size_t(register_count) << 4);
   }
+  StoreU64(base, device + 8, LoadU64(base, device + 8) | dirty_mask);
+}
 
-  std::array<uint32_t, 16> transform_after{};
-  for (uint32_t index = 0; index < transform_after.size(); ++index) {
-    transform_after[index] =
-        LoadU32(base, device + kReplayVertexTransformConstantsOffset + index * sizeof(uint32_t));
+extern "C" void sub_82A42338(PPCContext& ctx, uint8_t* base) {
+  const uint32_t device = ctx.r3.u32;
+  uint32_t reg = ctx.r4.u32;
+  uint32_t src = ctx.r5.u32;
+  uint32_t count = ctx.r6.u32;
+  while (count--) {
+    const uint32_t val = (LoadU32(base, src) & 1u);
+    src += 4;
+    const uint32_t bit = reg & 0x1Fu;
+    const uint32_t offset = (2528u + (reg >> 5)) << 2;
+    reg++;
+    const uint32_t current = LoadU32(base, device + offset);
+    const uint32_t mask = 1u << bit;
+    StoreU32(base, device + offset, (current & ~mask) | (val << bit));
   }
-  static std::atomic<uint64_t> transform_upload_count{0};
-  static std::atomic<uint64_t> bad_transform_upload_count{0};
-  const uint64_t ordinal = transform_upload_count.fetch_add(1, std::memory_order_relaxed) + 1;
-  const bool known_offscreen_transform =
-      transform_after[12] == 0x431B959E && transform_after[13] == 0x4311C5BE &&
-      transform_after[14] == 0x3C7DD5B0 && transform_after[15] == 0x415D1833;
-  const uint64_t bad_ordinal =
-      known_offscreen_transform
-          ? bad_transform_upload_count.fetch_add(1, std::memory_order_relaxed) + 1
-          : 0;
-  if (ordinal > 64 && (!bad_ordinal || bad_ordinal > 32)) {
-    return;
-  }
+  StoreU64(base, device + 32, LoadU64(base, device + 32) | (1ULL << 56));
+}
 
-  uint64_t source_hash = 0;
-  if (source && register_count <= 256) {
-    source_hash = XXH3_64bits(GuestPointer(base, source), size_t(register_count) * 16);
+extern "C" void sub_82A42398(PPCContext& ctx, uint8_t* base) {
+  const uint32_t device = ctx.r3.u32;
+  uint32_t reg = ctx.r4.u32;
+  uint32_t src = ctx.r5.u32;
+  uint32_t count = ctx.r6.u32;
+  while (count--) {
+    const uint32_t val = (LoadU32(base, src) & 1u);
+    src += 4;
+    const uint32_t bit = reg & 0x1Fu;
+    const uint32_t offset = (2532u + (reg >> 5)) << 2;
+    reg++;
+    const uint32_t current = LoadU32(base, device + offset);
+    const uint32_t mask = 1u << bit;
+    StoreU32(base, device + offset, (current & ~mask) | (val << bit));
   }
-  const uint32_t submitted_frame = LoadU32(base, device + kSubmittedFrameOffset);
-  REXLOG_INFO(
-      "gta4-native-cause: point=vertex-constant-producer frame={} ordinal={} "
-      "bad-ordinal={} caller={:08X} device={:08X} first={} count={} "
-      "source={:08X} source-hash={:016X} known-offscreen={} "
-      "before-c11={:08X},{:08X},{:08X},{:08X} "
-      "after-c8={:08X},{:08X},{:08X},{:08X} "
-      "after-c9={:08X},{:08X},{:08X},{:08X} "
-      "after-c10={:08X},{:08X},{:08X},{:08X} "
-      "after-c11={:08X},{:08X},{:08X},{:08X}",
-      submitted_frame, ordinal, bad_ordinal, caller, device, first_register, register_count, source,
-      source_hash, known_offscreen_transform, transform_before[12], transform_before[13],
-      transform_before[14], transform_before[15], transform_after[0], transform_after[1],
-      transform_after[2], transform_after[3], transform_after[4], transform_after[5],
-      transform_after[6], transform_after[7], transform_after[8], transform_after[9],
-      transform_after[10], transform_after[11], transform_after[12], transform_after[13],
-      transform_after[14], transform_after[15]);
+  StoreU64(base, device + 32, LoadU64(base, device + 32) | (1ULL << 56));
+}
+
+extern "C" void D3DDevice_SetVertexShaderConstantI(PPCContext& ctx, uint8_t* base) {
+  const uint32_t device = ctx.r3.u32;
+  const uint32_t reg = ctx.r4.u32;
+  uint32_t src = ctx.r5.u32;
+  uint32_t count = ctx.r6.u32;
+  uint32_t dst = device + 10144 + (reg << 2);
+  while (count--) {
+    const uint32_t b11 = LoadU8(base, src + 11);
+    const uint32_t b7 = LoadU8(base, src + 7);
+    const uint32_t b3 = LoadU8(base, src + 3);
+    src += 16;
+    StoreU32(base, dst, (b11 << 16) | (b7 << 8) | b3);
+    dst += 4;
+  }
+  StoreU64(base, device + 32, LoadU64(base, device + 32) | (1ULL << 56));
+}
+
+extern "C" void D3DDevice_SetPixelShaderConstantI(PPCContext& ctx, uint8_t* base) {
+  const uint32_t device = ctx.r3.u32;
+  const uint32_t reg = ctx.r4.u32;
+  uint32_t src = ctx.r5.u32;
+  uint32_t count = ctx.r6.u32;
+  uint32_t dst = device + 10208 + (reg << 2);
+  while (count--) {
+    const uint32_t b11 = LoadU8(base, src + 11);
+    const uint32_t b7 = LoadU8(base, src + 7);
+    const uint32_t b3 = LoadU8(base, src + 3);
+    src += 16;
+    StoreU32(base, dst, (b11 << 16) | (b7 << 8) | b3);
+    dst += 4;
+  }
+  StoreU64(base, device + 32, LoadU64(base, device + 32) | (1ULL << 56));
+}
+
+extern "C" void sub_82A423F8(PPCContext& ctx, uint8_t* base) {
+  D3DDevice_SetVertexShaderConstantI(ctx, base);
+}
+
+extern "C" void sub_82A42450(PPCContext& ctx, uint8_t* base) {
+  D3DDevice_SetPixelShaderConstantI(ctx, base);
 }
 
 void LogKnownOffscreenTransformBoundary(std::string_view point, const PPCContext& ctx,
@@ -4636,48 +4670,7 @@ extern "C" void sub_828D4268(PPCContext& ctx, uint8_t* base) {
 }
 
 extern "C" void sub_828BD250(PPCContext& ctx, uint8_t* base) {
-  static const bool trace_enabled =
-      rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeTrace);
-  if (!IsNativeMode() || !trace_enabled) {
-    __imp__sub_828BD250(ctx, base);
-    return;
-  }
-  const uint32_t device = LoadU32(base, kDeferredDeviceGlobal);
-  const uint32_t caller = uint32_t(ctx.lr);
-  const uint32_t state = ctx.r3.u32;
-  const uint32_t source = ctx.r4.u32;
-  const std::array<uint32_t, 16> before =
-      device ? CaptureLiveVertexTransform(base, device) : std::array<uint32_t, 16>{};
-  std::array<uint32_t, 16> source_matrix{};
-  if (source) {
-    for (uint32_t index = 0; index < source_matrix.size(); ++index) {
-      source_matrix[index] = LoadU32(base, source + index * sizeof(uint32_t));
-    }
-  }
   __imp__sub_828BD250(ctx, base);
-  const std::array<uint32_t, 16> after =
-      device ? CaptureLiveVertexTransform(base, device) : std::array<uint32_t, 16>{};
-  if (!device ||
-      (!IsKnownOffscreenVertexTransform(before) && !IsKnownOffscreenVertexTransform(after))) {
-    return;
-  }
-  const uint64_t source_hash = XXH3_64bits(source_matrix.data(), sizeof(source_matrix));
-  REXLOG_INFO(
-      "gta4-native-cause: point=offscreen-transition-matrix-setter-source "
-      "frame={} caller={:08X} state={:08X} source={:08X} "
-      "source-transform={:016X} "
-      "source-r0={:08X},{:08X},{:08X},{:08X} "
-      "source-r1={:08X},{:08X},{:08X},{:08X} "
-      "source-r2={:08X},{:08X},{:08X},{:08X} "
-      "source-r3={:08X},{:08X},{:08X},{:08X}",
-      LoadU32(base, device + kSubmittedFrameOffset), caller, state, source, source_hash,
-      source_matrix[0], source_matrix[1], source_matrix[2], source_matrix[3], source_matrix[4],
-      source_matrix[5], source_matrix[6], source_matrix[7], source_matrix[8], source_matrix[9],
-      source_matrix[10], source_matrix[11], source_matrix[12], source_matrix[13], source_matrix[14],
-      source_matrix[15]);
-  const std::array<uint32_t, 5> args = {state, source, 0, 0, 0};
-  LogKnownOffscreenTransformTransition("offscreen-transition-matrix-setter", base, device, caller,
-                                       state, args, before, after);
 }
 
 extern "C" void sub_828E7000(PPCContext& ctx, uint8_t* base) {
@@ -4776,24 +4769,20 @@ extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
 }
 
 extern "C" void sub_828C8DB0(PPCContext& ctx, uint8_t* base) {
-  LogKnownOffscreenTransformBoundary("offscreen-boundary-material-vertex", ctx, base, ctx.r3.u32);
   __imp__sub_828C8DB0(ctx, base);
 }
 
 extern "C" void sub_828C8E80(PPCContext& ctx, uint8_t* base) {
-  LogKnownOffscreenTransformBoundary("offscreen-boundary-material-pixel", ctx, base, ctx.r3.u32);
   __imp__sub_828C8E80(ctx, base);
 }
 
 extern "C" void sub_828C8F38(PPCContext& ctx, uint8_t* base) {
   FireMaterialPass(ctx, base, false);
-  LogKnownOffscreenTransformBoundary("offscreen-boundary-material-apply", ctx, base, ctx.r3.u32);
   __imp__sub_828C8F38(ctx, base);
   FireMaterialPass(ctx, base, true);
 }
 
 extern "C" void sub_828DFF00(PPCContext& ctx, uint8_t* base) {
-  LogKnownOffscreenTransformBoundary("offscreen-boundary-shader-select", ctx, base, ctx.r3.u32);
   __imp__sub_828DFF00(ctx, base);
 }
 
@@ -5619,8 +5608,6 @@ extern "C" void sub_82A3B690(PPCContext& ctx, uint8_t* base) {
   }
 
   const uint32_t device = ctx.r3.u32;
-  LogKnownOffscreenTransformBoundary("offscreen-boundary-vertex-stream", ctx, base, ctx.r5.u32,
-                                     device);
   const uint32_t stream = ctx.r4.u32;
   const uint32_t buffer = ctx.r5.u32;
   const uint32_t offset = ctx.r6.u32;
@@ -5666,8 +5653,6 @@ extern "C" void sub_82A3B7B0(PPCContext& ctx, uint8_t* base) {
   }
 
   const uint32_t device = ctx.r3.u32;
-  LogKnownOffscreenTransformBoundary("offscreen-boundary-index-buffer", ctx, base, ctx.r4.u32,
-                                     device);
   const uint32_t buffer = ctx.r4.u32;
   const uint32_t slot = device + kIndexBufferOffset;
   RetireNativeBoundResource(base, device, LoadU32(base, slot));
@@ -5852,6 +5837,10 @@ extern "C" void sub_82A44B78(PPCContext& ctx, uint8_t* base) {
 
   const uint32_t slot = device + kTextureHandleBase + stage * 4;
   const uint32_t previous = LoadU32(base, slot);
+  if (texture && texture == previous) {
+    StoreU64(base, device + 24, LoadU64(base, device + 24) | dirty_mask);
+    return;
+  }
   std::array<uint32_t, 6> source_descriptor{};
   std::array<uint32_t, 6> final_fetch{};
   if (texture) {
@@ -5973,8 +5962,6 @@ extern "C" void sub_82A42760(PPCContext& ctx, uint8_t* base) {
   }
 
   const uint32_t device = ctx.r3.u32;
-  LogKnownOffscreenTransformBoundary("offscreen-boundary-vertex-shader", ctx, base, ctx.r4.u32,
-                                     device);
   const uint32_t shader = ctx.r4.u32;
   ApplyNativeShaderState(ctx, base, __imp__sub_82A42760);
   TrackNativeShaderBinding(device, ShaderStage::kVertex, shader);
@@ -5990,8 +5977,6 @@ extern "C" void sub_82A42930(PPCContext& ctx, uint8_t* base) {
   }
 
   const uint32_t device = ctx.r3.u32;
-  LogKnownOffscreenTransformBoundary("offscreen-boundary-vertex-declaration", ctx, base, ctx.r4.u32,
-                                     device);
   const uint32_t declaration = ctx.r4.u32;
   StoreU32(base, device + kVertexDeclarationOffset, declaration);
   StoreU64(base, device + 16, LoadU64(base, device + 16) | uint64_t(0x00080000));
@@ -7342,66 +7327,7 @@ extern "C" void sub_82A3E348(PPCContext& ctx, uint8_t* base) {
   command.command_list = 0;
   command.draw_id = call;
 
-  const bool trace_gbuffer_submission =
-      rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeTrace) &&
-      (command.index_count == 5961 || command.index_count == 1056);
-  uint64_t constants_hash_before = 0;
-  uint64_t transform_hash_before = 0;
-  std::array<uint64_t, 5> dirty_before{};
-  std::array<uint32_t, 16> transform_before{};
-  NativeShaderBindingDiagnosticState shader_bindings{};
-  if (trace_gbuffer_submission) {
-    constants_hash_before = XXH3_64bits(GuestPointer(base, device + kReplayShaderConstantsOffset),
-                                        kReplayShaderConstantsSize);
-    transform_hash_before =
-        XXH3_64bits(GuestPointer(base, device + kReplayVertexTransformConstantsOffset),
-                    kReplayVertexTransformConstantsSize);
-    for (uint32_t index = 0; index < dirty_before.size(); ++index) {
-      dirty_before[index] = LoadU64(base, device + index * sizeof(uint64_t));
-    }
-    for (uint32_t index = 0; index < transform_before.size(); ++index) {
-      transform_before[index] =
-          LoadU32(base, device + kReplayVertexTransformConstantsOffset + index * sizeof(uint32_t));
-    }
-    shader_bindings = CaptureNativeShaderBindings(device);
-  }
   command.dirty_state = ConsumeNativeDrawDirtyState(base, device);
-
-  if (trace_gbuffer_submission) {
-    const uint64_t constants_hash_after = XXH3_64bits(
-        GuestPointer(base, device + kReplayShaderConstantsOffset), kReplayShaderConstantsSize);
-    const uint64_t transform_hash_after =
-        XXH3_64bits(GuestPointer(base, device + kReplayVertexTransformConstantsOffset),
-                    kReplayVertexTransformConstantsSize);
-    std::array<uint64_t, 5> dirty_after{};
-    for (uint32_t index = 0; index < dirty_after.size(); ++index) {
-      dirty_after[index] = LoadU64(base, device + index * sizeof(uint64_t));
-    }
-    const uint32_t submitted_frame = LoadU32(base, device + kSubmittedFrameOffset);
-    REXLOG_INFO(
-        "gta4-native-cause: point=gbuffer-title-submit frame={} draw={} "
-        "caller={:08X} device={:08X} primitive={} base={} start={} indices={} "
-        "vs-handle={:08X} ps-handle={:08X} vdecl={:08X} ib={:08X} "
-        "constants={:016X}->{:016X}:{} transform={:016X}->{:016X}:{} "
-        "dirty={:016X},{:016X},{:016X},{:016X},{:016X}->"
-        "{:016X},{:016X},{:016X},{:016X},{:016X} "
-        "c8={:08X},{:08X},{:08X},{:08X} "
-        "c9={:08X},{:08X},{:08X},{:08X} "
-        "c10={:08X},{:08X},{:08X},{:08X} "
-        "c11={:08X},{:08X},{:08X},{:08X}",
-        submitted_frame, call, command.caller, device, command.primitive_type, command.base_vertex,
-        command.start_index, command.index_count, shader_bindings.vertex_shader,
-        shader_bindings.pixel_shader, LoadU32(base, device + kVertexDeclarationOffset),
-        LoadU32(base, device + kIndexBufferOffset), constants_hash_before, constants_hash_after,
-        constants_hash_before == constants_hash_after, transform_hash_before, transform_hash_after,
-        transform_hash_before == transform_hash_after, dirty_before[0], dirty_before[1],
-        dirty_before[2], dirty_before[3], dirty_before[4], dirty_after[0], dirty_after[1],
-        dirty_after[2], dirty_after[3], dirty_after[4], transform_before[0], transform_before[1],
-        transform_before[2], transform_before[3], transform_before[4], transform_before[5],
-        transform_before[6], transform_before[7], transform_before[8], transform_before[9],
-        transform_before[10], transform_before[11], transform_before[12], transform_before[13],
-        transform_before[14], transform_before[15]);
-  }
   temporal_host::Draw(base,command.device);
   SubmitNativeCommand(command);
 }
