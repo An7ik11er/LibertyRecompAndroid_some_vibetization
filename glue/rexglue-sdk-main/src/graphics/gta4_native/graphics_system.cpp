@@ -5545,38 +5545,77 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
       return reject(header.type, "vertex-state-translation");
     }
     const std::span<const uint8_t> device_state(device_memory, kGuestDeviceSize);
-    if (const uint32_t handle0 = LoadGuestWord(device_state, kStreamBufferBase)) {
-      native_command.vertex_buffers[0] = CaptureBufferResource(handle0);
-      if (native_command.vertex_buffers[0]) {
-        native_command.captured_stream_mask = 1u;
+    if (header.type == CommandType::kDrawIndexedPrimitive) {
+      const auto& draw_indexed = *static_cast<const DrawIndexedPrimitiveCommand*>(command);
+      if (draw_indexed.batch_vb != 0) {
+        native_command.vertex_buffers[0] = CaptureBufferResource(draw_indexed.batch_vb);
+        if (native_command.vertex_buffers[0]) {
+          native_command.captured_stream_mask = 1u;
+        }
+        if (draw_indexed.batch_ib != 0) {
+          native_command.index_buffer = CaptureBufferResource(draw_indexed.batch_ib);
+        }
+        CaptureBulbSource(native_command, device_state);
+      } else {
+        if (const uint32_t handle0 = LoadGuestWord(device_state, kStreamBufferBase)) {
+          native_command.vertex_buffers[0] = CaptureBufferResource(handle0);
+          if (native_command.vertex_buffers[0]) {
+            native_command.captured_stream_mask = 1u;
+          }
+        }
+        // Fast-check if any stream 1..15 has a non-zero handle in guest memory before looping.
+        const uint8_t* s_ptr = device_state.data() + kStreamBufferBase + sizeof(uint32_t);
+        uint64_t any_hi_stream = 0;
+        for (size_t i = 0; i < 7; ++i) {
+          uint64_t pair = 0;
+          std::memcpy(&pair, s_ptr + i * sizeof(uint64_t), sizeof(uint64_t));
+          any_hi_stream |= pair;
+        }
+        uint32_t last_word = 0;
+        std::memcpy(&last_word, s_ptr + 14 * sizeof(uint32_t), sizeof(uint32_t));
+        if ((any_hi_stream | last_word) != 0) [[unlikely]] {
+          for (uint32_t stream = 1; stream < kVertexStreamCount; ++stream) {
+            if (const uint32_t handle =
+                    LoadGuestWord(device_state, kStreamBufferBase + stream * sizeof(uint32_t))) {
+              native_command.vertex_buffers[stream] = CaptureBufferResource(handle);
+              if (native_command.vertex_buffers[stream])
+                native_command.captured_stream_mask |= uint32_t{1} << stream;
+            }
+          }
+        }
+        const uint32_t handle = LoadGuestWord(device_state, kIndexBufferOffset);
+        if (handle) {
+          native_command.index_buffer = CaptureBufferResource(handle);
+        }
+        CaptureBulbSource(native_command, device_state);
       }
-    }
-    // Fast-check if any stream 1..15 has a non-zero handle in guest memory before looping.
-    const uint8_t* s_ptr = device_state.data() + kStreamBufferBase + sizeof(uint32_t);
-    uint64_t any_hi_stream = 0;
-    for (size_t i = 0; i < 7; ++i) {
-      uint64_t pair = 0;
-      std::memcpy(&pair, s_ptr + i * sizeof(uint64_t), sizeof(uint64_t));
-      any_hi_stream |= pair;
-    }
-    uint32_t last_word = 0;
-    std::memcpy(&last_word, s_ptr + 14 * sizeof(uint32_t), sizeof(uint32_t));
-    if ((any_hi_stream | last_word) != 0) [[unlikely]] {
-      for (uint32_t stream = 1; stream < kVertexStreamCount; ++stream) {
-        if (const uint32_t handle =
-                LoadGuestWord(device_state, kStreamBufferBase + stream * sizeof(uint32_t))) {
-          native_command.vertex_buffers[stream] = CaptureBufferResource(handle);
-          if (native_command.vertex_buffers[stream])
-            native_command.captured_stream_mask |= uint32_t{1} << stream;
+    } else {
+      if (const uint32_t handle0 = LoadGuestWord(device_state, kStreamBufferBase)) {
+        native_command.vertex_buffers[0] = CaptureBufferResource(handle0);
+        if (native_command.vertex_buffers[0]) {
+          native_command.captured_stream_mask = 1u;
         }
       }
-    }
-    if (header.type == CommandType::kDrawIndexedPrimitive) {
-      const uint32_t handle = LoadGuestWord(device_state, kIndexBufferOffset);
-      if (handle) {
-        native_command.index_buffer = CaptureBufferResource(handle);
+      // Fast-check if any stream 1..15 has a non-zero handle in guest memory before looping.
+      const uint8_t* s_ptr = device_state.data() + kStreamBufferBase + sizeof(uint32_t);
+      uint64_t any_hi_stream = 0;
+      for (size_t i = 0; i < 7; ++i) {
+        uint64_t pair = 0;
+        std::memcpy(&pair, s_ptr + i * sizeof(uint64_t), sizeof(uint64_t));
+        any_hi_stream |= pair;
       }
-      CaptureBulbSource(native_command, device_state);
+      uint32_t last_word = 0;
+      std::memcpy(&last_word, s_ptr + 14 * sizeof(uint32_t), sizeof(uint32_t));
+      if ((any_hi_stream | last_word) != 0) [[unlikely]] {
+        for (uint32_t stream = 1; stream < kVertexStreamCount; ++stream) {
+          if (const uint32_t handle =
+                  LoadGuestWord(device_state, kStreamBufferBase + stream * sizeof(uint32_t))) {
+            native_command.vertex_buffers[stream] = CaptureBufferResource(handle);
+            if (native_command.vertex_buffers[stream])
+              native_command.captured_stream_mask |= uint32_t{1} << stream;
+          }
+        }
+      }
     }
   }
 
@@ -5837,6 +5876,21 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
   // buffer re-pointed or locked without an unlock; the header read it skipped is three loads.
   const uint64_t cache_epoch = buffer_resources_epoch_.load(std::memory_order_acquire);
   const uint32_t current_serial = capture_keepalive_serial_;
+  const uint32_t fast_slot_idx = (handle >> 2) & kBufferCaptureFastTableMask;
+  auto& fast_entry = buffer_capture_fast_table_[fast_slot_idx];
+
+  // Intra-frame direct O(1) hit: identical handle in same frame without touching guest DRAM
+  if (current_serial) [[likely]] {
+    if (fast_entry.handle == handle && fast_entry.epoch == cache_epoch &&
+        fast_entry.alias_serial == current_serial && fast_entry.alias) [[likely]] {
+      const uint32_t frame = g_native_memory_profile_event_frame.load(std::memory_order_relaxed);
+      if (fast_entry.alias->last_used_frame.load(std::memory_order_relaxed) != frame) {
+        fast_entry.alias->last_used_frame.store(frame, std::memory_order_relaxed);
+      }
+      return AliasCaptured(fast_entry.alias);
+    }
+  }
+
   BufferCaptureCacheSlot& cache_slot = BufferCaptureSlot(handle);
 
   auto reject = [handle](const char* reason, uint32_t flags, uint32_t data_address,
@@ -5875,9 +5929,6 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
   if (!metadata->HasValidPayload(kMaximumResourcePayloadSize)) {
     return reject("metadata", flags, data_address, data_size);
   }
-  // Direct-mapped O(1) buffer capture table (Batch 70: 4096 slots, replaces O(N) 64-entry scan)
-  const uint32_t fast_slot_idx = (handle ^ (data_address >> 4)) & kBufferCaptureFastTableMask;
-  auto& fast_entry = buffer_capture_fast_table_[fast_slot_idx];
 
   // Remembered with the header it was captured with (the slot's condition below).
   const auto note_mru = [&](const NativeBufferResource* alias) {
@@ -5893,13 +5944,25 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
   };
   if (current_serial && !metadata->guest_locked) [[likely]] {
     if (fast_entry.handle == handle && fast_entry.epoch == cache_epoch &&
-        fast_entry.alias_serial == current_serial && fast_entry.alias && fast_entry.flags == flags &&
+        fast_entry.alias && fast_entry.flags == flags &&
         fast_entry.address == data_address && fast_entry.size == data_size) [[likely]] {
-      const uint32_t frame = g_native_memory_profile_event_frame.load(std::memory_order_relaxed);
-      if (fast_entry.alias->last_used_frame.load(std::memory_order_relaxed) != frame) {
-        fast_entry.alias->last_used_frame.store(frame, std::memory_order_relaxed);
+      if (fast_entry.alias_serial == current_serial) [[likely]] {
+        const uint32_t frame = g_native_memory_profile_event_frame.load(std::memory_order_relaxed);
+        if (fast_entry.alias->last_used_frame.load(std::memory_order_relaxed) != frame) {
+          fast_entry.alias->last_used_frame.store(frame, std::memory_order_relaxed);
+        }
+        return AliasCaptured(fast_entry.alias);
       }
-      return AliasCaptured(fast_entry.alias);
+      // Cross-frame sentinel verification:
+      const uint8_t* fast_data = memory_->TranslateVirtual<const uint8_t*>(data_address);
+      if (fast_data && (data_size < 40 || FastBufferSentinel5(fast_data, data_size) == fast_entry.sentinel_5)) {
+        fast_entry.alias_serial = current_serial;
+        const uint32_t frame = g_native_memory_profile_event_frame.load(std::memory_order_relaxed);
+        if (fast_entry.alias->last_used_frame.load(std::memory_order_relaxed) != frame) {
+          fast_entry.alias->last_used_frame.store(frame, std::memory_order_relaxed);
+        }
+        return AliasCaptured(fast_entry.alias);
+      }
     }
   }
 
@@ -8089,6 +8152,36 @@ void Gta4NativeGraphicsSystem::RenderWorkerLoop(WorkerLoopMode mode) {
                                 command.type == CommandType::kDrawIndexedPrimitive;
 		uint32_t old_depth_clamp = command.fixed_function_state->depth_clamp_enable;
         if (phase_draw) {
+          if (command.type == CommandType::kDrawIndexedPrimitive &&
+              command.bytes.size() >= sizeof(DrawIndexedPrimitiveCommand)) {
+            const auto& draw_indexed =
+                *reinterpret_cast<const DrawIndexedPrimitiveCommand*>(command.bytes.data());
+            if (draw_indexed.batch_vb != 0) {
+              if (draw_indexed.batch_vdecl != 0 &&
+                  (pipeline_state_.vertex_declaration != draw_indexed.batch_vdecl ||
+                   pipeline_state_.vertex_declaration_resource == nullptr)) {
+                pipeline_state_.vertex_declaration = draw_indexed.batch_vdecl;
+                auto decl_it = vertex_declarations_.find(draw_indexed.batch_vdecl);
+                pipeline_state_.vertex_declaration_resource =
+                    decl_it != vertex_declarations_.end() ? decl_it->second : nullptr;
+                ++pipeline_state_.version;
+              }
+              if (draw_indexed.batch_ib != 0 && pipeline_state_.index_buffer != draw_indexed.batch_ib) {
+                pipeline_state_.index_buffer = draw_indexed.batch_ib;
+                ++pipeline_state_.version;
+              }
+              auto& s0 = pipeline_state_.vertex_streams[0];
+              const uint32_t stride_words = (draw_indexed.batch_stride >> 2) & 0xFF;
+              if (s0.buffer != draw_indexed.batch_vb || s0.offset != 0 ||
+                  s0.stride != draw_indexed.batch_stride || s0.stride_words != stride_words) {
+                s0.buffer = draw_indexed.batch_vb;
+                s0.offset = 0;
+                s0.stride = draw_indexed.batch_stride;
+                s0.stride_words = stride_words;
+                ++pipeline_state_.version;
+              }
+            }
+          }
           // 48: the captured state is a shared read-only block; a changed clamp
           // makes a worker-owned variant (SetWorkerFixedState).
           const NativeFixedFunctionState& fixed = *command.fixed_function_state;
