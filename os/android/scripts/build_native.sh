@@ -7,7 +7,21 @@
 # usage: build_native.sh [jobs]      (default: number of CPUs - 2)
 set -euo pipefail
 . "$(dirname "$0")/env.sh"
-JOBS="${1:-${JOBS:-4}}"
+if [ -z "${1:-}" ] && [ -z "${JOBS:-}" ]; then
+  CPUS=$(nproc 2>/dev/null || echo 4)
+  MEM_FREE_KB=$(grep MemFree /proc/meminfo 2>/dev/null | awk '{print $2}' || echo "")
+  if [ -n "$MEM_FREE_KB" ]; then
+    MEM_FREE_GB=$((MEM_FREE_KB / 1024 / 1024))
+    RAM_JOBS=$(( (MEM_FREE_GB * 10) / 8 ))
+    [ "$RAM_JOBS" -lt 2 ] && RAM_JOBS=2
+    CPU_JOBS=$(( CPUS > 2 ? CPUS - 2 : CPUS ))
+    JOBS=$(( RAM_JOBS < CPU_JOBS ? RAM_JOBS : CPU_JOBS ))
+  else
+    JOBS=$(( CPUS > 2 ? CPUS - 2 : 4 ))
+  fi
+else
+  JOBS="${1:-${JOBS:-4}}"
+fi
 
 [ -d "$ANDROID_NDK" ] || { echo "no NDK at $ANDROID_NDK"; exit 1; }
 
