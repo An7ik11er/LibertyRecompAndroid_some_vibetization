@@ -603,6 +603,44 @@ extern "C" void sub_828BDAD8(PPCContext& ctx, uint8_t* base) {
     Write(base, viewport + 696, authored);
   phone_projection_build = previous_phone;
 }
+#if defined(__aarch64__)
+#include <arm_neon.h>
+
+namespace {
+static inline float32x4_t LoadBigEndianFloat4(const void* ptr) {
+  uint8x16_t raw = vld1q_u8(reinterpret_cast<const uint8_t*>(ptr));
+  return vreinterpretq_f32_u8(vrev32q_u8(raw));
+}
+
+static inline void StoreBigEndianFloat4(void* ptr, float32x4_t vec) {
+  uint8x16_t raw = vrev32q_u8(vreinterpretq_u8_f32(vec));
+  vst1q_u8(reinterpret_cast<uint8_t*>(ptr), raw);
+}
+
+// Multiplies two 4x4 big-endian matrices dst = B * A (matching RAGE sub_822707F8 convention)
+// where dst[i] = A[0]*B[i][0] + A[1]*B[i][1] + A[2]*B[i][2] + A[3]*B[i][3]
+static inline void NeonMatrix44Multiply(void* dst, const void* a, const void* b) {
+  const auto* a_ptr = reinterpret_cast<const uint8_t*>(a);
+  const auto* b_ptr = reinterpret_cast<const uint8_t*>(b);
+  auto* dst_ptr = reinterpret_cast<uint8_t*>(dst);
+
+  float32x4_t a0 = LoadBigEndianFloat4(a_ptr + 0);
+  float32x4_t a1 = LoadBigEndianFloat4(a_ptr + 16);
+  float32x4_t a2 = LoadBigEndianFloat4(a_ptr + 32);
+  float32x4_t a3 = LoadBigEndianFloat4(a_ptr + 48);
+
+  for (int i = 0; i < 4; ++i) {
+    float32x4_t b_row = LoadBigEndianFloat4(b_ptr + i * 16);
+    float32x4_t r = vmulq_laneq_f32(a0, b_row, 0);
+    r = vfmaq_laneq_f32(r, a1, b_row, 1);
+    r = vfmaq_laneq_f32(r, a2, b_row, 2);
+    r = vfmaq_laneq_f32(r, a3, b_row, 3);
+    StoreBigEndianFloat4(dst_ptr + i * 16, r);
+  }
+}
+} // namespace
+#endif
+
 extern "C" void sub_828BD1D8(PPCContext& ctx, uint8_t* base) {
   using namespace gta4::aspect;
   const uint32_t viewport = ctx.r3.u32;
@@ -614,6 +652,24 @@ extern "C" void sub_828BD1D8(PPCContext& ctx, uint8_t* base) {
     for (size_t i = 0; i < matrix.size(); ++i)
       Float(base, viewport + 448 + uint32_t(i) * 4, matrix[i]);
   }
+#if defined(__aarch64__)
+  if (viewport) {
+    uint8_t* vp_ptr = reinterpret_cast<uint8_t*>(rex::memory::GuestPtr(base, viewport));
+    // 1. Multiply viewport+192 = (viewport+384) * (viewport+128)
+    NeonMatrix44Multiply(vp_ptr + 192, vp_ptr + 384, vp_ptr + 128);
+    // 2. Multiply viewport+256 = (viewport+448) * (viewport+192)
+    NeonMatrix44Multiply(vp_ptr + 256, vp_ptr + 448, vp_ptr + 192);
+    // 3. Multiply viewport+512 = (viewport+576) * (viewport+256)
+    NeonMatrix44Multiply(vp_ptr + 512, vp_ptr + 576, vp_ptr + 256);
+
+    constexpr uint32_t kActiveViewportAddr = 0x831C2200u;
+    if (Read(base, kActiveViewportAddr) == viewport) {
+      ctx.r3.u32 = viewport;
+      sub_828BCFA8(ctx, base);
+    }
+    return;
+  }
+#endif
   __imp__sub_828BD1D8(ctx, base);
 }
 extern "C" void sub_828C2290(PPCContext& ctx, uint8_t* base) {

@@ -181,7 +181,7 @@ REXCVAR_DEFINE_BOOL(gta4_native_direct_record, false, "GTA IV/Graphics/Native Re
 REXCVAR_DEFINE_BOOL(gta4_native_intern_pipeline_snapshots, false, "GTA IV/Graphics/Native Renderer",
                     "No effect since 66 (kept so that old command lines still parse): there are "
                     "no pipeline snapshot objects to intern, a command carries its bindings");
-REXCVAR_DEFINE_UINT32(gta4_native_direct_stage_batch, 8, "GTA IV/Graphics/Native Renderer",
+REXCVAR_DEFINE_UINT32(gta4_native_direct_stage_batch, 32, "GTA IV/Graphics/Native Renderer",
                       "64: with direct record, commands are assembled in batches of this many "
                       "(1: each right after its capture, as before; at most 64). Presents, "
                       "device and synchronous commands publish the batch at once");
