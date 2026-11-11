@@ -3754,7 +3754,8 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   uint32_t worker_ring_segment_ = 0;
   VkDeviceSize worker_ring_cursor_ = 0;
   FrameGenerationMap<WorkerRingKey, uint32_t, WorkerRingKeyHash> worker_ring_dedupe_;
-  std::array<std::array<WorkerRingLast, 4>, 2> worker_ring_last_{};
+  // Batch 73: Expand worker ring last MRU to 8 entries for alternating sub-draws
+  std::array<std::array<WorkerRingLast, 8>, 2> worker_ring_last_{};
   // Recorder-thread: the ring frame of the frame being recorded.
   uint32_t recording_ring_serial_ = 0;
   // Whether a frame holds kTemporalUpdate commands (the worker marks the

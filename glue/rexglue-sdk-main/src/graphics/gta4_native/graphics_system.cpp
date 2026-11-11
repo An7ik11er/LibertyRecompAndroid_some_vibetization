@@ -5921,28 +5921,42 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
     cache_slot.resource = resource;
     cache_slot.alias_serial = 0;  // 32: the keep-alive does not hold this one yet
   };
-if (cache_slot.handle == handle && cache_slot.epoch == cache_epoch &&
+  if (cache_slot.handle == handle &&
       cache_slot.flags == flags && cache_slot.address == data_address &&
       cache_slot.size == data_size && !metadata->guest_locked) {
-    // 32: already held by this frame's keep-alive: an alias, no atomics on the
-    // resource (the keep-alive's reference keeps it alive).
-    if (cache_slot.alias && cache_slot.alias_serial == capture_keepalive_serial_ &&
-        capture_keepalive_serial_) {
-      touch_frame(*cache_slot.alias);
-      note_mru(cache_slot.alias);
-      return AliasCaptured(cache_slot.alias);
-    }
-    if (auto cached = cache_slot.resource.lock()) {
-      // Чистый слот во фронт-кэше (сбрасывается при любом ResourceUnlock) — возвращаем сразу без memcmp!
-      touch_frame(*cached);
-      if (use_keepalive) {
-        auto res = KeepCaptured(std::move(cached), cache_slot.alias, cache_slot.alias_serial);
+    if (cache_slot.epoch == cache_epoch) {
+      if (cache_slot.alias && cache_slot.alias_serial == capture_keepalive_serial_ &&
+          capture_keepalive_serial_) {
+        touch_frame(*cache_slot.alias);
         note_mru(cache_slot.alias);
-        return res;
+        return AliasCaptured(cache_slot.alias);
       }
-      return cached;
+      if (auto cached = cache_slot.resource.lock()) {
+        touch_frame(*cached);
+        if (use_keepalive) {
+          auto res = KeepCaptured(std::move(cached), cache_slot.alias, cache_slot.alias_serial);
+          note_mru(cache_slot.alias);
+          return res;
+        }
+        return cached;
+      }
+      cache_slot.handle = 0;
+    } else {
+      // Batch 73: Cross-frame O(1) hit on static buffers with 5-point sentinel check
+      if (auto cached = cache_slot.resource.lock()) {
+        const uint8_t* fast_data = memory_->TranslateVirtual<const uint8_t*>(data_address);
+        if (fast_data && (data_size < 40 || FastBufferSentinel5(fast_data, data_size) == cached->sentinel_5)) {
+          cache_slot.epoch = cache_epoch;
+          touch_frame(*cached);
+          if (use_keepalive) {
+            auto res = KeepCaptured(std::move(cached), cache_slot.alias, cache_slot.alias_serial);
+            note_mru(cache_slot.alias);
+            return res;
+          }
+          return cached;
+        }
+      }
     }
-    cache_slot.handle = 0;
   }
 
   std::shared_ptr<const NativeBufferResource> matching_cache_entry;
@@ -11083,6 +11097,14 @@ void Gta4NativeGraphicsSystem::WriteWorkerRingConstants(NativeCommand& command,
     }
     const uint64_t hash = version->content_hash ? version->content_hash : upload_hash;
     auto& mru = worker_ring_last_[kind];
+    // Batch 73: Fast O(1) consecutive sub-draw check (pointer equivalence of constant version)
+    if (mru[0].version == version.get() && mru[0].bytes == bytes && mru[0].offset) [[likely]] {
+      return mru[0].offset;
+    }
+    if (mru[1].version == version.get() && mru[1].bytes == bytes && mru[1].offset) {
+      std::swap(mru[0], mru[1]);
+      return mru[0].offset;
+    }
     if (hash) {
       for (size_t i = 0; i < mru.size(); ++i) {
         if (mru[i].version == version.get() && mru[i].hash == hash && mru[i].bytes == bytes) {
