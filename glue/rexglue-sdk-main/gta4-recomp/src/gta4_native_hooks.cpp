@@ -4714,28 +4714,38 @@ extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
   // 2. Batched Indices:
   const uint32_t ib_buf = LoadU32(base, index_buf + 12);
   const uint32_t ib_slot = device + kIndexBufferOffset;
-  RetireNativeBoundResource(base, device, LoadU32(base, ib_slot));
-  StoreU32(base, ib_slot, ib_buf);
+  const uint32_t prev_ib = LoadU32(base, ib_slot);
+  if (prev_ib != ib_buf) {
+    RetireNativeBoundResource(base, device, prev_ib);
+    StoreU32(base, ib_slot, ib_buf);
+  }
 
   // 3. Batched Stream Source 0:
   const uint32_t stream_buf = ctx.r5.u32;
-  StoreU32(base, kGlobalBase + 9236, stream_buf);  // 0x831C2414
+  if (stream_buf != LoadU32(base, kGlobalBase + 9236)) {
+    StoreU32(base, kGlobalBase + 9236, stream_buf);  // 0x831C2414
+  }
   const uint32_t vb_buf = LoadU32(base, stream_buf + 28);
   const uint32_t vb_stride = LoadU32(base, stream_buf + 12);
-  if (vb_buf) {
-    const uint32_t resource_address = LoadU32(base, vb_buf + 24);
-    const uint32_t full_resource_size = LoadU32(base, vb_buf + 28) & kResourceSizeMask;
-    StoreU32(base, device + kStreamSizeBase, full_resource_size);
-    StoreU32(base, device + kStreamFetchBase, EncodeNativeFetchAddress(resource_address));
-    StoreU64(base, device + 24, LoadU64(base, device + 24) | 1u);
-  }
   const uint32_t vb_slot = device + kStreamBufferBase;
-  RetireNativeBoundResource(base, device, LoadU32(base, vb_slot));
-  StoreU32(base, vb_slot, vb_buf);
+  const uint32_t prev_vb = LoadU32(base, vb_slot);
+  if (prev_vb != vb_buf) {
+    if (vb_buf) {
+      const uint32_t resource_address = LoadU32(base, vb_buf + 24);
+      const uint32_t full_resource_size = LoadU32(base, vb_buf + 28) & kResourceSizeMask;
+      StoreU32(base, device + kStreamSizeBase, full_resource_size);
+      StoreU32(base, device + kStreamFetchBase, EncodeNativeFetchAddress(resource_address));
+      StoreU64(base, device + 24, LoadU64(base, device + 24) | 1u);
+    }
+    RetireNativeBoundResource(base, device, prev_vb);
+    StoreU32(base, vb_slot, vb_buf);
+  }
   const uint32_t stride_words = (vb_stride >> 2) & 0xFF;
-  StoreU8(base, device + 12520, uint8_t(stride_words));
-  if (stride_words && stride_words != LoadU8(base, device + 11824)) {
-    StoreU64(base, device + 16, LoadU64(base, device + 16) | uint64_t(0x00080000));
+  if (stride_words != LoadU8(base, device + 12520)) {
+    StoreU8(base, device + 12520, uint8_t(stride_words));
+    if (stride_words && stride_words != LoadU8(base, device + 11824)) {
+      StoreU64(base, device + 16, LoadU64(base, device + 16) | uint64_t(0x00080000));
+    }
   }
 
   // 4. Batched Draw Submission (Unified Direct to Native Queue):

@@ -839,9 +839,11 @@ tools/optimize_generated_report.txt
 game_files/
 game_files
 
-# AI assistant instructions - DO NOT COMMIT
+# AI assistant instructions and agent tools - DO NOT COMMIT
 AGENTS.md
 GEMINI.md
 CLAUDE.md
 .agents/
+tools/agent_tools/
+
 

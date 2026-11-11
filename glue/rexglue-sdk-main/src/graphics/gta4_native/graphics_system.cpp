@@ -3696,8 +3696,30 @@ size_t Gta4NativeGraphicsSystem::NativePersistentBufferKeyHash::operator()(
 
 size_t Gta4NativeGraphicsSystem::NativeSharedConstantSemanticKeyHash::operator()(
     const NativeSharedConstantSemanticKey& key) const noexcept {
-  const auto words = NativeSharedKeyWords(key);
-  return size_t(XXH3_64bits(words.data(), sizeof(words)));
+  // Hot per-draw lookup: fast mix hash avoids 1120-byte NativeSharedKeyWords stack copy & XXH3.
+  uint64_t h = NativeMixHash(key.image_descriptor_epoch ^ (key.sampler_descriptor_epoch << 1) ^ 0x9E3779B97F4A7C15ull);
+  h = NativeMixHash(h ^ (key.cached_descriptor_epoch << 2) ^ (uint64_t(key.descriptor_page) << 32));
+  h = NativeMixHash(h ^ key.boolean_version.epoch ^ (key.boolean_version.revision << 16));
+  h = NativeMixHash(h ^ key.environmental_data_hash ^ (key.environmental_sequence << 32));
+  h = NativeMixHash(h ^ key.tone_lut_address ^ key.cloud_mask_address);
+  h = NativeMixHash(h ^ ((uint64_t(key.width) << 32) | key.height));
+  h = NativeMixHash(h ^ ((uint64_t(key.color_output_mask) << 32) | key.alpha_reference_bits));
+
+  const uint64_t* tex_words = reinterpret_cast<const uint64_t*>(key.texture_descriptor_indices.data());
+  constexpr size_t kTexWordCount = (sizeof(key.texture_descriptor_indices) / sizeof(uint64_t));
+  for (size_t i = 0; i < kTexWordCount; ++i) {
+    if (tex_words[i] != 0) {
+      h = NativeMixHash(h ^ tex_words[i]);
+    }
+  }
+  const uint64_t* samp_words = reinterpret_cast<const uint64_t*>(key.sampler_descriptor_indices.data());
+  constexpr size_t kSampWordCount = (sizeof(key.sampler_descriptor_indices) / sizeof(uint64_t));
+  for (size_t i = 0; i < kSampWordCount; ++i) {
+    if (samp_words[i] != 0) {
+      h = NativeMixHash(h ^ samp_words[i]);
+    }
+  }
+  return size_t(h);
 }
 
 Gta4NativeGraphicsSystem::Gta4NativeGraphicsSystem() {
@@ -6078,16 +6100,14 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
     }
   }
 
-  const uint64_t content_hash = XXH3_64bits(data, data_size);
   std::lock_guard lock(buffer_resource_mutex_);
   auto existing = buffer_resources_.find(handle);
   if (existing != buffer_resources_.end()) {
     const auto& resource = existing->second;
     if (resource && resource->flags == flags && resource->guest_address == data_address &&
         resource->guest_size == data_size &&
-        (data_size < 40 || FastBufferSentinel5(data, data_size) == resource->sentinel_5) &&
-        resource->content_hash == content_hash &&
         resource->payload.size() == data_size &&
+        (data_size < 40 || FastBufferSentinel5(data, data_size) == resource->sentinel_5) &&
         !std::memcmp(resource->payload.data(), data, data_size)) {
       dirty_buffer_handles_.erase(handle);
       resource->last_used_frame.store(current_frame, std::memory_order_relaxed);
@@ -6101,6 +6121,8 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
       return resource;
     }
   }
+
+  const uint64_t content_hash = XXH3_64bits(data, data_size);
 
   std::vector<uint8_t> payload(data, data + data_size);
 
