@@ -3878,12 +3878,34 @@ bool SubmitNativeVertexDeclaration(uint8_t* base, uint32_t device, uint32_t decl
     return false;
   }
 
+  // Fast collision-proof dedup: (device, declaration, sig) — skip already registered vertex declarations.
+  const uint32_t elements = declaration + kVertexDeclarationElementsOffset;
+  uint64_t sig = (uint64_t(element_count) << 56) | (uint64_t(maximum_stream) << 48);
+  for (uint32_t i = 0; i < element_count; ++i) {
+    const uint32_t elem_addr = elements + i * sizeof(VertexElement);
+    sig ^= (uint64_t(LoadU32(base, elem_addr)) << ((i * 5) & 31)) ^
+           (uint64_t(LoadU32(base, elem_addr + 4)) << ((i * 7 + 3) & 31));
+  }
+
+  struct KnownVDeclEntry {
+    uint32_t device = 0;
+    uint32_t declaration = 0;
+    uint64_t sig = 0;
+  };
+  static constexpr size_t kKnownVDeclTableSize = 256;
+  static thread_local std::array<KnownVDeclEntry, kKnownVDeclTableSize> s_known_vdecls{};
+
+  const size_t slot_idx = ((declaration >> 4) ^ (declaration >> 12)) & (kKnownVDeclTableSize - 1);
+  KnownVDeclEntry& cached = s_known_vdecls[slot_idx];
+  if (cached.device == device && cached.declaration == declaration && cached.sig == sig) [[likely]] {
+    return true;
+  }
+
   RegisterVertexDeclarationCommand command{};
   command.device = device;
   command.declaration = declaration;
   command.element_count = element_count;
   command.maximum_stream = maximum_stream;
-  const uint32_t elements = declaration + kVertexDeclarationElementsOffset;
   for (uint32_t index = 0; index < element_count; ++index) {
     const uint32_t element = elements + index * sizeof(VertexElement);
     VertexElement& output = command.elements[index];
@@ -3916,8 +3938,11 @@ bool SubmitNativeVertexDeclaration(uint8_t* base, uint32_t device, uint32_t decl
     REXLOG_INFO("gta4-native-vertex-declaration: handle={:08X} elements={} maximum-stream={} [{}]",
                 declaration, element_count, maximum_stream, elements_summary);
   }
-  SubmitNativeCommand(command);
-  return true;
+  if (SubmitNativeCommand(command)) {
+    cached = {device, declaration, sig};
+    return true;
+  }
+  return false;
 }
 
 PPCContext InvokeGuest(PPCContext& parent, uint8_t* base, GuestFunction function, uint64_t r3 = 0,
@@ -4674,7 +4699,41 @@ extern "C" void sub_828BD250(PPCContext& ctx, uint8_t* base) {
 }
 
 extern "C" void sub_828E7000(PPCContext& ctx, uint8_t* base) {
-  __imp__sub_828E7000(ctx, base);
+  if (!IsNativeMode()) {
+    __imp__sub_828E7000(ctx, base);
+    return;
+  }
+
+  const uint32_t r31_geom = ctx.r3.u32;
+
+  // Secondary stream / skinning (offset +68) - fallback to full recomp if active
+  if (REX_LOAD_U32(r31_geom + 68u) != 0u) [[unlikely]] {
+    __imp__sub_828E7000(ctx, base);
+    return;
+  }
+
+  // Fast path (loc_828E7080): bypass 112-byte guest stack frame allocation
+  uint32_t r30_slot = 0u;
+  if (static_cast<int32_t>(REX_LOAD_U32(r31_geom + 72u)) != 0) [[unlikely]] {
+    r30_slot = REX_LOAD_U32(0x831C6214u);
+  }
+
+  const uint32_t r11_ib_off = ((r30_slot + 7u) << 2) & 0xFFFFFFFCu;
+  const uint32_t r10_vb_off = ((r30_slot + 3u) << 2) & 0xFFFFFFFCu;
+
+  ctx.r11.u64 = r11_ib_off;
+  ctx.r10.u64 = r10_vb_off;
+  ctx.r7.u64 = REX_LOAD_U32(r31_geom + 44u);
+  ctx.r4.u64 = REX_LOAD_U32(r31_geom + 4u);
+  ctx.r3.u64 = REX_LOAD_U16(r31_geom + 54u);
+  ctx.r6.u64 = REX_LOAD_U32(r31_geom + r11_ib_off);
+  ctx.r5.u64 = REX_LOAD_U32(r31_geom + r10_vb_off);
+
+  const uint64_t saved_lr = ctx.lr;
+  ctx.lr = 0x828E70A8u;
+  sub_828BFC00(ctx, base);
+  ctx.r12.u64 = saved_lr;
+  ctx.lr = saved_lr;
 }
 
 uint32_t EncodeNativeFetchAddress(uint32_t address);
@@ -4716,7 +4775,9 @@ extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
   const uint32_t ib_slot = device + kIndexBufferOffset;
   const uint32_t prev_ib = LoadU32(base, ib_slot);
   if (prev_ib != ib_buf) {
-    RetireNativeBoundResource(base, device, prev_ib);
+    if (prev_ib != 0) {
+      RetireNativeBoundResource(base, device, prev_ib);
+    }
     StoreU32(base, ib_slot, ib_buf);
   }
 
@@ -4737,7 +4798,9 @@ extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
       StoreU32(base, device + kStreamFetchBase, EncodeNativeFetchAddress(resource_address));
       StoreU64(base, device + 24, LoadU64(base, device + 24) | 1u);
     }
-    RetireNativeBoundResource(base, device, prev_vb);
+    if (prev_vb != 0) {
+      RetireNativeBoundResource(base, device, prev_vb);
+    }
     StoreU32(base, vb_slot, vb_buf);
   }
   const uint32_t stride_words = (vb_stride >> 2) & 0xFF;
@@ -5847,8 +5910,10 @@ extern "C" void sub_82A44B78(PPCContext& ctx, uint8_t* base) {
 
   const uint32_t slot = device + kTextureHandleBase + stage * 4;
   const uint32_t previous = LoadU32(base, slot);
-  if (texture && texture == previous) {
-    StoreU64(base, device + 24, LoadU64(base, device + 24) | dirty_mask);
+  if (texture == previous) {
+    if (texture != 0) {
+      StoreU64(base, device + 24, LoadU64(base, device + 24) | dirty_mask);
+    }
     return;
   }
   std::array<uint32_t, 6> source_descriptor{};

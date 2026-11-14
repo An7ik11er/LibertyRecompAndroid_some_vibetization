@@ -4,6 +4,9 @@
 // sub_821D5F70).
 
 #include <sched.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 extern "C" bool gta4_atomic_sections_lock_flag;
 
@@ -827,22 +830,31 @@ extern "C" void sub_821D9518(PPCContext& ctx, uint8_t* base) {
   const int32_t col_count = r31 - r4;
   int32_t row_count = r8 - r10 + 1;
   uint32_t cur_row = r11 + (static_cast<uint32_t>(r10 * 48 + r4 + 2) * 4u);
-  uint32_t result = 0;
+  uint32_t raw_result = 0;
 
   do {
     const uint32_t next_row = cur_row + 192u;
-    int32_t c = col_count;
-    uint32_t ptr = cur_row;
-    do {
-      result |= REX_LOAD_U32(ptr);
-      ptr += 4u;
-      c -= 1;
-    } while (c >= 0);
+    const uint32_t* row_ptr = reinterpret_cast<const uint32_t*>(REX_RAW_ADDR(cur_row));
+    int32_t c = col_count + 1;
+#if defined(__aarch64__)
+    uint32x4_t v_acc = vdupq_n_u32(0);
+    while (c >= 4) {
+      v_acc = vorrq_u32(v_acc, vld1q_u32(row_ptr));
+      row_ptr += 4;
+      c -= 4;
+    }
+    uint32x2_t v_pair = vorr_u32(vget_low_u32(v_acc), vget_high_u32(v_acc));
+    raw_result |= vget_lane_u32(v_pair, 0) | vget_lane_u32(v_pair, 1);
+#endif
+    while (c > 0) {
+      raw_result |= *row_ptr++;
+      --c;
+    }
     cur_row = next_row;
     row_count -= 1;
   } while (row_count > 0);
 
-  ctx.r3.u64 = result;
+  ctx.r3.u64 = __builtin_bswap32(raw_result);
 }
 
 // -----------------------------------------------------------------------------
@@ -875,22 +887,31 @@ extern "C" void sub_821D9770(PPCContext& ctx, uint8_t* base) {
   const int32_t col_count = r31 - r4;
   int32_t row_count = r7 - r8 + 1;
   uint32_t cur_row = r11 + (static_cast<uint32_t>(r8 * 120 + r4 + 2) * 4u);
-  uint32_t result = 0;
+  uint32_t raw_result = 0;
 
   do {
     const uint32_t next_row = cur_row + 480u;
-    int32_t c = col_count;
-    uint32_t ptr = cur_row;
-    do {
-      result |= REX_LOAD_U32(ptr);
-      ptr += 4u;
-      c -= 1;
-    } while (c >= 0);
+    const uint32_t* row_ptr = reinterpret_cast<const uint32_t*>(REX_RAW_ADDR(cur_row));
+    int32_t c = col_count + 1;
+#if defined(__aarch64__)
+    uint32x4_t v_acc = vdupq_n_u32(0);
+    while (c >= 4) {
+      v_acc = vorrq_u32(v_acc, vld1q_u32(row_ptr));
+      row_ptr += 4;
+      c -= 4;
+    }
+    uint32x2_t v_pair = vorr_u32(vget_low_u32(v_acc), vget_high_u32(v_acc));
+    raw_result |= vget_lane_u32(v_pair, 0) | vget_lane_u32(v_pair, 1);
+#endif
+    while (c > 0) {
+      raw_result |= *row_ptr++;
+      --c;
+    }
     cur_row = next_row;
     row_count -= 1;
   } while (row_count > 0);
 
-  ctx.r3.u64 = result;
+  ctx.r3.u64 = __builtin_bswap32(raw_result);
 }
 
 
