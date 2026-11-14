@@ -1658,6 +1658,8 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   struct NativeCachedDescriptorState;
   struct NativePipelineCompilerState;
 
+  struct NativePlacementOwner;
+
   struct NativeSurfaceImage {
     uint64_t lifetime_id = 0;
     SurfaceDescriptor descriptor{};
@@ -1685,6 +1687,9 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     NativeSurfaceAspectContent aspect_content{};
     GuestPlacementKey materialized_placement{};
     uint64_t materialized_serial = 0;
+    GuestPlacementKey cached_owner_key{};
+    NativePlacementOwner* cached_owner_slot = nullptr;
+    uint64_t cached_owner_map_epoch = 0;
     uint32_t created_frame = 0;
     uint32_t last_used_frame = 0;
     uint64_t last_used_submission = 0;
@@ -1980,7 +1985,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     bool has_last_shared_key = false;
     NativeSharedConstantSemanticKey last_shared_key{};
     NativeUploadAllocation last_shared_allocation{};
-    static constexpr size_t kSharedMruSize = 4;
+    static constexpr size_t kSharedMruSize = 16;
     struct SharedMruEntry {
       bool valid = false;
       NativeSharedConstantSemanticKey key{};
@@ -3808,6 +3813,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   uint32_t worker_ring_serial_ = 1;
   uint32_t worker_ring_segment_ = 0;
   VkDeviceSize worker_ring_cursor_ = 0;
+  VkDeviceSize worker_ring_segment_bytes_ = 0;
   FrameGenerationMap<WorkerRingKey, uint32_t, WorkerRingKeyHash> worker_ring_dedupe_;
   // Batch 73: Expand worker ring last MRU to 8 entries for alternating sub-draws
   std::array<std::array<WorkerRingLast, 8>, 2> worker_ring_last_{};
@@ -3992,6 +3998,18 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   uint64_t next_surface_lifetime_id_ = 1;
   std::unordered_map<GuestPlacementKey, NativePlacementOwner, GuestPlacementKeyHash>
       native_placement_owners_;
+  struct PlacementOwnerFastCacheEntry {
+    uint64_t epoch = 0;
+    GuestPlacementKey key{};
+    const NativePlacementOwner* slot = nullptr;
+  };
+  mutable std::array<PlacementOwnerFastCacheEntry, 32> placement_owner_fast_cache_{};
+  uint64_t placement_owners_epoch_ = 1;
+  void InvalidatePlacementOwnersCache() {
+    if (++placement_owners_epoch_ == 0) placement_owners_epoch_ = 1;
+  }
+  void UpsertPlacementOwner(NativeSurfaceImage& surface, const GuestPlacementKey& key,
+                            const NativePlacementOwner& owner);
   uint64_t next_surface_write_serial_ = 1;
   uint64_t next_reflection_capture_epoch_ = 1;
   NativeReflectionRegistry reflection_resources_;

@@ -228,6 +228,14 @@ struct ConstantStateVersion {
   // worker only; while the version is current, the canonical bank equals its
   // content, so the prefix can still be extended for a later draw. 0: all.
   mutable size_t materialized_bytes = 0;
+  // Render-worker-only memoization of prefix XXH3 hash and current-frame
+  // worker constant ring placement. Immutable version bytes + single worker
+  // serializer guarantee zero synchronization overhead.
+  mutable uint32_t cached_prefix_bytes = 0;
+  mutable uint64_t cached_prefix_hash = 0;
+  mutable uint32_t cached_ring_serial = 0;
+  mutable uint32_t cached_ring_bytes = 0;
+  mutable uint32_t cached_ring_offset = 0;
 };
 
 // Versions and snapshot control blocks are allocated for nearly every draw

@@ -9369,12 +9369,19 @@ bool Gta4NativeGraphicsSystem::SnapshotDrawConstants(NativeCommand& command,
       const uint32_t bytes = partial_upload ? NativeConstantUploadPrefix(shader, bank_size)
                                             : uint32_t(bank_size);
       if (source.size() < bytes) return;
+      if (version->cached_prefix_bytes == bytes && version->cached_prefix_hash != 0) [[likely]] {
+        hash = version->cached_prefix_hash;
+        hashed_bytes = bytes;
+        return;
+      }
       auto& memo = constant_upload_hash_memo_[slot];
       if (memo.version != version || memo.bytes != bytes) {
         memo.version = version;
         memo.bytes = bytes;
         memo.hash = XXH3_64bits(source.data(), bytes);
       }
+      version->cached_prefix_bytes = bytes;
+      version->cached_prefix_hash = memo.hash;
       hash = memo.hash;
       hashed_bytes = bytes;
     };
@@ -9392,7 +9399,6 @@ bool Gta4NativeGraphicsSystem::SnapshotDrawConstants(NativeCommand& command,
   const bool ring_placed =
       command.worker_vertex_constants_offset != 0 &&
       command.worker_pixel_constants_offset != 0 &&
-      pipelined_recording_ &&
       !temporal_active_ &&
       !command.temporal_instance &&
       !command.temporal_prefilter &&
@@ -11180,7 +11186,8 @@ void Gta4NativeGraphicsSystem::DestroyNativeFrameConstantArenas() {
 
 namespace {
 constexpr uint32_t kWorkerRingSegments = 6;
-constexpr VkDeviceSize kWorkerRingSegmentBytes = 6ull << 20;
+constexpr VkDeviceSize kWorkerRingSegmentBytesPreferred = 12ull << 20;
+constexpr VkDeviceSize kWorkerRingSegmentBytesFallback = 6ull << 20;
 // The last bank's uniform range may reach past its segment: keep it inside
 // the buffer.
 constexpr VkDeviceSize kWorkerRingGuardBytes = kVertexConstantsSize;
@@ -11194,11 +11201,19 @@ void SwapGuestConstantWords(uint8_t* destination, const uint8_t* source, size_t 
 void Gta4NativeGraphicsSystem::InitializeWorkerConstantRing() {
   if (!REXCVAR_GET(gta4_native_worker_constant_ring)) return;
   std::lock_guard lock(worker_ring_mutex_);
-  if (!worker_constant_ring_.buffer &&
-      !CreateNativeUploadBuffer(kWorkerRingSegments * kWorkerRingSegmentBytes + kWorkerRingGuardBytes,
-                                worker_constant_ring_, false)) {
-    worker_constant_ring_ = NativeUploadBuffer{};
-    return;
+  if (!worker_constant_ring_.buffer) {
+    worker_ring_segment_bytes_ = kWorkerRingSegmentBytesPreferred;
+    if (!CreateNativeUploadBuffer(
+            kWorkerRingSegments * worker_ring_segment_bytes_ + kWorkerRingGuardBytes,
+            worker_constant_ring_, false)) {
+      worker_ring_segment_bytes_ = kWorkerRingSegmentBytesFallback;
+      if (!CreateNativeUploadBuffer(
+              kWorkerRingSegments * worker_ring_segment_bytes_ + kWorkerRingGuardBytes,
+              worker_constant_ring_, false)) {
+        worker_constant_ring_ = NativeUploadBuffer{};
+        return;
+      }
+    }
   }
   if (!worker_constant_ring_.mapping || !worker_constant_ring_.device_address) {
     DestroyNativeUploadBuffer(worker_constant_ring_);
@@ -11271,6 +11286,10 @@ void Gta4NativeGraphicsSystem::WriteWorkerRingConstants(NativeCommand& command,
     const uint32_t bytes = partial ? NativeConstantUploadPrefix(shader, bank_size)
                                    : uint32_t(bank_size);
     if (!bytes) return 0;
+    if (version->cached_ring_serial == worker_ring_serial_ &&
+        version->cached_ring_bytes == bytes && version->cached_ring_offset) [[likely]] {
+      return version->cached_ring_offset;
+    }
     const uint8_t* src_data = nullptr;
     const auto& materialized = version->materialized;
     if (materialized && materialized->size() >= bytes &&
@@ -11285,10 +11304,16 @@ void Gta4NativeGraphicsSystem::WriteWorkerRingConstants(NativeCommand& command,
     auto& mru = worker_ring_last_[kind];
     // Batch 73: Fast O(1) consecutive sub-draw check (pointer equivalence of constant version)
     if (mru[0].version == version.get() && mru[0].bytes == bytes && mru[0].offset) [[likely]] {
+      version->cached_ring_serial = worker_ring_serial_;
+      version->cached_ring_bytes = bytes;
+      version->cached_ring_offset = mru[0].offset;
       return mru[0].offset;
     }
     if (mru[1].version == version.get() && mru[1].bytes == bytes && mru[1].offset) {
       std::swap(mru[0], mru[1]);
+      version->cached_ring_serial = worker_ring_serial_;
+      version->cached_ring_bytes = bytes;
+      version->cached_ring_offset = mru[0].offset;
       return mru[0].offset;
     }
     if (hash) {
@@ -11298,6 +11323,9 @@ void Gta4NativeGraphicsSystem::WriteWorkerRingConstants(NativeCommand& command,
           if (i > 0) {
             std::swap(mru[0], mru[i]);
           }
+          version->cached_ring_serial = worker_ring_serial_;
+          version->cached_ring_bytes = bytes;
+          version->cached_ring_offset = offset;
           return offset;
         }
       }
@@ -11307,19 +11335,27 @@ void Gta4NativeGraphicsSystem::WriteWorkerRingConstants(NativeCommand& command,
       if (const uint32_t* found = worker_ring_dedupe_.Find(key)) {
         for (size_t i = mru.size() - 1; i > 0; --i) mru[i] = mru[i - 1];
         mru[0] = {version.get(), hash, bytes, *found};
+        version->cached_ring_serial = worker_ring_serial_;
+        version->cached_ring_bytes = bytes;
+        version->cached_ring_offset = *found;
         return *found;
       }
     }
     // Offset 0 of a segment is skipped, so a valid offset is never 0.
     const VkDeviceSize cursor =
         rex::round_up(std::max<VkDeviceSize>(worker_ring_cursor_, alignment), alignment);
-    if (cursor + bytes > kWorkerRingSegmentBytes) return 0;
-    const VkDeviceSize offset = VkDeviceSize(worker_ring_segment_) * kWorkerRingSegmentBytes + cursor;
+    const VkDeviceSize segment_bytes =
+        worker_ring_segment_bytes_ ? worker_ring_segment_bytes_ : kWorkerRingSegmentBytesFallback;
+    if (cursor + bytes > segment_bytes) return 0;
+    const VkDeviceSize offset = VkDeviceSize(worker_ring_segment_) * segment_bytes + cursor;
     SwapGuestConstantWords(worker_constant_ring_.mapping + offset, src_data, bytes);
     worker_ring_cursor_ = cursor + bytes;
     if (hash) worker_ring_dedupe_.Insert(key, uint32_t(offset));
     for (size_t i = mru.size() - 1; i > 0; --i) mru[i] = mru[i - 1];
     mru[0] = {version.get(), hash, bytes, uint32_t(offset)};
+    version->cached_ring_serial = worker_ring_serial_;
+    version->cached_ring_bytes = bytes;
+    version->cached_ring_offset = uint32_t(offset);
     return uint32_t(offset);
   };
   const uint32_t vertex_offset =
@@ -21027,7 +21063,12 @@ NativeFrameTask Gta4NativeGraphicsSystem::PrepareFrameTexturesTask(
   // batch is as valid a source as the previous one. Cleared wherever
   // previous_prepared_draw is.
   constexpr size_t kPreparedDrawCacheSize = 512;
-  std::array<std::array<const NativeCommand*, 2>, kPreparedDrawCacheSize> prepared_draw_cache{};
+  struct PreparedDrawCacheEntry {
+    const NativeCommand* command = nullptr;
+    uint64_t signature = 0;
+    uint32_t used_texture_mask = 0;
+  };
+  std::array<std::array<PreparedDrawCacheEntry, 2>, kPreparedDrawCacheSize> prepared_draw_cache{};
   // With the worker's signatures on both draws, equal inputs are equal
   // signatures (a 64-bit hash of the same fields the full comparison reads).
   const auto prepared_inputs_equal = [](const NativeCommand& previous, const NativeCommand& next) {
@@ -21138,7 +21179,10 @@ NativeFrameTask Gta4NativeGraphicsSystem::PrepareFrameTexturesTask(
     }
     for (const NativeCommand* command_pointer : texture_commands) {
       const NativeCommand& command = *command_pointer;
-      for (const auto& texture : command.textures) {
+      for (uint32_t mask = command.used_texture_mask & kSupportedShaderTextureMask; mask;
+           mask &= mask - 1) {
+        const uint32_t stage = uint32_t(std::countr_zero(mask));
+        const auto& texture = command.textures[stage];
         if (texture && texture->packed_depth_source) {
           packed_alias_generations.insert(texture->generation);
         }
@@ -21239,18 +21283,29 @@ if (!PrepareFrameDescriptorPool(descriptor_pool_draw_count, combined_descriptor_
     bool valid = false;
   };
   std::array<DescriptorKeyMRUEntry, 4> descriptor_mru{};
+  std::array<uint8_t, 4> descriptor_mru_order{0, 1, 2, 3};
 
-  const auto compute_descriptor_key_fingerprint = [](const NativeDrawDescriptorKey& key) -> uint64_t {
-    uint64_t fp = key.layout_epoch * 0x9E3779B97F4A7C15ull;
-    for (size_t i = 0; i < kShaderTextureCount; ++i) {
-      const uint64_t img = reinterpret_cast<uintptr_t>(key.images_2d[i]);
-      const uint64_t smp = reinterpret_cast<uintptr_t>(key.samplers[i]);
-      fp ^= (img + 0x517cc1b727220a95ull + (fp << 6) + (fp >> 2));
-      fp ^= (smp + 0x9e3779b97f4a7c15ull + (fp << 5) + (fp >> 3));
-      fp ^= (key.image_lifetimes[i] * 0xbf58476d1ce4e5b9ull);
-    }
-    return fp ? fp : 1;
+  const auto compute_stage_fingerprint = [](size_t stage, const NativeDrawDescriptorKey& key) -> uint64_t {
+    const uint64_t img2d = reinterpret_cast<uintptr_t>(key.images_2d[stage]);
+    const uint64_t img2da = reinterpret_cast<uintptr_t>(key.images_2d_array[stage]);
+    const uint64_t img3d = reinterpret_cast<uintptr_t>(key.images_3d[stage]);
+    const uint64_t imgc = reinterpret_cast<uintptr_t>(key.images_cube[stage]);
+    const uint64_t smp = reinterpret_cast<uintptr_t>(key.samplers[stage]);
+    uint64_t h = (stage + 1) * 0x9E3779B97F4A7C15ull;
+    h ^= img2d * 0xBF58476D1CE4E5B9ull;
+    h ^= (img2da ^ img3d ^ imgc) * 0x94D049BB133111EBull;
+    h ^= smp * 0x517CC1B727220A95ull;
+    h ^= key.image_lifetimes[stage] * 0xD6E8FEB86659FD93ull;
+    h ^= h >> 30;
+    h *= 0xBF58476D1CE4E5B9ull;
+    return h;
   };
+  std::array<uint64_t, kShaderTextureCount> null_stage_fp{};
+  uint64_t null_descriptor_fp = null_descriptor_key.layout_epoch * 0x9E3779B97F4A7C15ull;
+  for (size_t i = 0; i < kShaderTextureCount; ++i) {
+    null_stage_fp[i] = compute_stage_fingerprint(i, null_descriptor_key);
+    null_descriptor_fp ^= null_stage_fp[i];
+  }
   for (size_t command_index = 0;; ++command_index) {
     if (streaming) {
       // 60: take the commands assembled since the last resume; suspend when there are none.
@@ -21290,6 +21345,7 @@ if (!PrepareFrameDescriptorPool(descriptor_pool_draw_count, combined_descriptor_
       previous_prepared_draw = nullptr;
       prepared_draw_cache.fill({});
       for (auto& entry : descriptor_mru) entry.valid = false;
+      descriptor_mru_order = {0, 1, 2, 3};
     }
     if (command.depth_handoff_source &&
         !prepared_image(command.depth_handoff_source)) {
@@ -21305,20 +21361,26 @@ if (!PrepareFrameDescriptorPool(descriptor_pool_draw_count, combined_descriptor_
     if (reuse_prepared_bindings && !command.temporal_scene_binding && !TvCommandRole(command) &&
         native_descriptor_backend_ == NativeDescriptorBackend::kIndexed && native_descriptor_paging_) {
       const NativeCommand* source = nullptr;
+      const auto way_matches = [&](const PreparedDrawCacheEntry& way) {
+        if (!way.command || way.command == previous_prepared_draw) return false;
+        if (command.texture_inputs_signature && command.pipeline_state) {
+          return way.signature == command.texture_inputs_signature &&
+                 way.used_texture_mask == command.used_texture_mask;
+        }
+        return !way.command->temporal_scene_binding &&
+               prepared_inputs_equal(*way.command, command);
+      };
       if (previous_prepared_draw && !previous_prepared_draw->temporal_scene_binding &&
           prepared_inputs_equal(*previous_prepared_draw, command)) {
         source = previous_prepared_draw;
       } else if (use_prepared_draw_cache) {
         auto& ways = prepared_draw_cache[prepared_slot];
-        if (ways[0] && ways[0] != previous_prepared_draw && !ways[0]->temporal_scene_binding &&
-            prepared_inputs_equal(*ways[0], command)) {
-          source = ways[0];
-        } else if (ways[1] && ways[1] != previous_prepared_draw && !ways[1]->temporal_scene_binding &&
-                   prepared_inputs_equal(*ways[1], command)) {
-          source = ways[1];
+        if (way_matches(ways[0])) {
+          source = ways[0].command;
+        } else if (way_matches(ways[1])) {
+          source = ways[1].command;
           // MRU promotion: promote way 1 to way 0
-          ways[1] = ways[0];
-          ways[0] = source;
+          std::swap(ways[0], ways[1]);
         }
       }
       if (source) {
@@ -21742,17 +21804,26 @@ if (!PrepareFrameDescriptorPool(descriptor_pool_draw_count, combined_descriptor_
     //  descriptor_key.samplers[stage] = samplers[stage].sampler;
    // }
     if (native_descriptor_backend_ == NativeDescriptorBackend::kIndexed && native_descriptor_paging_) {
-      const uint64_t key_fp = compute_descriptor_key_fingerprint(descriptor_key);
-      int hit_index = -1;
-      for (int i = 0; i < 4; ++i) {
-        if (descriptor_mru[i].valid && descriptor_mru[i].fingerprint == key_fp &&
-            descriptor_mru[i].key == descriptor_key) {
-          hit_index = i;
+      uint64_t key_fp = null_descriptor_fp ^
+          ((descriptor_key.layout_epoch ^ null_descriptor_key.layout_epoch) *
+           0x9E3779B97F4A7C15ull);
+      for (uint32_t mask = stage_mask; mask; mask &= mask - 1) {
+        const uint32_t stage = uint32_t(std::countr_zero(mask));
+        key_fp ^= null_stage_fp[stage] ^ compute_stage_fingerprint(stage, descriptor_key);
+      }
+      if (!key_fp) key_fp = 1;
+      int hit_pos = -1;
+      for (int pos = 0; pos < 4; ++pos) {
+        const auto& candidate = descriptor_mru[descriptor_mru_order[pos]];
+        if (candidate.valid && candidate.fingerprint == key_fp &&
+            candidate.key == descriptor_key) {
+          hit_pos = pos;
           break;
         }
       }
-      if (hit_index >= 0) {
-        const auto& hit = descriptor_mru[hit_index];
+      if (hit_pos >= 0) {
+        const uint8_t hit_slot = descriptor_mru_order[hit_pos];
+        const auto& hit = descriptor_mru[hit_slot];
         command.descriptor_page = hit.page;
         command.descriptor_copy = hit.copy;
         command.texture_descriptor_indices = hit.texture_indices;
@@ -21760,33 +21831,36 @@ if (!PrepareFrameDescriptorPool(descriptor_pool_draw_count, combined_descriptor_
         command.image_descriptor_epoch = hit.epoch;
         command.sampler_descriptor_epoch = hit.epoch;
         command.bindings_prepared = true;
-        if (hit_index > 0) {
-          const auto hit_copy = descriptor_mru[hit_index];
-          for (int j = hit_index; j > 0; --j) {
-            descriptor_mru[j] = descriptor_mru[j - 1];
+        if (hit_pos > 0) {
+          for (int j = hit_pos; j > 0; --j) {
+            descriptor_mru_order[j] = descriptor_mru_order[j - 1];
           }
-          descriptor_mru[0] = hit_copy;
+          descriptor_mru_order[0] = hit_slot;
         }
       } else {
         if (!AssignIndexedWorkingSet(command, descriptor_key)) co_return false;
+        const uint8_t evict_slot = descriptor_mru_order[3];
         for (int j = 3; j > 0; --j) {
-          descriptor_mru[j] = descriptor_mru[j - 1];
+          descriptor_mru_order[j] = descriptor_mru_order[j - 1];
         }
-        descriptor_mru[0].valid = true;
-        descriptor_mru[0].fingerprint = key_fp;
-        descriptor_mru[0].key = descriptor_key;
-        descriptor_mru[0].page = command.descriptor_page;
-        descriptor_mru[0].copy = command.descriptor_copy;
-        descriptor_mru[0].texture_indices = command.texture_descriptor_indices;
-        descriptor_mru[0].sampler_indices = command.sampler_descriptor_indices;
-        descriptor_mru[0].epoch = command.image_descriptor_epoch;
+        descriptor_mru_order[0] = evict_slot;
+        auto& mru_slot = descriptor_mru[evict_slot];
+        mru_slot.valid = true;
+        mru_slot.fingerprint = key_fp;
+        mru_slot.key = descriptor_key;
+        mru_slot.page = command.descriptor_page;
+        mru_slot.copy = command.descriptor_copy;
+        mru_slot.texture_indices = command.texture_descriptor_indices;
+        mru_slot.sampler_indices = command.sampler_descriptor_indices;
+        mru_slot.epoch = command.image_descriptor_epoch;
       }
       previous_prepared_draw = &command;
-      if (use_prepared_draw_cache) {
+      if (use_prepared_draw_cache && !command.temporal_scene_binding && !TvCommandRole(command) &&
+          command.bindings_prepared && !command.failed_texture_mask && command.pipeline_state) {
         auto& ways = prepared_draw_cache[prepared_slot];
-        if (ways[0] != &command) {
+        if (ways[0].command != &command) {
           ways[1] = ways[0];
-          ways[0] = &command;
+          ways[0] = {&command, command.texture_inputs_signature, command.used_texture_mask};
         }
       }
     } else {
@@ -22960,13 +23034,16 @@ void Gta4NativeGraphicsSystem::QueueSurfaceImageRelease(uint32_t handle) {
     }
   }
   // A released lifetime cannot remain a content source for a reused handle.
+  bool erased_owner = false;
   for (auto owner = native_placement_owners_.begin(); owner != native_placement_owners_.end();) {
     if (owner->second.image && owner->second.image->descriptor.handle == handle) {
       owner = native_placement_owners_.erase(owner);
+      erased_owner = true;
     } else {
       ++owner;
     }
   }
+  if (erased_owner) InvalidatePlacementOwnersCache();
 }
 
 void Gta4NativeGraphicsSystem::ReleasePendingSurfaceImages() {
@@ -22995,13 +23072,16 @@ void Gta4NativeGraphicsSystem::ReleasePendingSurfaceImages() {
       continue;
     }
     NativeSurfaceImage* retired_image = image->get();
+    bool erased_owner = false;
     for (auto owner = native_placement_owners_.begin(); owner != native_placement_owners_.end();) {
       if (owner->second.image == retired_image) {
         owner = native_placement_owners_.erase(owner);
+        erased_owner = true;
       } else {
         ++owner;
       }
     }
+    if (erased_owner) InvalidatePlacementOwnersCache();
     DestroyNativeSurfaceImage(*retired_image);
     image = native_surface_images_.erase(image);
     ++retired_surface_count;
@@ -25575,7 +25655,14 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
     bool temporal_jitter = false;
     NativeUploadAllocation allocation{};
   };
-  static thread_local FastSharedConstMemo s_fast_shared_memo{};
+  static thread_local std::array<FastSharedConstMemo, 32> s_fast_shared_memo_cache{};
+  const size_t fast_shared_slot =
+      (size_t((reinterpret_cast<uintptr_t>(command.pipeline_state.get()) >> 6) * 0x9E3779B97F4A7C15ull) ^
+       size_t((reinterpret_cast<uintptr_t>(command.fixed_function_state.get()) >> 6) * 0xBF58476D1CE4E5B9ull) ^
+       size_t(command.texture_inputs_signature) ^
+       size_t(vertex_booleans) ^ (size_t(pixel_booleans) << 16)) &
+      (s_fast_shared_memo_cache.size() - 1);
+  FastSharedConstMemo& s_fast_shared_memo = s_fast_shared_memo_cache[fast_shared_slot];
 
   const StateVersionStamp boolean_ver =
       command.shader_state->versions.Get(DirtyStateComponent::kBooleanConstants);
@@ -29560,6 +29647,26 @@ bool Gta4NativeGraphicsSystem::RecordDepthResolveConversion(
   return true;
 }
 
+void Gta4NativeGraphicsSystem::UpsertPlacementOwner(
+    NativeSurfaceImage& surface, const GuestPlacementKey& key,
+    const NativePlacementOwner& owner) {
+  const size_t cache_slot =
+      GuestPlacementKeyHash{}(key) & (placement_owner_fast_cache_.size() - 1);
+  if (surface.cached_owner_slot && surface.cached_owner_map_epoch == placement_owners_epoch_ &&
+      surface.cached_owner_key == key) [[likely]] {
+    *surface.cached_owner_slot = owner;
+    placement_owner_fast_cache_[cache_slot] = {placement_owners_epoch_, key,
+                                               surface.cached_owner_slot};
+    return;
+  }
+  NativePlacementOwner& slot = native_placement_owners_[key];
+  slot = owner;
+  surface.cached_owner_key = key;
+  surface.cached_owner_slot = &slot;
+  surface.cached_owner_map_epoch = placement_owners_epoch_;
+  placement_owner_fast_cache_[cache_slot] = {placement_owners_epoch_, key, &slot};
+}
+
 const Gta4NativeGraphicsSystem::NativePlacementOwner* Gta4NativeGraphicsSystem::FindPlacementOwner(
     const SurfaceDescriptor& descriptor, bool depth) const {
   if (FindNativeReflectionSurface(reflection_resources_, descriptor, depth)) {
@@ -29570,13 +29677,25 @@ const Gta4NativeGraphicsSystem::NativePlacementOwner* Gta4NativeGraphicsSystem::
     return nullptr;
   }
   const GuestPlacementKey key = GetGuestPlacementKey(view);
-  const auto owner = native_placement_owners_.find(key);
-  if (owner == native_placement_owners_.end() || !owner->second.image ||
-      owner->second.image->materialized_serial != owner->second.serial ||
-      owner->second.image->materialized_placement != key) {
+  const size_t cache_slot =
+      GuestPlacementKeyHash{}(key) & (placement_owner_fast_cache_.size() - 1);
+  const NativePlacementOwner* found_owner = nullptr;
+  auto& cached = placement_owner_fast_cache_[cache_slot];
+  if (cached.epoch == placement_owners_epoch_ && cached.key == key) [[likely]] {
+    found_owner = cached.slot;
+  } else {
+    const auto owner = native_placement_owners_.find(key);
+    if (owner != native_placement_owners_.end()) {
+      found_owner = &owner->second;
+      cached = {placement_owners_epoch_, key, found_owner};
+    }
+  }
+  if (!found_owner || !found_owner->image ||
+      found_owner->image->materialized_serial != found_owner->serial ||
+      found_owner->image->materialized_placement != key) {
     return nullptr;
   }
-  return &owner->second;
+  return found_owner;
 }
 
 bool Gta4NativeGraphicsSystem::HasCurrentPlacementContent(const NativeSurfaceImage& surface,
@@ -29647,8 +29766,8 @@ void Gta4NativeGraphicsSystem::ClaimSurfaceContent(NativeSurfaceImage& surface,
   const GuestPlacementKey key = GetGuestPlacementKey(view);
   surface.materialized_placement = key;
   surface.materialized_serial = serial;
-  native_placement_owners_[key] = {
-      &surface, view, serial, submitted_frame, diagnostic_command_index_, render_phase, write_kind};
+  UpsertPlacementOwner(surface, key, {
+      &surface, view, serial, submitted_frame, diagnostic_command_index_, render_phase, write_kind});
   if (NativeRendererEventTraceEnabled()) {
   TraceNativeRendererEvent(
       "placement-owner-claimed",
@@ -29734,9 +29853,9 @@ bool Gta4NativeGraphicsSystem::RecordSurfaceMaterialization(
                                      source->aspect_content.color.writer_serial);
     destination.materialized_placement = GetGuestPlacementKey(destination_view);
     destination.materialized_serial = owner.serial;
-    native_placement_owners_[destination.materialized_placement] = {
+    UpsertPlacementOwner(destination, destination.materialized_placement, {
         &destination,        destination_view,   owner.serial,    owner.frame,
-        owner.command_index, owner.render_phase, owner.write_kind};
+        owner.command_index, owner.render_phase, owner.write_kind});
     return true;
   }
 
@@ -29867,9 +29986,9 @@ bool Gta4NativeGraphicsSystem::RecordSurfaceMaterialization(
                                    source->aspect_content.color.writer_serial);
   destination.materialized_placement = GetGuestPlacementKey(destination_view);
   destination.materialized_serial = owner.serial;
-  native_placement_owners_[destination.materialized_placement] = {
+  UpsertPlacementOwner(destination, destination.materialized_placement, {
       &destination,        destination_view,   owner.serial,    owner.frame,
-      owner.command_index, owner.render_phase, owner.write_kind};
+      owner.command_index, owner.render_phase, owner.write_kind});
   if (NativeRendererEventTraceEnabled()) {
   TraceNativeRendererEvent(
       "placement-view-materialized",
@@ -41528,6 +41647,7 @@ void Gta4NativeGraphicsSystem::DestroyNativeRendererObjects() {
   surface_images_by_handle_.clear();
   pending_surface_release_ids_.clear();
   native_placement_owners_.clear();
+  InvalidatePlacementOwnersCache();
   next_surface_write_serial_ = 1;
   next_reflection_capture_epoch_ = 1;
   reflection_resources_.clear();
