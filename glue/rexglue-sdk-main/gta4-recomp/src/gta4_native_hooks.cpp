@@ -4325,8 +4325,12 @@ void InitializeNativeCommandScratch(uint8_t* base, uint32_t device) {
 NativeDirtyState ConsumeNativeDrawDirtyState(uint8_t* base, uint32_t device) {
   NativeDirtyState dirty_state{};
   for (uint32_t index = 0; index < dirty_state.words.size(); ++index) {
-    dirty_state.words[index] = LoadU64(base, device + index * sizeof(uint64_t));
-    StoreU64(base, device + index * sizeof(uint64_t), 0);
+    const uint32_t offset = device + index * sizeof(uint64_t);
+    const uint64_t val = LoadU64(base, offset);
+    dirty_state.words[index] = val;
+    if (val != 0) {
+      StoreU64(base, offset, 0);
+    }
   }
   return dirty_state;
 }

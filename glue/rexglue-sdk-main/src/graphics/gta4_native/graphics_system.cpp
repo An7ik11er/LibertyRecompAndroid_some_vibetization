@@ -5901,18 +5901,6 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
   const uint32_t fast_slot_idx = (handle >> 2) & kBufferCaptureFastTableMask;
   auto& fast_entry = buffer_capture_fast_table_[fast_slot_idx];
 
-  // Intra-frame direct O(1) hit: identical handle in same frame without touching guest DRAM
-  if (current_serial) [[likely]] {
-    if (fast_entry.handle == handle && fast_entry.epoch == cache_epoch &&
-        fast_entry.alias_serial == current_serial && fast_entry.alias) [[likely]] {
-      const uint32_t frame = g_native_memory_profile_event_frame.load(std::memory_order_relaxed);
-      if (fast_entry.alias->last_used_frame.load(std::memory_order_relaxed) != frame) {
-        fast_entry.alias->last_used_frame.store(frame, std::memory_order_relaxed);
-      }
-      return AliasCaptured(fast_entry.alias);
-    }
-  }
-
   auto reject = [handle](const char* reason, uint32_t flags, uint32_t data_address,
                          uint32_t data_size) {
     static std::atomic<uint64_t> rejection_count{0};
@@ -5964,25 +5952,14 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
   };
   if (current_serial && !metadata->guest_locked) [[likely]] {
     if (fast_entry.handle == handle && fast_entry.epoch == cache_epoch &&
-        fast_entry.alias && fast_entry.flags == flags &&
-        fast_entry.address == data_address && fast_entry.size == data_size) [[likely]] {
-      if (fast_entry.alias_serial == current_serial) [[likely]] {
-        const uint32_t frame = g_native_memory_profile_event_frame.load(std::memory_order_relaxed);
-        if (fast_entry.alias->last_used_frame.load(std::memory_order_relaxed) != frame) {
-          fast_entry.alias->last_used_frame.store(frame, std::memory_order_relaxed);
-        }
-        return AliasCaptured(fast_entry.alias);
+        fast_entry.alias_serial == current_serial && fast_entry.alias &&
+        fast_entry.flags == flags && fast_entry.address == data_address &&
+        fast_entry.size == data_size) [[likely]] {
+      const uint32_t frame = g_native_memory_profile_event_frame.load(std::memory_order_relaxed);
+      if (fast_entry.alias->last_used_frame.load(std::memory_order_relaxed) != frame) {
+        fast_entry.alias->last_used_frame.store(frame, std::memory_order_relaxed);
       }
-      // Cross-frame sentinel verification:
-      const uint8_t* fast_data = memory_->TranslateVirtual<const uint8_t*>(data_address);
-      if (fast_data && (data_size < 40 || FastBufferSentinel5(fast_data, data_size) == fast_entry.sentinel_5)) {
-        fast_entry.alias_serial = current_serial;
-        const uint32_t frame = g_native_memory_profile_event_frame.load(std::memory_order_relaxed);
-        if (fast_entry.alias->last_used_frame.load(std::memory_order_relaxed) != frame) {
-          fast_entry.alias->last_used_frame.store(frame, std::memory_order_relaxed);
-        }
-        return AliasCaptured(fast_entry.alias);
-      }
+      return AliasCaptured(fast_entry.alias);
     }
   }
 
@@ -25239,59 +25216,6 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
       command.shader_state->pixel_constants->byte_size != kPixelConstantsSize) {
     return false;
   }
-#if 0
-// ===== FAST PATH (более надёжный) =====
-static thread_local VkPipeline      fast_pipeline   = VK_NULL_HANDLE;
-static thread_local const void*     fast_vc         = nullptr;
-static thread_local const void*     fast_pc         = nullptr;
-static thread_local uint64_t        fast_textures   = 0;
-static thread_local uint64_t        fast_ff         = 0;
-static thread_local VkCommandBuffer fast_cb         = VK_NULL_HANDLE;
-static thread_local uint64_t        fast_frame      = ~0ull;
-static thread_local bool            fast_valid      = false;
-
-const uint64_t current_frame = diagnostic_submitted_frame_;
-const bool same_frame = (fast_frame == current_frame);
-const bool same_cb    = (fast_cb == command_buffer);
-
-// Разрешаем fast-path только если:
-// 1. Тот же кадр
-// 2. Тот же command buffer
-// 3. Все ключевые указатели/сигнатуры совпадают
-// 4. Кэш уже был один раз прогрет в этом кадре+CB
-if (fast_valid &&
-    same_frame &&
-    same_cb &&
-    fast_pipeline == pipeline &&
-    fast_vc == command.shader_state->vertex_constants.get() &&
-    fast_pc == command.shader_state->pixel_constants.get() &&
-    fast_textures == command.texture_inputs_signature &&
-    fast_ff == command.pipeline_memo_signature)
-{
-  // Поддерживаем метрики кольцевого буфера
-  if (command.worker_vertex_constants_offset &&
-      command.worker_pixel_constants_offset &&
-      command.worker_ring_serial == recording_ring_serial_ &&
-      !target.temporal_shader &&
-      worker_ring_valid_.load(std::memory_order_acquire) &&
-      worker_constant_ring_.buffer)
-  {
-    if (REXCVAR_GET(gta4_native_debug_counters)) g_worker_ring_draws.fetch_add(1, std::memory_order_relaxed);
-  }
-  return true;   // безопасно пропускаем тяжёлую работу
-}
-
-// Обычный (медленный) путь — обновляем кэш
-fast_pipeline  = pipeline;
-fast_vc        = command.shader_state->vertex_constants.get();
-fast_pc        = command.shader_state->pixel_constants.get();
-fast_textures  = command.texture_inputs_signature;
-fast_ff        = command.pipeline_memo_signature;
-fast_cb        = command_buffer;
-fast_frame     = current_frame;
-fast_valid     = true;
-// ===== КОНЕЦ FAST PATH =====
-#endif
   const NativeFixedFunctionState& fixed = *command.fixed_function_state;
   const float requested_viewport_x = std::bit_cast<float>(fixed.viewport_bits[0]);
   const float requested_viewport_y = std::bit_cast<float>(fixed.viewport_bits[1]);
@@ -25507,7 +25431,56 @@ fast_valid     = true;
   }
   auto* vulkan_provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
   const auto* vulkan_device = vulkan_provider->vulkan_device();
+
+  struct FastSharedConstMemo {
+    uint64_t frame = ~0ull;
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    const NativeFixedFunctionState* fixed_state = nullptr;
+    const NativePipelineState* pipe_state = nullptr;
+    const EnvironmentalDataV2* env_data = nullptr;
+    uint32_t descriptor_page = UINT32_MAX, descriptor_copy = UINT32_MAX;
+    uint32_t vertex_booleans = 0, pixel_booleans = 0;
+    StateVersionStamp boolean_version{};
+    uint64_t texture_inputs_sig = 0;
+    uint32_t width = 0, height = 0, logical_width = 0, logical_height = 0, samples = 0;
+    uint32_t color_mask = 0;
+    uint32_t color_output_info_0 = 0;
+    uint8_t temporal_mode = 0, split_postfx = 0;
+    bool is_reflection = false;
+    NativeUploadAllocation allocation{};
+  };
+  static thread_local FastSharedConstMemo s_fast_shared_memo{};
+
+  const StateVersionStamp boolean_ver =
+      command.shader_state->versions.Get(DirtyStateComponent::kBooleanConstants);
+  const bool can_reuse_shared_allocation =
+      resources.has_last_shared_key &&
+      s_fast_shared_memo.frame              == diagnostic_submitted_frame_ &&
+      s_fast_shared_memo.cb                 == command_buffer &&
+      s_fast_shared_memo.pipe_state         == command.pipeline_state.get() &&
+      s_fast_shared_memo.fixed_state        == command.fixed_function_state.get() &&
+      s_fast_shared_memo.env_data           == command.environmental_data.get() &&
+      s_fast_shared_memo.texture_inputs_sig == command.texture_inputs_signature &&
+      s_fast_shared_memo.vertex_booleans    == vertex_booleans &&
+      s_fast_shared_memo.pixel_booleans     == pixel_booleans &&
+      s_fast_shared_memo.boolean_version    == boolean_ver &&
+      s_fast_shared_memo.descriptor_page    == command.descriptor_page &&
+      s_fast_shared_memo.descriptor_copy    == command.descriptor_copy &&
+      s_fast_shared_memo.width              == width &&
+      s_fast_shared_memo.height             == height &&
+      s_fast_shared_memo.logical_width      == logical_width &&
+      s_fast_shared_memo.logical_height     == logical_height &&
+      s_fast_shared_memo.samples            == uint32_t(samples) &&
+      s_fast_shared_memo.color_mask         == target.color_attachment_mask &&
+      s_fast_shared_memo.temporal_mode      == command.temporal_composite_mode &&
+      s_fast_shared_memo.split_postfx       == command.split_postfx_applied &&
+      s_fast_shared_memo.is_reflection      == target.is_reflection;
+
   NativeSharedConstantSemanticKey shared_key{};
+  if (can_reuse_shared_allocation) [[likely]] {
+    shared_constants_allocation = s_fast_shared_memo.allocation;
+    shared_key.color_output_info[0] = s_fast_shared_memo.color_output_info_0;
+  } else {
   shared_key.texture_descriptor_indices = command.texture_descriptor_indices;
   shared_key.sampler_descriptor_indices = command.sampler_descriptor_indices;
   shared_key.boolean_version =
@@ -25742,6 +25715,30 @@ fast_valid     = true;
     resources.has_last_shared_key = true;
     resources.last_shared_key = shared_key;
     resources.last_shared_allocation = shared_constants_allocation;
+  }
+
+  s_fast_shared_memo.frame              = diagnostic_submitted_frame_;
+  s_fast_shared_memo.cb                 = command_buffer;
+  s_fast_shared_memo.pipe_state         = command.pipeline_state.get();
+  s_fast_shared_memo.fixed_state        = command.fixed_function_state.get();
+  s_fast_shared_memo.env_data           = command.environmental_data.get();
+  s_fast_shared_memo.texture_inputs_sig = command.texture_inputs_signature;
+  s_fast_shared_memo.vertex_booleans    = vertex_booleans;
+  s_fast_shared_memo.pixel_booleans     = pixel_booleans;
+  s_fast_shared_memo.boolean_version    = boolean_ver;
+  s_fast_shared_memo.descriptor_page    = command.descriptor_page;
+  s_fast_shared_memo.descriptor_copy    = command.descriptor_copy;
+  s_fast_shared_memo.width              = width;
+  s_fast_shared_memo.height             = height;
+  s_fast_shared_memo.logical_width      = logical_width;
+  s_fast_shared_memo.logical_height     = logical_height;
+  s_fast_shared_memo.samples            = uint32_t(samples);
+  s_fast_shared_memo.color_mask         = target.color_attachment_mask;
+  s_fast_shared_memo.color_output_info_0= shared_key.color_output_info[0];
+  s_fast_shared_memo.temporal_mode      = command.temporal_composite_mode;
+  s_fast_shared_memo.split_postfx       = command.split_postfx_applied;
+  s_fast_shared_memo.is_reflection      = target.is_reflection;
+  s_fast_shared_memo.allocation         = shared_constants_allocation;
   }
 
   static const bool trace_glass_output = [] {
