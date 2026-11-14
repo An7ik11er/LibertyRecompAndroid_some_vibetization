@@ -21,6 +21,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 #include <fmt/format.h>
 #include <xxhash.h>
 
@@ -4695,7 +4699,50 @@ extern "C" void sub_828D4268(PPCContext& ctx, uint8_t* base) {
 }
 
 extern "C" void sub_828BD250(PPCContext& ctx, uint8_t* base) {
+#if defined(__aarch64__)
+  const uint32_t vp  = ctx.r3.u32;
+  const uint32_t mtx = ctx.r4.u32;
+
+  uint8_t* const vp_row0 = REX_RAW_ADDR(vp & ~0xFu);
+  uint8_t* const vp_row1 = REX_RAW_ADDR((vp + 16u) & ~0xFu);
+  uint8_t* const vp_row2 = REX_RAW_ADDR((vp + 32u) & ~0xFu);
+  uint8_t* const vp_row3 = REX_RAW_ADDR((vp + 48u) & ~0xFu);
+
+  const uint8x16_t r0_be = vld1q_u8(REX_RAW_ADDR(mtx & ~0xFu));
+  const uint8x16_t r1_be = vld1q_u8(REX_RAW_ADDR((mtx + 16u) & ~0xFu));
+  const uint8x16_t r2_be = vld1q_u8(REX_RAW_ADDR((mtx + 32u) & ~0xFu));
+  const uint8x16_t r3_be = vld1q_u8(REX_RAW_ADDR((mtx + 48u) & ~0xFu));
+
+  vst1q_u8(vp_row0, r0_be);
+  vst1q_u8(vp_row1, r1_be);
+  vst1q_u8(vp_row2, r2_be);
+  vst1q_u8(vp_row3, r3_be);
+
+  const uint8x16_t mask_and_be = vld1q_u8(REX_RAW_ADDR(0x831AB6F0u));
+  const uint8x16_t mask_or_be  = vld1q_u8(REX_RAW_ADDR(0x831AB6D0u));
+
+  const uint32_t vp_128 = vp + 128u;
+  vst1q_u8(REX_RAW_ADDR(vp_128 & ~0xFu),         vandq_u8(r0_be, mask_and_be));
+  vst1q_u8(REX_RAW_ADDR((vp_128 + 16u) & ~0xFu), vandq_u8(r1_be, mask_and_be));
+  vst1q_u8(REX_RAW_ADDR((vp_128 + 32u) & ~0xFu), vandq_u8(r2_be, mask_and_be));
+  vst1q_u8(REX_RAW_ADDR((vp_128 + 48u) & ~0xFu), vorrq_u8(mask_or_be, vandq_u8(r3_be, mask_and_be)));
+
+  ctx.r5.s64  = 32;
+  ctx.r6.s64  = 48;
+  ctx.r7.s64  = ctx.r3.s64 + 48;
+  ctx.r8.s64  = ctx.r3.s64 + 32;
+  ctx.r9.s64  = ctx.r3.s64 + 16;
+  ctx.r10.s64 = -2095382528LL - 18736LL;      // 0xFFFFFFFF831AB6D0
+  ctx.r11.s64 = ctx.r3.s64 + 128;
+
+  const uint64_t saved_lr = ctx.lr;
+  ctx.lr = 0x828BD2F8u;
+  sub_828BD1D8(ctx, base);
+  ctx.r12.u64 = saved_lr;
+  ctx.lr = saved_lr;
+#else
   __imp__sub_828BD250(ctx, base);
+#endif
 }
 
 extern "C" void sub_828E7000(PPCContext& ctx, uint8_t* base) {
@@ -4842,7 +4889,55 @@ extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
 }
 
 extern "C" void sub_828C8DB0(PPCContext& ctx, uint8_t* base) {
-  __imp__sub_828C8DB0(ctx, base);
+  const uint64_t saved_lr = ctx.lr;
+  const uint32_t r28_pass        = ctx.r3.u32;
+  const uint32_t r29_arg1        = ctx.r4.u32;
+  const uint32_t r31_shader_data = ctx.r5.u32;
+  const uint32_t r27_effect_ptr  = ctx.r6.u32;
+
+  ctx.r3.u64 = r29_arg1;
+  ctx.lr = 0x828C8DD4u;
+  sub_828DFF00(ctx, base);
+
+  const uint16_t count = REX_LOAD_U16(r28_pass + 8u);
+  if (count > 0u) {
+    // Invariants hoisted outside loop
+    const uint32_t pair_table   = REX_LOAD_U32(r28_pass + 4u);
+    const uint32_t type_table   = REX_LOAD_U32(r31_shader_data + 16u);
+    const uint32_t val_table    = REX_LOAD_U32(r31_shader_data);
+    const uint32_t effect_base  = REX_LOAD_U32(r27_effect_ptr);
+
+    uint32_t r30_offset = 0u;
+    uint32_t r26_rem = count;
+    do {
+      const uint32_t entry = pair_table + r30_offset;
+      const uint8_t idx0 = REX_LOAD_U8(entry);
+      const uint8_t is_const = REX_LOAD_U8(type_table + idx0);
+
+      ctx.r3.u64 = r29_arg1;
+      if (is_const == 0u) {
+        const uint8_t stage = REX_LOAD_U8(entry + 1u);
+        const uint32_t desc = effect_base + ((static_cast<uint32_t>(idx0) * 3u) << 4);
+        ctx.r4.u64 = stage;
+        ctx.r5.u64 = REX_LOAD_U32(val_table + (static_cast<uint32_t>(idx0) << 2));
+        ctx.r6.u64 = (static_cast<uint32_t>(REX_LOAD_U8(desc + 2u)) >> 1) & 0x7FFFFFFFu;
+        ctx.r7.u64 = REX_LOAD_U32(desc + 24u);
+        ctx.lr = 0x828C8E3Cu;
+        sub_828E01B8(ctx, base);
+      } else {
+        ctx.r4.u64 = REX_LOAD_U8(entry + 1u);
+        ctx.r6.u64 = is_const;
+        ctx.r5.u64 = REX_LOAD_U32(val_table + (static_cast<uint32_t>(idx0) << 2));
+        ctx.lr = 0x828C8E64u;
+        sub_828E0348(ctx, base);
+      }
+      --r26_rem;
+      r30_offset += 2u;
+    } while (r26_rem != 0u);
+  }
+
+  ctx.r12.u64 = saved_lr;
+  ctx.lr = saved_lr;
 }
 
 extern "C" void sub_828C8E80(PPCContext& ctx, uint8_t* base) {
@@ -4850,9 +4945,13 @@ extern "C" void sub_828C8E80(PPCContext& ctx, uint8_t* base) {
 }
 
 extern "C" void sub_828C8F38(PPCContext& ctx, uint8_t* base) {
-  FireMaterialPass(ctx, base, false);
+  if (g_fire_context.occurrence) {
+    FireMaterialPass(ctx, base, false);
+  }
   __imp__sub_828C8F38(ctx, base);
-  FireMaterialPass(ctx, base, true);
+  if (g_fire_context.occurrence) {
+    FireMaterialPass(ctx, base, true);
+  }
 }
 
 extern "C" void sub_828DFF00(PPCContext& ctx, uint8_t* base) {

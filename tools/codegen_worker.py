@@ -228,8 +228,7 @@ def find_function_in_files(func_name: str, search_dir: str = GENERATED_DIR) -> d
             i += 1
 
         if end_pos != -1:
-            line_no = content[:start_pos].count('
-') + 1
+            line_no = content[:start_pos].count('\n') + 1
             func_code = content[start_pos:end_pos].strip()
             return {
                 "func_name": func_name,
@@ -287,9 +286,7 @@ def build_callgraph_context(extracted_data: list) -> str:
             c_label_str = f" ({c_label})" if c_label else ""
             lines.append(f"  * calls `{callee}`{c_label_str}{audio_warn}")
 
-    return "
-".join(lines) + "
-"
+    return "\n".join(lines) + "\n"
 
 
 def get_api_key() -> str:
@@ -354,8 +351,7 @@ def verify_cpp_code(code: str, expected_funcs: list, extracted_data: list = None
         next_c = code[i + 1] if i + 1 < length else ''
 
         if in_line_comment:
-            if c == '
-':
+            if c == '\n':
                 in_line_comment = False
         elif in_block_comment:
             if c == '*' and next_c == '/':
@@ -364,14 +360,14 @@ def verify_cpp_code(code: str, expected_funcs: list, extracted_data: list = None
         elif in_string:
             if escape:
                 escape = False
-            elif c == '\':
+            elif c == '\\':
                 escape = True
             elif c == '"':
                 in_string = False
         elif in_char:
             if escape:
                 escape = False
-            elif c == '\':
+            elif c == '\\':
                 escape = True
             elif c == "'":
                 in_char = False
@@ -408,7 +404,7 @@ def verify_cpp_code(code: str, expected_funcs: list, extracted_data: list = None
                 missing_funcs.append(fn)
 
     if missing_funcs:
-        return False, f"Missing expected function signature `extern "C" void <fn>(PPCContext& ctx, uint8_t* base)` for: {', '.join(missing_funcs)}"
+        return False, f"Missing expected function signature `extern \\\"C\\\" void <fn>(PPCContext& ctx, uint8_t* base)` for: {', '.join(missing_funcs)}"
 
     if "REX_FUNC_PROLOGUE" not in code:
         return False, "Missing `REX_FUNC_PROLOGUE();` at the start of hooked function(s)."
@@ -471,16 +467,9 @@ def main():
     callgraph_context = build_callgraph_context(extracted_data)
 
     if args.extract_only:
-        header = f"// Extracted Recompiled Functions
-/*
-{callgraph_context}*/
-
-"
-        full_text = header + "
-
-".join(
-            [f"// --- {d['func_name']} ({os.path.basename(d['file'])}:{d['line']}) ---
-" + d['code'] for d in extracted_data]
+        header = f"// Extracted Recompiled Functions\n/*\n{callgraph_context}*/\n\n"
+        full_text = header + "\n\n".join(
+            [f"// --- {d['func_name']} ({os.path.basename(d['file'])}:{d['line']}) ---\n" + d['code'] for d in extracted_data]
         )
         if args.out:
             os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
@@ -516,38 +505,29 @@ def main():
 
     prompt_parts = [callgraph_context]
     if args.spec:
-        prompt_parts.append(f"### Specific Optimization Requirements:
-{args.spec}
-")
+        prompt_parts.append(f"### Specific Optimization Requirements:\n{args.spec}\n")
 
     prompt_parts.append("### Target Functions:")
     for d in extracted_data:
-        prompt_parts.append(f"
-// From {os.path.basename(d['file'])}:{d['line']}:
-{d['code']}
-")
+        prompt_parts.append(f"\n// From {os.path.basename(d['file'])}:{d['line']}:\n{d['code']}\n")
 
     if args.mode == "inspect":
         prompt_parts.append(
-            "
-Provide the structured reverse-engineering inspection report for the function(s) above. "
+            "\nProvide the structured reverse-engineering inspection report for the function(s) above. "
             "Be concise, exact with hex offsets, and highlight D3D9 calls vs RAGE logic."
         )
     elif args.mode == "vulkan-direct":
         prompt_parts.append(
-            "
-Generate drop-in replacement C++20 hooks implementing Rule 10 (bypass D3D9 wrapper overhead, "
+            "\nGenerate drop-in replacement C++20 hooks implementing Rule 10 (bypass D3D9 wrapper overhead, "
             "coalesce state updates, optimize with ARM64 NEON, and preserve PPCContext ABI & stack restoration)."
         )
     else:
         prompt_parts.append(
-            "
-Generate drop-in replacement C++20 hooks for the above function(s). "
+            "\nGenerate drop-in replacement C++20 hooks for the above function(s). "
             "Preserve stack restoration, follow PPCContext ABI, and write clean high-performance code."
         )
 
-    user_prompt = "
-".join(prompt_parts)
+    user_prompt = "\n\n".join(prompt_parts)
     messages = [
         {"role": "system", "content": sys_prompt},
         {"role": "user", "content": user_prompt},
@@ -573,11 +553,7 @@ Generate drop-in replacement C++20 hooks for the above function(s). "
             sys.exit(1)
 
         report = re.sub(r'<think>[\s\S]*?</think>', '', raw_reply).strip()
-        output_text = f"# Inspection Report: {', '.join(func_list)}
-
-{callgraph_context}
-{report}
-"
+        output_text = f"# Inspection Report: {', '.join(func_list)}\n\n{callgraph_context}\n{report}\n"
         if args.out:
             out_path = os.path.abspath(args.out)
             os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -585,8 +561,7 @@ Generate drop-in replacement C++20 hooks for the above function(s). "
                 f.write(output_text)
             print(f"[+] Inspection report written to {out_path}")
         else:
-            print("
-" + output_text)
+            print("\n" + output_text)
         return
 
     # Mode: hook or vulkan-direct (with self-repair loop)
@@ -618,16 +593,11 @@ Generate drop-in replacement C++20 hooks for the above function(s). "
         print(f"[!] Validation failed on attempt {attempt + 1}/{args.retries + 1}: {msg}", file=sys.stderr)
         if attempt < args.retries:
             print("[*] Requesting automatic self-repair from model...")
-            messages.append({"role": "assistant", "content": f"```cpp
-{cleaned_code}
-```"})
+            messages.append({"role": "assistant", "content": f"```cpp\n{cleaned_code}\n```"})
             messages.append({
                 "role": "user",
                 "content": (
-                    f"Your generated C++ code failed verification with the following error:
-{msg}
-
-"
+                    f"Your generated C++ code failed verification with the following error:\n{msg}\n\n"
                     f"Fix the issue and return the COMPLETE corrected C++ code block for: {', '.join(func_list)}."
                 ),
             })
@@ -649,8 +619,7 @@ Generate drop-in replacement C++20 hooks for the above function(s). "
 #endif
 
 """
-    final_output = out_banner + cleaned_code + "
-"
+    final_output = out_banner + cleaned_code + "\n"
 
     if args.out:
         out_path = os.path.abspath(args.out)
@@ -659,8 +628,7 @@ Generate drop-in replacement C++20 hooks for the above function(s). "
             f.write(final_output)
         print(f"[+] Successfully wrote {len(final_output)} bytes to {out_path}")
     else:
-        print("
-" + final_output)
+        print("\n" + final_output)
 
 
 if __name__ == "__main__":
