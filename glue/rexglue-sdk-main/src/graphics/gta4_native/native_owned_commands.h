@@ -43,16 +43,19 @@ class NativeCommandPool {
     // malloc). Only the pool makes Deleters, always for its FixedResource.
     void operator()(T* value) const noexcept {
       if (!value) return;
+      auto* slot = reinterpret_cast<Slot*>(value);
       if constexpr (requires(T& recyclable) { recyclable.RecycleInPlace(); }) {
         auto* fixed = static_cast<FixedResource*>(resource);
         if (fixed->recycle.load(std::memory_order_relaxed)) {
           value->RecycleInPlace();
-          fixed->ReturnRecycled(reinterpret_cast<Slot*>(value));
+          slot->constructed = true;
+          fixed->ReleaseSlots(slot->slab, 1);
           return;
         }
       }
       std::destroy_at(value);
-      resource->deallocate(value, sizeof(T), alignof(T));
+      slot->constructed = false;
+      static_cast<FixedResource*>(resource)->ReleaseSlots(slot->slab, 1);
     }
   };
   using Owner = std::unique_ptr<T, Deleter>;
@@ -105,10 +108,11 @@ class NativeCommandPool {
   static constexpr size_t kReturnChunk = 256;
   template <typename Owners>
   void RetireBatch(Owners& owners) noexcept {
-    Slot* first = nullptr;
-    Slot* last = nullptr;
-    size_t count = 0;
+    Slab* batch_slab = nullptr;
+    size_t batch_count = 0;
     const size_t total = owners.size();
+    const bool should_recycle =
+        kRecyclable && resource_.recycle.load(std::memory_order_relaxed);
     for (size_t index = 0; index < total; ++index) {
       if constexpr (requires(const T& value) {
                       value.PrefetchForRecycle();
@@ -126,97 +130,97 @@ class NativeCommandPool {
       T* object = owner.release();
       auto* slot = reinterpret_cast<Slot*>(object);
       if constexpr (kRecyclable) {
-        if (resource_.recycle.load(std::memory_order_relaxed)) {
+        if (should_recycle) {
           object->RecycleInPlace();
           slot->constructed = true;
         } else {
           std::destroy_at(object);
+          slot->constructed = false;
         }
       } else {
         std::destroy_at(object);
+        slot->constructed = false;
       }
-      slot->next = first;
-      first = slot;
-      if (!last) last = slot;
-      if (++count == kReturnChunk) {
-        resource_.ReturnList(first, last, count);
-        first = last = nullptr;
-        count = 0;
+      Slab* slot_slab = slot->slab;
+      if (slot_slab == batch_slab) {
+        ++batch_count;
+      } else {
+        if (batch_slab) {
+          resource_.ReleaseSlots(batch_slab, batch_count);
+        }
+        batch_slab = slot_slab;
+        batch_count = 1;
       }
     }
-    if (first) resource_.ReturnList(first, last, count);
+    if (batch_slab) resource_.ReleaseSlots(batch_slab, batch_count);
     owners.clear();
   }
 
  private:
+  struct Slab;
   struct Slot {
     alignas(T) std::byte storage[sizeof(T)];
-    Slot* next = nullptr;
+    Slab* slab = nullptr;
     bool constructed = false;  // storage holds a recycled, default-state T.
   };
   static_assert(std::is_standard_layout_v<Slot> && offsetof(Slot, storage) == 0);
   struct Slab {
-    Slab* next = nullptr;
-    Slot slots[kSlotsPerSlab];
+    Slab* next_all = nullptr;
+    Slab* next_free = nullptr;
+    alignas(64) std::atomic<size_t> remaining_retires{0};
+    alignas(64) Slot slots[kSlotsPerSlab];
   };
   class FixedResource final : public std::pmr::memory_resource {
    public:
     ~FixedResource() override {
-      // Recycled objects still own (empty but allocated) buffers.
-      for (Slot* slot : local_)
-        if (slot->constructed) std::destroy_at(std::launder(reinterpret_cast<T*>(slot->storage)));
-      for (Slot* slot : free_)
-        if (slot->constructed) std::destroy_at(std::launder(reinterpret_cast<T*>(slot->storage)));
-      live_ -= local_.size();  // Taken by the allocator cache, never handed out.
       // Destruction occurs after the render worker has joined and owners drain.
-      assert(live_ == 0);
       for (Slab* slab = slabs_; slab;) {
-        Slab* next = slab->next;
+        const size_t expected_remaining =
+            (slab == active_slab_) ? (kSlotsPerSlab - cursor_) : 0;
+        assert(slab->remaining_retires.load(std::memory_order_relaxed) == expected_remaining);
+        for (Slot& slot : slab->slots) {
+          if (slot.constructed) {
+            std::destroy_at(std::launder(reinterpret_cast<T*>(slot.storage)));
+          }
+        }
+        Slab* next = slab->next_all;
         delete slab;
         slab = next;
       }
     }
-    // The retiring thread just wrote these links, so walking them here is
-    // cache-hot; the allocator then never reads cold slot memory.
-    void ReturnList(Slot* first, Slot* last, size_t count) {
-      (void)last;
-      std::lock_guard lock(mutex_);
-      assert(count <= live_);
-      free_.reserve(free_.size() + count);
-      for (Slot* slot = first; slot; slot = slot->next) free_.push_back(slot);
-      live_ -= count;
-    }
-    // 33: one recycled slot from a single dropped owner (Deleter).
-    void ReturnRecycled(Slot* slot) {
-      slot->constructed = true;  // published to the allocator by mutex_
-      std::lock_guard lock(mutex_);
-      assert(live_ != 0);
-      free_.push_back(slot);
-      --live_;
+    // Bulk slab-level retirement: one atomic fetch_sub per contiguous slab run
+    // (typically all 64 commands) instead of per-slot intrusive linking + vector push.
+    void ReleaseSlots(Slab* slab, size_t count) noexcept {
+      const size_t prev = slab->remaining_retires.fetch_sub(count, std::memory_order_acq_rel);
+      assert(prev >= count);
+      if (prev == count) {
+        ReturnFreeSlab(slab);
+      }
     }
     std::atomic<bool> recycle{true};  // SetRecycling
     Statistics GetStatistics() const {
       std::lock_guard lock(mutex_);
-      return {slab_count_, live_, slab_count_ * kSlotsPerSlab - live_,
+      const size_t free_slots = free_slab_count_ * kSlotsPerSlab;
+      const size_t total_slots = slab_count_ * kSlotsPerSlab;
+      return {slab_count_, total_slots - free_slots, free_slots,
               slab_count_ * sizeof(Slab)};
     }
     void* AllocateSlot() {
       // Allocation is single-threaded (the producer holds its capture mutex),
-      // while slots return from the retirement thread. Keep the hot local_ pop
-      // non-virtual so Make() inlines without going through memory_resource.
-      if (local_.empty()) [[unlikely]] {
-        RefillLocal();
+      // while slabs return from the retirement thread once all 64 slots retire.
+      // Fast path is a single sequential pointer/index bump within active_slab_.
+      if (!active_slab_) [[unlikely]] {
+        AcquireSlab();
       }
-      Slot* slot = local_.back();
-      local_.pop_back();
-      if (!local_.empty()) [[likely]] {
-        const auto* next = reinterpret_cast<const char*>(local_.back());
+      Slot* slot = &active_slab_->slots[cursor_++];
+      if (cursor_ < kSlotsPerSlab) [[likely]] {
+        const auto* next = reinterpret_cast<const char*>(&active_slab_->slots[cursor_]);
         // 48: a command type that knows which lines the producer writes says so.
         if constexpr (requires { T::PrefetchForAcquire(static_cast<const void*>(next)); }) {
           T::PrefetchForAcquire(next);
           // 48.1: Make() reads and writes slot->constructed right away; that line
           // was last written by the retirer (Little).
-          __builtin_prefetch(next + offsetof(Slot, next), 1);
+          __builtin_prefetch(next + offsetof(Slot, slab), 1);
         } else {
           for (size_t offset = 0; offset < 256 && offset < sizeof(Slot); offset += 64)
             __builtin_prefetch(next + offset, 1);
@@ -225,23 +229,45 @@ class NativeCommandPool {
               __builtin_prefetch(next + offset, 1);
           }
         }
+      } else [[unlikely]] {
+        // Detach active_slab_ before handing out its final slot so ReleaseSlots()
+        // never returns a slab that is still active_slab_.
+        active_slab_ = nullptr;
+        cursor_ = 0;
       }
       return static_cast<void*>(slot->storage);
     }
    private:
-    void RefillLocal() {
+    void ReturnFreeSlab(Slab* slab) noexcept {
       std::lock_guard lock(mutex_);
-      if (free_.empty()) {
-        // Nothing changes until allocation succeeds. Empty storage is not a T.
-        Slab* slab = new Slab;
-        slab->next = slabs_;
+      slab->next_free = free_slabs_;
+      free_slabs_ = slab;
+      ++free_slab_count_;
+    }
+    void AcquireSlab() {
+      Slab* slab = nullptr;
+      {
+        std::lock_guard lock(mutex_);
+        if (free_slabs_) {
+          slab = free_slabs_;
+          free_slabs_ = slab->next_free;
+          slab->next_free = nullptr;
+          --free_slab_count_;
+        }
+      }
+      if (!slab) {
+        slab = new Slab;
+        for (Slot& slot : slab->slots) {
+          slot.slab = slab;
+        }
+        std::lock_guard lock(mutex_);
+        slab->next_all = slabs_;
         slabs_ = slab;
         ++slab_count_;
-        free_.reserve(free_.size() + kSlotsPerSlab);
-        for (Slot& slot : slab->slots) free_.push_back(&slot);
       }
-      local_.swap(free_);
-      live_ += local_.size();  // Counted as live while cached; never returned uncached.
+      slab->remaining_retires.store(kSlotsPerSlab, std::memory_order_release);
+      active_slab_ = slab;
+      cursor_ = 0;
     }
     void* do_allocate(size_t bytes, size_t alignment) override {
       if (bytes != sizeof(T) || alignment != alignof(T)) throw std::bad_alloc();
@@ -253,23 +279,19 @@ class NativeCommandPool {
       (void)alignment;
       // storage is the first member; retiring a slot requires no owner search.
       auto* slot = reinterpret_cast<Slot*>(value);
-      std::lock_guard lock(mutex_);
-      assert(live_ != 0);
-      free_.push_back(slot);
-      --live_;
+      slot->constructed = false;
+      ReleaseSlots(slot->slab, 1);
     }
     bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
       return this == &other;
     }
-    // 29.10: the allocator (title thread, every command) and the retirer
-    // (ReturnList, every batch) no longer write the same cache line: local_ has
-    // its own line, the shared state another.
-    alignas(64) std::vector<Slot*> local_;  // Allocator-private free slots.
+    alignas(64) Slab* active_slab_ = nullptr;  // Allocator-private active bump slab.
+    size_t cursor_ = 0;
     alignas(64) mutable std::mutex mutex_;
-    std::vector<Slot*> free_;   // Shared, under mutex_.
+    Slab* free_slabs_ = nullptr;
+    size_t free_slab_count_ = 0;
     Slab* slabs_ = nullptr;
     size_t slab_count_ = 0;
-    size_t live_ = 0;
   };
   FixedResource resource_;
 };

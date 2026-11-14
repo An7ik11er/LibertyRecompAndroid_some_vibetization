@@ -13,6 +13,27 @@ namespace rex::graphics::gta4_native {
 template <size_t DescriptorSetCount>
 class NativeDrawStateCache {
  public:
+  struct IndexedDescriptorKey {
+    uint64_t layout = 0;
+    uint32_t descriptor_page = 0;
+    uint32_t descriptor_copy = 0;
+    uint64_t image_descriptor_epoch = 0;
+    uint32_t active_frame_slot = 0;
+    bool operator==(const IndexedDescriptorKey&) const = default;
+  };
+  struct DynamicDrawKey {
+    const void* fixed_state = nullptr;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t logical_width = 0;
+    uint32_t logical_height = 0;
+    uint32_t color_write_mask = 0;
+    uint32_t debug_gpu_attribution = 0;
+    uint64_t color_formats_lo = 0;
+    uint64_t color_formats_hi = 0;
+    bool operator==(const DynamicDrawKey&) const = default;
+  };
+
   void Reset() { *this = {}; }
 
   bool UpdatePipeline(uint64_t pipeline) {
@@ -27,12 +48,31 @@ class NativeDrawStateCache {
     stencil_ = {};
     blend_constants_ = {};
     push_constants_ = {};
+    dynamic_draw_ = {};
     return true;
+  }
+
+  bool HasMatchingIndexedDescriptors(const IndexedDescriptorKey& key) const noexcept {
+    return indexed_descriptors_.last && *indexed_descriptors_.last == key;
+  }
+  void RecordIndexedDescriptors(const IndexedDescriptorKey& key) noexcept {
+    indexed_descriptors_.last = key;
+  }
+
+  bool HasMatchingDynamicDraw(const DynamicDrawKey& key) const noexcept {
+    return dynamic_draw_.last && *dynamic_draw_.last == key;
+  }
+  void RecordDynamicDraw(const DynamicDrawKey& key) noexcept {
+    dynamic_draw_.last = key;
   }
 
   bool UpdateDescriptors(uint64_t layout,
                          const std::array<uint64_t, DescriptorSetCount>& sets) {
-    return descriptors_.Update({layout, sets});
+    if (!descriptors_.Update({layout, sets})) {
+      return false;
+    }
+    indexed_descriptors_ = {};
+    return true;
   }
   bool UpdateViewport(const std::array<uint32_t, 6>& bits) { return viewport_.Update(bits); }
   bool UpdateScissor(const std::array<int64_t, 4>& rectangle) {
@@ -81,6 +121,8 @@ class NativeDrawStateCache {
 
   Tracked<uint64_t> pipeline_;
   Tracked<LayoutValues<DescriptorSetCount>> descriptors_;
+  Tracked<IndexedDescriptorKey> indexed_descriptors_;
+  Tracked<DynamicDrawKey> dynamic_draw_;
   Tracked<std::array<uint32_t, 6>> viewport_;
   Tracked<std::array<int64_t, 4>> scissor_;
   Tracked<std::array<uint32_t, 3>> depth_bias_;

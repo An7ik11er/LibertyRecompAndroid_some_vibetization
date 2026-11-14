@@ -3001,6 +3001,22 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
       }
     }
   }
+  struct BufferL1MruEntry {
+    uint32_t handle = 0;
+    uint32_t alias_serial = 0;
+    uint32_t flags = 0;
+    uint32_t address = 0;
+    uint32_t size = 0;
+    uint32_t last_frame = 0;
+    // Batch 89: Non-owning raw pointer valid while capture_keepalive_serial_ == alias_serial
+    // and buffer_fast_table_clear_epoch_ == clear_epoch (guaranteed pinned in capture_keepalive_).
+    const NativeBufferResource* raw = nullptr;
+  };
+  static_assert(sizeof(BufferL1MruEntry) == 32);
+  static constexpr size_t kBufferCaptureL1TableSize = 128;
+  static constexpr uint32_t BufferL1TableIndex(uint32_t handle) noexcept {
+    return (handle * 0x9E3779B1u) >> (32 - 7);
+  }
   struct alignas(64) BufferMruEntry {
     uint32_t handle = 0;
     uint32_t alias_serial = 0;
@@ -3013,15 +3029,22 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     std::shared_ptr<const NativeBufferResource> strong_ref;
   };
   static_assert(sizeof(BufferMruEntry) == 64);
-  static constexpr size_t kBufferCaptureFastTableSize = 16384;
+  // Batch 89: 2-way associative L2 table (4096 sets x 2 ways = 8192 entries, 512 KB)
+  // eliminates 1-way direct-mapped hash ping-pong while halving footprint.
+  static constexpr size_t kBufferCaptureFastSetCount = 4096;
+  static constexpr size_t kBufferCaptureFastWays = 2;
+  static constexpr size_t kBufferCaptureFastTableSize =
+      kBufferCaptureFastSetCount * kBufferCaptureFastWays;
   static constexpr uint32_t kBufferCaptureFastTableMask = kBufferCaptureFastTableSize - 1;
-  static constexpr uint32_t BufferFastTableIndex(uint32_t handle) noexcept {
-    return (handle * 0x9E3779B1u) >> (32 - 14);
+  static constexpr uint32_t BufferFastSetBase(uint32_t handle) noexcept {
+    return ((handle * 0x9E3779B1u) >> (32 - 12)) * uint32_t(kBufferCaptureFastWays);
   }
+  std::array<BufferL1MruEntry, kBufferCaptureL1TableSize> buffer_capture_l1_table_{};  // command_capture_mutex_
   std::array<BufferMruEntry, kBufferCaptureFastTableSize> buffer_capture_fast_table_{};  // command_capture_mutex_
   std::atomic<uint64_t> buffer_resources_clear_epoch_{1};
   uint64_t buffer_fast_table_clear_epoch_ = 1;  // command_capture_mutex_
   size_t buffer_fast_sweep_cursor_ = 0;         // command_capture_mutex_
+  uint8_t buffer_fast_replace_rr_ = 0;          // command_capture_mutex_
 
 
   std::array<BufferCaptureCacheSlot, 8192> buffer_capture_cache_{};  // command_capture_mutex_
@@ -3030,11 +3053,18 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     return CaptureCacheWay(buffer_capture_cache_, handle);
   }
   void ForgetBufferCapture(uint32_t handle) {
-    auto& entry = buffer_capture_fast_table_[BufferFastTableIndex(handle)];
-    if (entry.handle == handle) {
-      entry.handle = 0;
-      entry.strong_ref.reset();
-      entry.alias_serial = 0;
+    auto& l1 = buffer_capture_l1_table_[BufferL1TableIndex(handle)];
+    if (l1.handle == handle) {
+      l1 = {};
+    }
+    const uint32_t base = BufferFastSetBase(handle);
+    for (size_t way = 0; way < kBufferCaptureFastWays; ++way) {
+      auto& entry = buffer_capture_fast_table_[base + way];
+      if (entry.handle == handle) {
+        entry.handle = 0;
+        entry.strong_ref.reset();
+        entry.alias_serial = 0;
+      }
     }
     ForgetCaptureCache(buffer_capture_cache_, handle);
   }
@@ -3357,6 +3387,8 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   };
   void CommitProducerConstantShadow(const NativeCommand& command);
   std::unordered_map<uint32_t, ProducerConstantShadow> producer_constant_shadows_;
+  uint32_t last_producer_constant_shadow_device_ = 0;
+  ProducerConstantShadow* last_producer_constant_shadow_ptr_ = nullptr;
   uint32_t producer_constant_commit_device_ = 0;
   bool producer_constant_commit_ = false;
   uint32_t producer_constant_resync_seen_ = 0;

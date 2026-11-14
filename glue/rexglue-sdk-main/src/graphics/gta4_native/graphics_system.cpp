@@ -4291,7 +4291,12 @@ bool Gta4NativeGraphicsSystem::CaptureTitleCommand(uint32_t abi_version, const v
   const uint64_t capture_begin = profile_transport ? profile::CpuTick() : 0;
   std::unique_lock capture_lock(command_capture_mutex_);
   const uint64_t capture_acquired = profile_transport ? profile::CpuTick() : 0;
+  CommandHeader fast_header{};
+  if (title_command_size >= sizeof(CommandHeader)) {
+    std::memcpy(&fast_header, title_command, sizeof(fast_header));
+  }
   if (!phone_envelope && !tv_envelope && !fire_envelope &&
+      fast_header.type != CommandType::kDrawIndexedPrimitive &&
       (!profile_transport || REXCVAR_GET(gta4_profile_native_real_stream)) &&
       REXCVAR_GET(gta4_native_coalesce_state_commands) &&
       CoalesceStateCommand(title_command, title_command_size)) {
@@ -4313,7 +4318,12 @@ bool Gta4NativeGraphicsSystem::CaptureTitleCommand(uint32_t abi_version, const v
     CommitProducerConstantShadow(native_command);
     producer_constant_commit_ = false;
   }
-  if (native_command.type == CommandType::kTemporalUpdate) {
+  if (native_command.type == CommandType::kDrawIndexedPrimitive) [[likely]] {
+    const uint32_t device = static_cast<const DrawIndexedPrimitiveCommand*>(title_command)->device;
+    if (auto instance = temporal_command_capture_.Capture(device)) {
+      native_command.temporal_instance = std::move(instance);
+    }
+  } else if (native_command.type == CommandType::kTemporalUpdate) {
     TemporalCommand temporal_command{};
     std::memcpy(&temporal_command, title_command, sizeof(temporal_command));
     temporal_command_capture_.Observe(temporal_command);
@@ -4322,8 +4332,7 @@ bool Gta4NativeGraphicsSystem::CaptureTitleCommand(uint32_t abi_version, const v
              native_command.type == CommandType::kDeviceDestroyed) {
     temporal_command_capture_.Reset();
   } else if (native_command.type == CommandType::kDrawPrimitive ||
-             native_command.type == CommandType::kDrawPrimitiveUp ||
-             native_command.type == CommandType::kDrawIndexedPrimitive) {
+             native_command.type == CommandType::kDrawPrimitiveUp) {
     // 48: a recycled command's slot is already empty (RetireResources); storing
     // a null pointer would only dirty a line the retirer owns.
     if (auto instance = temporal_command_capture_.Capture(
@@ -4337,8 +4346,6 @@ bool Gta4NativeGraphicsSystem::CaptureTitleCommand(uint32_t abi_version, const v
   if (tv_envelope) native_command.tv_trace = std::make_shared<TvTraceContext>(tv_context);
   if (fire_envelope) native_command.fire_trace = std::make_shared<FireTraceContext>(fire_context);
 
-  CommandHeader title_header{};
-  std::memcpy(&title_header, title_command, sizeof(title_header));
   // Batch asynchronous commands on the producer side; anything published
   // immediately publishes the batch first, keeping the queue order identical.
   constexpr size_t kStagedDrawBatch = 64;
@@ -4455,7 +4462,7 @@ bool Gta4NativeGraphicsSystem::CaptureTitleCommand(uint32_t abi_version, const v
           capture_acquired-capture_begin, queue_lock_end-queue_lock_begin, backpressure_end-queue_lock_end};
     }
     render_queue_.push_back(std::move(native_command_owner));
-    if (title_header.type == CommandType::kPresent) {
+    if (fast_header.type == CommandType::kPresent) {
       ++queued_title_presents_;
       ++diagnostic_producer_epoch_;
       InvalidateProducerTextureMemo();
@@ -4467,13 +4474,13 @@ bool Gta4NativeGraphicsSystem::CaptureTitleCommand(uint32_t abi_version, const v
   // capture lock — another submitter may capture meanwhile, as with the worker thread.
   if (direct_record_) {
     const std::thread::id self = std::this_thread::get_id();
-    if (title_header.type == CommandType::kPresent)
+    if (fast_header.type == CommandType::kPresent)
       direct_recorder_thread_.store(self, std::memory_order_relaxed);
     const std::thread::id recorder = direct_recorder_thread_.load(std::memory_order_relaxed);
     capture_lock.unlock();
     if (recorder == std::thread::id() || recorder == self) PumpDirectRecord();
   }
-  if (title_header.type == CommandType::kPresent &&
+  if (fast_header.type == CommandType::kPresent &&
       REXCVAR_GET(gta4_native_frame_complete_signal) == 2 &&
       title_command_size >= sizeof(PresentCommand)) {
     // Every byte the title wrote for this frame has been captured, so its
@@ -4840,15 +4847,27 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
 
   CommandHeader header;
   std::memcpy(&header, command, sizeof(header));
-  const size_t expected_size = CommandSize(header.type);
-  if (!expected_size || command_size != expected_size || header.size != expected_size ||
-      (header.type != CommandType::kRegisterShader && header.type != CommandType::kResourceUnlock &&
-       header.type != CommandType::kTextureLock &&
-       header.type != CommandType::kRegisterReflectionTarget &&
-       header.type != CommandType::kRegisterVirtualResource &&
-       header.type != CommandType::kReleaseResource && !CommandDevice(header.type, command))) {
-    return reject(header.type, "header-size-or-device");
+  const bool is_draw_indexed = header.type == CommandType::kDrawIndexedPrimitive;
+  uint32_t fast_device = 0;
+  if (is_draw_indexed) [[likely]] {
+    const auto& draw_indexed = *static_cast<const DrawIndexedPrimitiveCommand*>(command);
+    if (command_size != sizeof(DrawIndexedPrimitiveCommand) ||
+        header.size != sizeof(DrawIndexedPrimitiveCommand) || !draw_indexed.device) {
+      return reject(header.type, "header-size-or-device");
+    }
+    fast_device = draw_indexed.device;
+  } else {
+    const size_t expected_size = CommandSize(header.type);
+    if (!expected_size || command_size != expected_size || header.size != expected_size ||
+        (header.type != CommandType::kRegisterShader && header.type != CommandType::kResourceUnlock &&
+         header.type != CommandType::kTextureLock &&
+         header.type != CommandType::kRegisterReflectionTarget &&
+         header.type != CommandType::kRegisterVirtualResource &&
+         header.type != CommandType::kReleaseResource && !CommandDevice(header.type, command))) {
+      return reject(header.type, "header-size-or-device");
+    }
   }
+  if (!is_draw_indexed) {
   if (header.type == CommandType::kTemporalUpdate &&
       !temporal::ValidTemporalCommand(*static_cast<const TemporalCommand*>(command))) {
     return reject(header.type, "invalid-temporal-metadata");
@@ -5097,18 +5116,27 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
       return reject(header.type, "render-phase-range");
     }
   }
+  }  // !is_draw_indexed
 
   native_command.type = header.type;
   // The title executable and native renderer are separate Mach-O images, so
   // inline thread-local storage is not shared between them. Draw commands carry
   // the active per-light ID explicitly through the title-command ABI.
-  native_command.light_trace_id = CommandLightTraceId(header.type, command);
-  native_command.light_trace_technique = CommandLightTraceTechnique(header.type, command);
-  native_command.light_trace_mode = CommandLightTraceMode(header.type, command);
+  if (is_draw_indexed) [[likely]] {
+    const auto& draw_indexed = *static_cast<const DrawIndexedPrimitiveCommand*>(command);
+    native_command.light_trace_id = draw_indexed.light_trace_id;
+    native_command.light_trace_technique = draw_indexed.light_trace_technique;
+    native_command.light_trace_mode = draw_indexed.light_trace_mode;
+  } else {
+    native_command.light_trace_id = CommandLightTraceId(header.type, command);
+    native_command.light_trace_technique = CommandLightTraceTechnique(header.type, command);
+    native_command.light_trace_mode = CommandLightTraceMode(header.type, command);
+  }
   // 48: NativeCommand::lighting() reads the context from the bytes copied below.
   native_command.bytes.resize(command_size);
   std::memcpy(native_command.bytes.data(), command, command_size);
 
+  if (!is_draw_indexed) {
   if (header.type == CommandType::kRegisterShader) {
     const auto& registration = *static_cast<const RegisterShaderCommand*>(command);
     const ShaderCacheEntry* cache_entry = FindStockShaderCacheEntry(registration.hash);
@@ -5170,6 +5198,10 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
       }
     }
     producer_constant_shadows_.erase(device);  // 49
+    if (last_producer_constant_shadow_device_ == device) {
+      last_producer_constant_shadow_device_ = 0;
+      last_producer_constant_shadow_ptr_ = nullptr;
+    }
     std::lock_guard snapshot_lock(device_snapshot_mutex_);
     last_device_snapshots_.erase(device);
     initialized_constant_capture_devices_.erase(device);
@@ -5273,15 +5305,20 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
     }
     native_command.depth_handoff_source = source->second;
   }
+  }  // !is_draw_indexed
 
-  const bool draw_command = header.type == CommandType::kDrawPrimitive ||
-                            header.type == CommandType::kDrawPrimitiveUp ||
-                            header.type == CommandType::kDrawIndexedPrimitive;
+  const bool draw_command = is_draw_indexed ||
+                            header.type == CommandType::kDrawPrimitive ||
+                            header.type == CommandType::kDrawPrimitiveUp;
   const uint8_t* cached_device_memory = nullptr;
   uint32_t cached_device_handle = 0;
   if (draw_command || header.type == CommandType::kClear) {
-    const uint32_t device = CommandDevice(header.type, command);
-    const NativeDirtyState* dirty_state = CommandDirtyState(header.type, command);
+    const uint32_t device =
+        is_draw_indexed ? fast_device : CommandDevice(header.type, command);
+    const NativeDirtyState* dirty_state =
+        is_draw_indexed
+            ? &static_cast<const DrawIndexedPrimitiveCommand*>(command)->dirty_state
+            : CommandDirtyState(header.type, command);
     const uint8_t* device_memory = CaptureDeviceMemory(device, replay);  // 56
     if (!device_memory) {
       return reject(header.type, "device-state-translation");
@@ -5388,12 +5425,23 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
       static const bool filter_constants = REXCVAR_GET(gta4_native_filter_unchanged_constants);
       ProducerConstantShadow* shadow = nullptr;
       if (filter_constants) {
-        const auto found = producer_constant_shadows_.find(device);
-        if (found != producer_constant_shadows_.end()) {
+        ProducerConstantShadow* found_shadow = nullptr;
+        if (last_producer_constant_shadow_device_ == device &&
+            last_producer_constant_shadow_ptr_) [[likely]] {
+          found_shadow = last_producer_constant_shadow_ptr_;
+        } else {
+          const auto found = producer_constant_shadows_.find(device);
+          if (found != producer_constant_shadows_.end()) {
+            found_shadow = &found->second;
+            last_producer_constant_shadow_device_ = device;
+            last_producer_constant_shadow_ptr_ = found_shadow;
+          }
+        }
+        if (found_shadow) {
           // A diagnostic transport may replace the worker's banks: the shadow
           // is unknown from here until the next complete snapshot.
-          if (capture_full_snapshot) found->second.vertex_valid = found->second.pixel_valid = false;
-          else if (!full_semantic_capture) shadow = &found->second;
+          if (capture_full_snapshot) found_shadow->vertex_valid = found_shadow->pixel_valid = false;
+          else if (!full_semantic_capture) shadow = found_shadow;
         }
       }
       const auto capture_bank = [&](std::span<const uint8_t> source, const DirtyRangeSet& ranges,
@@ -5575,78 +5623,25 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
       }
     }
   }
-  if (header.type == CommandType::kDrawPrimitiveUp) {
-    const auto& draw = *static_cast<const DrawPrimitiveUpCommand*>(command);
-    if (draw.vertex_data_size > kMaximumUpPayloadSize ||
-        (draw.vertex_data_size && !draw.vertex_data)) {
-      return reject(header.type, "up-payload-range");
-    }
-    if (draw.vertex_data_size) {
-      // 56: GtaCapture replays the vertices copied at submit.
-      const uint8_t* vertex_data =
-          replay && replay->up_payload && replay->up_size == draw.vertex_data_size
-              ? replay->up_payload
-              : memory_->TranslateVirtual<const uint8_t*>(draw.vertex_data);
-      if (!vertex_data) {
-        return reject(header.type, "up-payload-translation");
-      }
-      native_command.payload.resize(draw.vertex_data_size);
-      std::memcpy(native_command.payload.data(), vertex_data, draw.vertex_data_size);
-    }
-  } else if (header.type == CommandType::kDrawPrimitive ||
-             header.type == CommandType::kDrawIndexedPrimitive) {
-    const uint32_t device = CommandDevice(header.type, command);
-    const uint8_t* device_memory = (device == cached_device_handle && cached_device_memory)
+  if (is_draw_indexed || header.type == CommandType::kDrawPrimitive) [[likely]] {
+    const uint32_t device = cached_device_handle;
+    const uint8_t* device_memory = cached_device_memory
                                        ? cached_device_memory
                                        : CaptureDeviceMemory(device, replay);  // 56
     if (!device_memory) {
       return reject(header.type, "vertex-state-translation");
     }
     const std::span<const uint8_t> device_state(device_memory, kGuestDeviceSize);
-    if (header.type == CommandType::kDrawIndexedPrimitive) {
+    if (is_draw_indexed && static_cast<const DrawIndexedPrimitiveCommand*>(command)->batch_vb != 0) [[likely]] {
       const auto& draw_indexed = *static_cast<const DrawIndexedPrimitiveCommand*>(command);
-      if (draw_indexed.batch_vb != 0) {
-        native_command.vertex_buffers[0] = CaptureBufferResource(draw_indexed.batch_vb);
-        if (native_command.vertex_buffers[0]) {
-          native_command.captured_stream_mask = 1u;
-        }
-        if (draw_indexed.batch_ib != 0) {
-          native_command.index_buffer = CaptureBufferResource(draw_indexed.batch_ib);
-        }
-        CaptureBulbSource(native_command, device_state);
-      } else {
-        if (const uint32_t handle0 = LoadGuestWord(device_state, kStreamBufferBase)) {
-          native_command.vertex_buffers[0] = CaptureBufferResource(handle0);
-          if (native_command.vertex_buffers[0]) {
-            native_command.captured_stream_mask = 1u;
-          }
-        }
-        // Fast-check if any stream 1..15 has a non-zero handle in guest memory before looping.
-        const uint8_t* s_ptr = device_state.data() + kStreamBufferBase + sizeof(uint32_t);
-        uint64_t any_hi_stream = 0;
-        for (size_t i = 0; i < 7; ++i) {
-          uint64_t pair = 0;
-          std::memcpy(&pair, s_ptr + i * sizeof(uint64_t), sizeof(uint64_t));
-          any_hi_stream |= pair;
-        }
-        uint32_t last_word = 0;
-        std::memcpy(&last_word, s_ptr + 14 * sizeof(uint32_t), sizeof(uint32_t));
-        if ((any_hi_stream | last_word) != 0) [[unlikely]] {
-          for (uint32_t stream = 1; stream < kVertexStreamCount; ++stream) {
-            if (const uint32_t handle =
-                    LoadGuestWord(device_state, kStreamBufferBase + stream * sizeof(uint32_t))) {
-              native_command.vertex_buffers[stream] = CaptureBufferResource(handle);
-              if (native_command.vertex_buffers[stream])
-                native_command.captured_stream_mask |= uint32_t{1} << stream;
-            }
-          }
-        }
-        const uint32_t handle = LoadGuestWord(device_state, kIndexBufferOffset);
-        if (handle) {
-          native_command.index_buffer = CaptureBufferResource(handle);
-        }
-        CaptureBulbSource(native_command, device_state);
+      native_command.vertex_buffers[0] = CaptureBufferResource(draw_indexed.batch_vb);
+      if (native_command.vertex_buffers[0]) {
+        native_command.captured_stream_mask = 1u;
       }
+      if (draw_indexed.batch_ib != 0) {
+        native_command.index_buffer = CaptureBufferResource(draw_indexed.batch_ib);
+      }
+      CaptureBulbSource(native_command, device_state);
     } else {
       if (const uint32_t handle0 = LoadGuestWord(device_state, kStreamBufferBase)) {
         native_command.vertex_buffers[0] = CaptureBufferResource(handle0);
@@ -5674,12 +5669,36 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
           }
         }
       }
+      if (is_draw_indexed) {
+        const uint32_t handle = LoadGuestWord(device_state, kIndexBufferOffset);
+        if (handle) {
+          native_command.index_buffer = CaptureBufferResource(handle);
+        }
+        CaptureBulbSource(native_command, device_state);
+      }
+    }
+  } else if (header.type == CommandType::kDrawPrimitiveUp) {
+    const auto& draw = *static_cast<const DrawPrimitiveUpCommand*>(command);
+    if (draw.vertex_data_size > kMaximumUpPayloadSize ||
+        (draw.vertex_data_size && !draw.vertex_data)) {
+      return reject(header.type, "up-payload-range");
+    }
+    if (draw.vertex_data_size) {
+      // 56: GtaCapture replays the vertices copied at submit.
+      const uint8_t* vertex_data =
+          replay && replay->up_payload && replay->up_size == draw.vertex_data_size
+              ? replay->up_payload
+              : memory_->TranslateVirtual<const uint8_t*>(draw.vertex_data);
+      if (!vertex_data) {
+        return reject(header.type, "up-payload-translation");
+      }
+      native_command.payload.resize(draw.vertex_data_size);
+      std::memcpy(native_command.payload.data(), vertex_data, draw.vertex_data_size);
     }
   }
 
-  if (header.type == CommandType::kDrawPrimitive || header.type == CommandType::kDrawPrimitiveUp ||
-      header.type == CommandType::kDrawIndexedPrimitive) {
-    const uint32_t device = CommandDevice(header.type, command);
+  if (draw_command) [[likely]] {
+    const uint32_t device = cached_device_handle;
     ProducerDeviceShaderState active_device_shaders{};
     bool has_device_shaders = false;
     if (last_producer_device_shader_state_valid_ && last_producer_device_handle_ == device) [[likely]] {
@@ -5731,27 +5750,27 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
       }
     }
 
-    const uint8_t* device_memory = (device == cached_device_handle && cached_device_memory)
+    const uint8_t* device_memory = cached_device_memory
                                        ? cached_device_memory
                                        : CaptureDeviceMemory(device, replay);  // 56
     if (!device_memory) {
       return reject(header.type, "texture-state-translation");
     }
     const std::span<const uint8_t> device_state(device_memory, kGuestDeviceSize);
-    for (uint32_t stage = 0; stage < kShaderTextureCount; ++stage) {
-      if (!(native_command.used_texture_mask & (uint32_t{1} << stage))) {
-        continue;
-      }
+    const uint32_t current_texture_epoch =
+        uint32_t(texture_resources_epoch_.load(std::memory_order_relaxed));
+    const bool recheck_vertex_textures = REXCVAR_GET(gta4_native_recheck_vertex_textures);
+    for (uint32_t mask = native_command.used_texture_mask; mask; mask &= mask - 1) {
+      const uint32_t stage = uint32_t(std::countr_zero(mask));
+      if (stage >= kShaderTextureCount) break;
       const uint32_t handle =
           LoadGuestWord(device_state, kTextureHandleBase + stage * sizeof(uint32_t));
       const size_t fetch_offset = kTextureFetchBase + stage * kTextureFetchSize;
       std::array<uint64_t, 3> raw_fetch{};
       std::memcpy(raw_fetch.data(), device_state.data() + fetch_offset, sizeof(raw_fetch));
       const bool is_vertex_texture = (vertex_texture_mask & (uint32_t{1} << stage)) != 0;
-      const uint32_t current_texture_epoch =
-          uint32_t(texture_resources_epoch_.load(std::memory_order_relaxed));
       auto& memo = producer_texture_memo_[stage];
-      if (handle != 0 && !(is_vertex_texture && REXCVAR_GET(gta4_native_recheck_vertex_textures)) &&
+      if (handle != 0 && !(is_vertex_texture && recheck_vertex_textures) &&
           memo.handle == handle && memo.epoch == current_texture_epoch &&
           memo.keepalive_serial == capture_keepalive_serial_ && capture_keepalive_serial_ != 0 &&
           memo.has_raw_fetch && memo.raw_fetch == raw_fetch && memo.resource) [[likely]] {
@@ -5774,7 +5793,7 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
       // path recreates the resource only when the bytes changed. Render
       // targets sampled by vertex shaders (depth, shadow maps) are GPU-owned
       // and large; re-reading guest memory for them is slow and wrong.
-      if (is_vertex_texture && REXCVAR_GET(gta4_native_recheck_vertex_textures)) {
+      if (is_vertex_texture && recheck_vertex_textures) {
         const uint32_t frame = g_native_memory_profile_event_frame.load(std::memory_order_relaxed);
         auto [recheck, inserted] = vertex_texture_rechecks_.try_emplace(handle);
         if (inserted || recheck->second.frame != frame) {
@@ -5828,8 +5847,8 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
     }
   }
 
-if (draw_command || header.type == CommandType::kClear) {
-    const uint32_t device = CommandDevice(header.type, command);
+  if (draw_command || header.type == CommandType::kClear) {
+    const uint32_t device = cached_device_handle;
     if (device != producer_initialized_constant_device_.load(std::memory_order_relaxed)) {
       std::lock_guard state_lock(device_snapshot_mutex_);
       initialized_constant_capture_devices_.insert(device);
@@ -5979,9 +5998,9 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
   // 61: the MRU (batch 62/63) moved below the header read: like the slot, it must see the
   // resource's flags / address / size and lock state. Before, it returned the old capture of a
   // buffer re-pointed or locked without an unlock; the header read it skipped is three loads.
-  const uint64_t cache_epoch = buffer_resources_epoch_.load(std::memory_order_acquire);
   const uint64_t clear_epoch = buffer_resources_clear_epoch_.load(std::memory_order_acquire);
   if (buffer_fast_table_clear_epoch_ != clear_epoch) [[unlikely]] {
+    buffer_capture_l1_table_.fill({});
     for (auto& slot : buffer_capture_fast_table_) {
       slot = {};
     }
@@ -5991,8 +6010,6 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
   const uint32_t current_frame =
       g_native_memory_profile_event_frame.load(std::memory_order_relaxed);
   static const bool use_keepalive = REXCVAR_GET(gta4_native_capture_keepalive);
-  const uint32_t fast_slot_idx = BufferFastTableIndex(handle);
-  auto& fast_entry = buffer_capture_fast_table_[fast_slot_idx];
 
   auto reject = [handle](const char* reason, uint32_t flags, uint32_t data_address,
                          uint32_t data_size) {
@@ -6030,39 +6047,96 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
     return reject("metadata", flags, data_address, data_size);
   }
 
-  // Remembered with the header it was captured with (the slot's condition below).
-  const auto note_mru = [&](const std::shared_ptr<const NativeBufferResource>& ref) {
-    if (!ref) return;
-    fast_entry.handle = handle;
-    fast_entry.alias_serial = capture_keepalive_serial_;
-    fast_entry.epoch = clear_epoch;
-    fast_entry.flags = flags;
-    fast_entry.address = data_address;
-    fast_entry.size = data_size;
-    fast_entry.sentinel_5 = ref->sentinel_5;
-    fast_entry.strong_ref = ref;
-  };
+  BufferL1MruEntry& l1_entry = buffer_capture_l1_table_[BufferL1TableIndex(handle)];
+  const uint32_t set_base = BufferFastSetBase(handle);
+
   if (use_keepalive && current_serial && !metadata->guest_locked) [[likely]] {
-    if (fast_entry.handle == handle && fast_entry.epoch == clear_epoch &&
-        fast_entry.strong_ref && fast_entry.flags == flags &&
-        fast_entry.address == data_address && fast_entry.size == data_size) [[likely]] {
-      if (fast_entry.strong_ref->last_used_frame.load(std::memory_order_relaxed) != current_frame) {
-        fast_entry.strong_ref->last_used_frame.store(current_frame, std::memory_order_relaxed);
+    // Tier 1 (Batch 89): 4 KB L1D-resident direct-mapped raw-pointer MRU cache.
+    // Valid as long as capture_keepalive_serial_ == alias_serial and not forgotten.
+    if (l1_entry.handle == handle && l1_entry.alias_serial == current_serial &&
+        l1_entry.raw && l1_entry.flags == flags && l1_entry.address == data_address &&
+        l1_entry.size == data_size) [[likely]] {
+      if (l1_entry.last_frame != current_frame) [[unlikely]] {
+        l1_entry.last_frame = current_frame;
+        if (l1_entry.raw->last_used_frame.load(std::memory_order_relaxed) != current_frame) {
+          l1_entry.raw->last_used_frame.store(current_frame, std::memory_order_relaxed);
+        }
       }
-      if (fast_entry.alias_serial == current_serial) [[likely]] {
-        return AliasCaptured(fast_entry.strong_ref.get());
+      return AliasCaptured(l1_entry.raw);
+    }
+
+    // Tier 2 (Batch 89): 2-way associative 512 KB static buffer cache.
+    BufferMruEntry& w0 = buffer_capture_fast_table_[set_base];
+    BufferMruEntry& w1 = buffer_capture_fast_table_[set_base + 1];
+    BufferMruEntry* hit_entry = nullptr;
+    if (w0.handle == handle && w0.epoch == clear_epoch && w0.strong_ref &&
+        w0.flags == flags && w0.address == data_address && w0.size == data_size) {
+      hit_entry = &w0;
+    } else if (w1.handle == handle && w1.epoch == clear_epoch && w1.strong_ref &&
+               w1.flags == flags && w1.address == data_address && w1.size == data_size) {
+      hit_entry = &w1;
+    }
+    if (hit_entry) [[likely]] {
+      const NativeBufferResource* raw = hit_entry->strong_ref.get();
+      if (raw->last_used_frame.load(std::memory_order_relaxed) != current_frame) {
+        raw->last_used_frame.store(current_frame, std::memory_order_relaxed);
       }
-      // Batch 87: Cross-frame O(1) static buffer hit directly via fast_entry.strong_ref,
-      // skipping BufferCaptureSlot, weak_ptr::lock, buffer_resource_mutex_, and map find.
-      return KeepBufferMruCaptured(fast_entry.strong_ref, fast_entry.alias_serial);
+      std::shared_ptr<const NativeBufferResource> result;
+      if (hit_entry->alias_serial == current_serial) [[likely]] {
+        result = AliasCaptured(raw);
+      } else {
+        // Cross-frame O(1) static buffer hit directly via strong_ref, skipping
+        // BufferCaptureSlot, weak_ptr::lock, buffer_resource_mutex_, and map find.
+        result = KeepBufferMruCaptured(hit_entry->strong_ref, hit_entry->alias_serial);
+      }
+      l1_entry = {handle, capture_keepalive_serial_, flags, data_address, data_size,
+                  current_frame, raw};
+      return result;
     }
   }
+
+  const uint64_t cache_epoch = buffer_resources_epoch_.load(std::memory_order_acquire);
+
+  auto record_l2_and_l1 = [&](const std::shared_ptr<const NativeBufferResource>& ref) {
+    if (!ref) return;
+    BufferMruEntry& w0 = buffer_capture_fast_table_[set_base];
+    BufferMruEntry& w1 = buffer_capture_fast_table_[set_base + 1];
+    BufferMruEntry* target = nullptr;
+    if (w0.handle == handle || w0.handle == 0 || !w0.strong_ref) {
+      target = &w0;
+    } else if (w1.handle == handle || w1.handle == 0 || !w1.strong_ref) {
+      target = &w1;
+    } else if (w0.alias_serial != capture_keepalive_serial_) {
+      target = &w0;
+    } else if (w1.alias_serial != capture_keepalive_serial_) {
+      target = &w1;
+    } else {
+      target = &buffer_capture_fast_table_[set_base + ((++buffer_fast_replace_rr_) & 1u)];
+    }
+    const NativeBufferResource* raw = ref.get();
+    target->handle = handle;
+    target->alias_serial = capture_keepalive_serial_;
+    target->epoch = clear_epoch;
+    target->flags = flags;
+    target->address = data_address;
+    target->size = data_size;
+    target->sentinel_5 = ref->sentinel_5;
+    target->strong_ref = ref;
+    l1_entry = {handle, capture_keepalive_serial_, flags, data_address, data_size,
+                current_frame, raw};
+  };
 
   BufferCaptureCacheSlot& cache_slot = BufferCaptureSlot(handle);
   auto touch_frame = [current_frame](const NativeBufferResource& resource) {
     if (resource.last_used_frame.load(std::memory_order_relaxed) != current_frame) {
       resource.last_used_frame.store(current_frame, std::memory_order_relaxed);
     }
+  };
+  auto keep_and_record = [&](std::shared_ptr<const NativeBufferResource> ref) {
+    auto copy_for_l2 = ref;
+    auto kept = KeepCaptured(std::move(ref), cache_slot.alias, cache_slot.alias_serial);
+    record_l2_and_l1(copy_for_l2);
+    return kept;
   };
   auto remember = [&](const std::shared_ptr<const NativeBufferResource>& resource) {
     cache_slot.handle = handle;
@@ -6080,16 +6154,17 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
       if (cache_slot.alias && cache_slot.alias_serial == capture_keepalive_serial_ &&
           capture_keepalive_serial_) {
         touch_frame(*cache_slot.alias);
-        if (auto cached = cache_slot.resource.lock()) {
-          note_mru(cached);
+        if (use_keepalive) {
+          if (auto cached = cache_slot.resource.lock()) {
+            record_l2_and_l1(cached);
+          }
         }
         return AliasCaptured(cache_slot.alias);
       }
       if (auto cached = cache_slot.resource.lock()) {
         touch_frame(*cached);
         if (use_keepalive) {
-          note_mru(cached);
-          return KeepCaptured(std::move(cached), cache_slot.alias, cache_slot.alias_serial);
+          return keep_and_record(std::move(cached));
         }
         return cached;
       }
@@ -6102,8 +6177,7 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
           cache_slot.epoch = cache_epoch;
           touch_frame(*cached);
           if (use_keepalive) {
-            note_mru(cached);
-            return KeepCaptured(std::move(cached), cache_slot.alias, cache_slot.alias_serial);
+            return keep_and_record(std::move(cached));
           }
           return cached;
         }
@@ -6135,9 +6209,7 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
     touch_frame(*matching_cache_entry);
     remember(matching_cache_entry);
     if (use_keepalive) {
-      note_mru(matching_cache_entry);
-      return KeepCaptured(std::move(matching_cache_entry), cache_slot.alias,
-                          cache_slot.alias_serial);
+      return keep_and_record(std::move(matching_cache_entry));
     }
     return matching_cache_entry;
   }
@@ -6158,9 +6230,7 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
       matching_cache_entry->last_used_frame.store(current_frame, std::memory_order_relaxed);
       remember(matching_cache_entry);
       if (use_keepalive) {
-        note_mru(matching_cache_entry);
-        return KeepCaptured(std::move(matching_cache_entry), cache_slot.alias,
-                            cache_slot.alias_serial);
+        return keep_and_record(std::move(matching_cache_entry));
       }
       return matching_cache_entry;
     }
@@ -6179,9 +6249,7 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
       resource->last_used_frame.store(current_frame, std::memory_order_relaxed);
       remember(resource);
       if (use_keepalive) {
-        note_mru(resource);
-        std::shared_ptr<const NativeBufferResource> keep_resource = resource;
-        return KeepCaptured(std::move(keep_resource), cache_slot.alias, cache_slot.alias_serial);
+        return keep_and_record(resource);
       }
       return resource;
     }
@@ -6213,9 +6281,7 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
       resource->created_frame, flags);
   remember(resource);
   if (use_keepalive) {
-    note_mru(resource);
-    std::shared_ptr<const NativeBufferResource> keep_resource = resource;
-    return KeepCaptured(std::move(keep_resource), cache_slot.alias, cache_slot.alias_serial);
+    return keep_and_record(resource);
   }
   return resource;
 }
@@ -22246,8 +22312,13 @@ void Gta4NativeGraphicsSystem::RollCaptureKeepAlive() {
   }
   next->refs.reserve(std::max<size_t>(previous + previous / 4, 1024));
   capture_keepalive_ = std::move(next);
-  if (++capture_keepalive_serial_ == 0) ++capture_keepalive_serial_;  // 0 means "none"
-  // Batch 87: incrementally release aged BufferMruEntry strong_refs (128/roll => full sweep / 128 rolls)
+  if (++capture_keepalive_serial_ == 0) {
+    ++capture_keepalive_serial_;  // 0 means "none"
+    buffer_capture_l1_table_.fill({});
+  } else if (capture_keepalive_serial_ == 1) {
+    buffer_capture_l1_table_.fill({});
+  }
+  // Batch 87/89: incrementally release aged BufferMruEntry strong_refs (128/roll => full sweep / 64 rolls)
   // so streamed-out static buffers do not stay pinned in buffer_capture_fast_table_.
   const uint32_t current_frame =
       g_native_memory_profile_event_frame.load(std::memory_order_relaxed);
@@ -22258,6 +22329,8 @@ void Gta4NativeGraphicsSystem::RollCaptureKeepAlive() {
       const uint32_t used_frame =
           entry.strong_ref->last_used_frame.load(std::memory_order_relaxed);
       if (current_frame > used_frame && (current_frame - used_frame) > 240u) {
+        auto& l1 = buffer_capture_l1_table_[BufferL1TableIndex(entry.handle)];
+        if (l1.handle == entry.handle) l1 = {};
         entry.handle = 0;
         entry.alias_serial = 0;
         entry.strong_ref.reset();
@@ -22359,7 +22432,16 @@ void Gta4NativeGraphicsSystem::ProtectInQueueEpoch(NativeCommand& command) {
 // 49: RenderGuest, after the command was accepted: its constant delta, applied to
 // the shadow exactly as the worker applies it to its banks.
 void Gta4NativeGraphicsSystem::CommitProducerConstantShadow(const NativeCommand& command) {
-  ProducerConstantShadow& shadow = producer_constant_shadows_[producer_constant_commit_device_];
+  ProducerConstantShadow* shadow_ptr = nullptr;
+  if (last_producer_constant_shadow_device_ == producer_constant_commit_device_ &&
+      last_producer_constant_shadow_ptr_) [[likely]] {
+    shadow_ptr = last_producer_constant_shadow_ptr_;
+  } else {
+    shadow_ptr = &producer_constant_shadows_[producer_constant_commit_device_];
+    last_producer_constant_shadow_device_ = producer_constant_commit_device_;
+    last_producer_constant_shadow_ptr_ = shadow_ptr;
+  }
+  ProducerConstantShadow& shadow = *shadow_ptr;
   const auto apply = [](std::vector<uint8_t>& bank, bool& valid, size_t bank_size,
                         const ConstantPayloadDelta& delta) {
     if (delta.complete_snapshot) {
@@ -25988,28 +26070,51 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
     }
   }
   const auto& dfn = vulkan_provider->vulkan_device()->functions();
+  const uint64_t layout_identity = NativeVulkanHandleIdentity(draw_pipeline_layout);
+  bool descriptors_elided = false;
+  typename decltype(native_draw_state_cache_)::IndexedDescriptorKey indexed_key{};
   std::array<VkDescriptorSet, kDescriptorSetCount> draw_descriptor_sets{};
   if (native_descriptor_backend_ == NativeDescriptorBackend::kIndexed) {
-    if (command.descriptor_page >= native_descriptor_pages_.size() ||
-        command.descriptor_copy != active_descriptor_copy_) {
+    if (command.descriptor_copy != active_descriptor_copy_) {
       return false;
     }
-    const NativeDescriptorPage& page = native_descriptor_pages_[command.descriptor_page];
-    if (native_descriptor_paging_ && (page.frame_epoch != command.image_descriptor_epoch ||
-        command.descriptor_page % NativeFrameContextRing::kSlotCount != active_frame_slot_))
-      return false;
-    StageNativeFlightResource(NativeFlightResourceKind::kDescriptorPool,
-                              NativeVulkanHandleIdentity(page.pool));
-    draw_descriptor_sets = {page.descriptor_sets[0],
-                            descriptor_sets_[active_descriptor_copy_][kNativeMergedStorageSet]};
+    indexed_key = {
+        layout_identity,
+        command.descriptor_page,
+        command.descriptor_copy,
+        command.image_descriptor_epoch,
+        active_frame_slot_,
+    };
+    if (native_draw_state_cache_.HasMatchingIndexedDescriptors(indexed_key)) [[likely]] {
+      descriptors_elided = true;
+    } else {
+      if (command.descriptor_page >= native_descriptor_pages_.size()) {
+        return false;
+      }
+      const NativeDescriptorPage& page = native_descriptor_pages_[command.descriptor_page];
+      if (native_descriptor_paging_ &&
+          (page.frame_epoch != command.image_descriptor_epoch ||
+           command.descriptor_page % NativeFrameContextRing::kSlotCount != active_frame_slot_)) {
+        return false;
+      }
+      StageNativeFlightResource(NativeFlightResourceKind::kDescriptorPool,
+                                NativeVulkanHandleIdentity(page.pool));
+      draw_descriptor_sets = {page.descriptor_sets[0],
+                              descriptor_sets_[active_descriptor_copy_][kNativeMergedStorageSet]};
+      for (VkDescriptorSet descriptor_set : draw_descriptor_sets) {
+        if (!descriptor_set) {
+          return false;
+        }
+      }
+    }
   } else {
     draw_descriptor_sets = {
         command.draw_descriptor_sets[0],
         descriptor_sets_[active_descriptor_copy_][kNativeMergedStorageSet]};
-  }
-  for (VkDescriptorSet descriptor_set : draw_descriptor_sets) {
-    if (!descriptor_set) {
-      return false;
+    for (VkDescriptorSet descriptor_set : draw_descriptor_sets) {
+      if (!descriptor_set) {
+        return false;
+      }
     }
   }
 #if REX_PLATFORM_ANDROID
@@ -26018,16 +26123,49 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
   if (native_draw_state_cache_.UpdatePipeline(NativeVulkanHandleIdentity(pipeline))) {
     profile::CpuCall(profile::CpuOp::kDriverBind, [&] { return dfn.vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline); });
   }
-  std::array<uint64_t, kDescriptorSetCount> descriptor_identities{};
-  std::transform(draw_descriptor_sets.begin(), draw_descriptor_sets.end(),
-                  descriptor_identities.begin(),
-                  [](VkDescriptorSet set) { return NativeVulkanHandleIdentity(set); });
-  if (native_draw_state_cache_.UpdateDescriptors(
-          NativeVulkanHandleIdentity(draw_pipeline_layout), descriptor_identities)) {
-    profile::CpuCall(profile::CpuOp::kDriverBind, [&] { return dfn.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                draw_pipeline_layout, 0, kDescriptorSetCount,
-                                draw_descriptor_sets.data(), 0, nullptr); });
+  if (!descriptors_elided) {
+    const std::array<uint64_t, kDescriptorSetCount> descriptor_identities = {
+        NativeVulkanHandleIdentity(draw_descriptor_sets[0]),
+        NativeVulkanHandleIdentity(draw_descriptor_sets[1])};
+    if (native_draw_state_cache_.UpdateDescriptors(layout_identity, descriptor_identities)) {
+      profile::CpuCall(profile::CpuOp::kDriverBind, [&] { return dfn.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                  draw_pipeline_layout, 0, kDescriptorSetCount,
+                                  draw_descriptor_sets.data(), 0, nullptr); });
+    }
+    if (native_descriptor_backend_ == NativeDescriptorBackend::kIndexed) {
+      native_draw_state_cache_.RecordIndexedDescriptors(indexed_key);
+    }
   }
+  const uint32_t debug_gpu_attr =
+      REXCVAR_GET(gta4_native_debug_gpu_attribution) == 1 ? 1u : 0u;
+  const bool any_draw_diagnostics =
+      deterministic_trace_active_ || fire_event_active_ ||
+      (phone_lineage_draw_active_ && command.phone_trace) ||
+      bool(TvCommandRole(command)) ||
+      (bulb_trace_frame_ &&
+       (command.bulb_trace || NeedsBulbInterference(command, target)));
+  static_assert(kRenderTargetCount == 4);
+  const uint64_t color_formats_lo =
+      uint64_t(uint32_t(target.color_formats[0])) |
+      (uint64_t(uint32_t(target.color_formats[1])) << 32);
+  const uint64_t color_formats_hi =
+      uint64_t(uint32_t(target.color_formats[2])) |
+      (uint64_t(uint32_t(target.color_formats[3])) << 32);
+  const typename decltype(native_draw_state_cache_)::DynamicDrawKey dynamic_key{
+      command.fixed_function_state.get(),
+      width,
+      height,
+      logical_width,
+      logical_height,
+      target.color_write_mask,
+      debug_gpu_attr,
+      color_formats_lo,
+      color_formats_hi,
+  };
+  VkViewport viewport{};
+  VkRect2D scissor{};
+  if (any_draw_diagnostics ||
+      !native_draw_state_cache_.HasMatchingDynamicDraw(dynamic_key)) {
   const float viewport_scale_x = logical_width ? float(width) / float(logical_width) : 1.0f;
   const float viewport_scale_y = logical_height ? float(height) / float(logical_height) : 1.0f;
   const NativeViewportSelection viewport_selection = SelectNativeViewport(
@@ -26035,14 +26173,13 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
        requested_viewport_height, requested_min_depth, requested_max_depth},
       viewport_scale_x, viewport_scale_y, width, height,
       vulkan_provider->vulkan_device()->properties());
-  const VkViewport& viewport = viewport_selection.viewport;
+  viewport = viewport_selection.viewport;
   if (native_draw_state_cache_.UpdateViewport(
           {std::bit_cast<uint32_t>(viewport.x), std::bit_cast<uint32_t>(viewport.y),
            std::bit_cast<uint32_t>(viewport.width), std::bit_cast<uint32_t>(viewport.height),
            std::bit_cast<uint32_t>(viewport.minDepth), std::bit_cast<uint32_t>(viewport.maxDepth)})) {
     profile::CpuCall(profile::CpuOp::kDriverDynamic, [&] { return dfn.vkCmdSetViewport(command_buffer, 0, 1, &viewport); });
   }
-  VkRect2D scissor{};
   // GTA IV's XDK setters already intersect the D3D scissor and viewport and
   // write the final PA_SC_WINDOW_SCISSOR rectangle. Replay that authoritative
   // hardware result instead of rebuilding the intersection from API shadows.
@@ -26060,7 +26197,7 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
   const int32_t bottom = ScaleCoordinateCeil(logical_bottom, logical_height, height);
   scissor.offset = {left, top};
   scissor.extent = {uint32_t(right - left), uint32_t(bottom - top)};
-  if (viewport_selection.empty || REXCVAR_GET(gta4_native_debug_gpu_attribution) == 1) {
+  if (viewport_selection.empty || debug_gpu_attr) {
     scissor = {};
   }
   if (native_draw_state_cache_.UpdateScissor(
@@ -26174,6 +26311,9 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
           std::bit_cast<std::array<uint32_t, 4>>(blend_constants.constants))) {
     profile::CpuCall(profile::CpuOp::kDriverDynamic, [&] { return dfn.vkCmdSetBlendConstants(command_buffer, blend_constants.constants.data()); });
   }
+  if (!any_draw_diagnostics) {
+    native_draw_state_cache_.RecordDynamicDraw(dynamic_key);
+  } else {
   #include "fire_escape_trace_bind.inc"
   if (phone_lineage_draw_active_ && command.phone_trace) {
     PhoneTraceLog("effective-draw", fmt::format(
@@ -26182,7 +26322,7 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
         "depth={},{},{} stencil-test={} compare={}/{} color-mask={} bindings={}/{}/{}",
         command.phone_trace->run, command.phone_trace->event,
         diagnostic_submitted_frame_, diagnostic_command_index_, NativeVulkanHandleIdentity(pipeline),
-        NativeVulkanHandleIdentity(draw_pipeline_layout), viewport.x, viewport.y, viewport.width,
+        layout_identity, viewport.x, viewport.y, viewport.width,
         viewport.height, viewport.minDepth, viewport.maxDepth, scissor.offset.x, scissor.offset.y,
         scissor.extent.width, scissor.extent.height, stencil_mask_ref.front.reference,
         stencil_mask_ref.front.compare_mask, stencil_mask_ref.front.write_mask,
@@ -26200,6 +26340,8 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
       target.color_write_mask,uint32_t(target.samples),stencil_mask_ref.front.reference,stencil_mask_ref.front.compare_mask,
       stencil_mask_ref.front.write_mask,fixed.stencil_enable,fixed.depth_enable,fixed.depth_function,fixed.depth_write_enable,
       fixed.alpha_test_enable,fixed.alpha_function,fixed.alpha_reference,fixed.alpha_to_mask));
+  }
+  }
   NativePushConstants push_constants{};
   push_constants.vertex_constants = vertex_constants_allocation.device_address;
   push_constants.pixel_constants = pixel_constants_allocation.device_address;
@@ -26209,7 +26351,7 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
           vertex_constants_allocation, pixel_constants_allocation, shared_constants_allocation)) return false;
     native_draw_state_cache_.Reset(); ubo_bound_layout_ = VK_NULL_HANDLE;
   } else if (native_draw_state_cache_.UpdatePushConstants(
-          NativeVulkanHandleIdentity(draw_pipeline_layout),
+          layout_identity,
           {push_constants.vertex_constants, push_constants.pixel_constants,
            push_constants.shared_constants})) {
     profile::CpuCall(profile::CpuOp::kDriverDynamic, [&] { return dfn.vkCmdPushConstants(command_buffer, draw_pipeline_layout,
@@ -41924,6 +42066,7 @@ void Gta4NativeGraphicsSystem::Shutdown() {
   ShutdownDeferredDiagnosticWorker();
   {
     std::lock_guard capture_lock(command_capture_mutex_);
+    buffer_capture_l1_table_.fill({});
     for (auto& slot : buffer_capture_fast_table_) {
       slot = {};
     }
