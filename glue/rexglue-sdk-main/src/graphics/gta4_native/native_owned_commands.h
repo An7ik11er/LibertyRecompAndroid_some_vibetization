@@ -68,7 +68,7 @@ class NativeCommandPool {
 
   template <typename... Args>
   Owner Make(Args&&... args) {
-    void* storage = resource_.allocate(sizeof(T), alignof(T));
+    void* storage = resource_.AllocateSlot();
     auto* slot = static_cast<Slot*>(storage);
     if (slot->constructed) {
       // Ordered after the retiring thread's writes by the free-list mutex.
@@ -200,43 +200,22 @@ class NativeCommandPool {
       return {slab_count_, live_, slab_count_ * kSlotsPerSlab - live_,
               slab_count_ * sizeof(Slab)};
     }
-   private:
-    void* do_allocate(size_t bytes, size_t alignment) override {
-      if (bytes != sizeof(T) || alignment != alignof(T)) throw std::bad_alloc();
+    void* AllocateSlot() {
       // Allocation is single-threaded (the producer holds its capture mutex),
-      // while slots return from the retirement thread. The allocator swaps out
-      // the whole shared free array under one lock and pops from a private
-      // one. Free slots are tracked as a pointer array, not an intrusive list:
-      // reading a link from a command freed on another core was a cache miss
-      // on every allocation.
-      if (local_.empty()) {
-        std::lock_guard lock(mutex_);
-        if (free_.empty()) {
-          // Nothing changes until allocation succeeds. Empty storage is not a T.
-          Slab* slab = new Slab;
-          slab->next = slabs_;
-          slabs_ = slab;
-          ++slab_count_;
-          free_.reserve(free_.size() + kSlotsPerSlab);
-          for (Slot& slot : slab->slots) free_.push_back(&slot);
-        }
-        local_.swap(free_);
-        live_ += local_.size();  // Counted as live while cached; never returned uncached.
+      // while slots return from the retirement thread. Keep the hot local_ pop
+      // non-virtual so Make() inlines without going through memory_resource.
+      if (local_.empty()) [[unlikely]] {
+        RefillLocal();
       }
       Slot* slot = local_.back();
       local_.pop_back();
-      // With command recycling enabled, Make() does not zero-fill the 3.2 KB
-      // command. Prefetch only the header lines (first 256B) and the tail lines
-      // that ValidateAndCopyCommand actually writes, instead of flooding MSHR
-      // with 51 exclusive-ownership requests across unused middle lines.
-      if (!local_.empty()) {
+      if (!local_.empty()) [[likely]] {
         const auto* next = reinterpret_cast<const char*>(local_.back());
         // 48: a command type that knows which lines the producer writes says so.
         if constexpr (requires { T::PrefetchForAcquire(static_cast<const void*>(next)); }) {
           T::PrefetchForAcquire(next);
           // 48.1: Make() reads and writes slot->constructed right away; that line
-          // was last written by the retirer (Little). Package 48 dropped it from
-          // the prefetch (the old tail prefetch covered it): +2 % of RenderGuest.
+          // was last written by the retirer (Little).
           __builtin_prefetch(next + offsetof(Slot, next), 1);
         } else {
           for (size_t offset = 0; offset < 256 && offset < sizeof(Slot); offset += 64)
@@ -248,6 +227,25 @@ class NativeCommandPool {
         }
       }
       return static_cast<void*>(slot->storage);
+    }
+   private:
+    void RefillLocal() {
+      std::lock_guard lock(mutex_);
+      if (free_.empty()) {
+        // Nothing changes until allocation succeeds. Empty storage is not a T.
+        Slab* slab = new Slab;
+        slab->next = slabs_;
+        slabs_ = slab;
+        ++slab_count_;
+        free_.reserve(free_.size() + kSlotsPerSlab);
+        for (Slot& slot : slab->slots) free_.push_back(&slot);
+      }
+      local_.swap(free_);
+      live_ += local_.size();  // Counted as live while cached; never returned uncached.
+    }
+    void* do_allocate(size_t bytes, size_t alignment) override {
+      if (bytes != sizeof(T) || alignment != alignof(T)) throw std::bad_alloc();
+      return AllocateSlot();
     }
     void do_deallocate(void* value, size_t bytes, size_t alignment) override {
       assert(bytes == sizeof(T) && alignment == alignof(T));

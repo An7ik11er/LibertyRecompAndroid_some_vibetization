@@ -2996,21 +2996,27 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
       }
     }
   }
-  struct BufferMruEntry {
+  struct alignas(64) BufferMruEntry {
     uint32_t handle = 0;
     uint32_t alias_serial = 0;
     uint64_t epoch = 0;
-    const NativeBufferResource* alias = nullptr;
     // 61: the resource header it was captured with (as BufferCaptureCacheSlot).
     uint32_t flags = 0, address = 0, size = 0;
     uint64_t sentinel_5 = 0;
+    // Batch 87: hold strong_ref across frames so static buffers hit O(1)
+    // without touching BufferCaptureSlot, weak_ptr::lock, or buffer_resources_.
+    std::shared_ptr<const NativeBufferResource> strong_ref;
   };
-  static constexpr size_t kBufferCaptureFastTableSize = 4096;
+  static_assert(sizeof(BufferMruEntry) == 64);
+  static constexpr size_t kBufferCaptureFastTableSize = 16384;
   static constexpr uint32_t kBufferCaptureFastTableMask = kBufferCaptureFastTableSize - 1;
   static constexpr uint32_t BufferFastTableIndex(uint32_t handle) noexcept {
-    return (handle * 0x9E3779B1u) >> (32 - 12);
+    return (handle * 0x9E3779B1u) >> (32 - 14);
   }
   std::array<BufferMruEntry, kBufferCaptureFastTableSize> buffer_capture_fast_table_{};  // command_capture_mutex_
+  std::atomic<uint64_t> buffer_resources_clear_epoch_{1};
+  uint64_t buffer_fast_table_clear_epoch_ = 1;  // command_capture_mutex_
+  size_t buffer_fast_sweep_cursor_ = 0;         // command_capture_mutex_
 
 
   std::array<BufferCaptureCacheSlot, 8192> buffer_capture_cache_{};  // command_capture_mutex_
@@ -3022,7 +3028,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     auto& entry = buffer_capture_fast_table_[BufferFastTableIndex(handle)];
     if (entry.handle == handle) {
       entry.handle = 0;
-      entry.alias = nullptr;
+      entry.strong_ref.reset();
       entry.alias_serial = 0;
     }
     ForgetCaptureCache(buffer_capture_cache_, handle);
@@ -3139,6 +3145,20 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     alias_serial = capture_keepalive_serial_;
     return AliasCaptured(raw);
   }
+  // Batch 87: retain a fast-table strong_ref inside the frame keep-alive once per serial
+  // without moving/clearing the MRU slot or probing BufferCaptureCacheSlot.
+  std::shared_ptr<const NativeBufferResource> KeepBufferMruCaptured(
+      const std::shared_ptr<const NativeBufferResource>& strong, uint32_t& mru_serial) {
+    if (!capture_keepalive_ || capture_keepalive_->refs.size() >= kCaptureKeepAliveLimit)
+      RollCaptureKeepAlive();
+    const NativeBufferResource* raw = strong.get();
+    if (raw->keepalive_serial != capture_keepalive_serial_) {
+      raw->keepalive_serial = capture_keepalive_serial_;
+      capture_keepalive_->refs.push_back(strong);
+    }
+    mru_serial = capture_keepalive_serial_;
+    return AliasCaptured(raw);
+  }
   static std::shared_ptr<const NativeTextureResource> OwningTextureResource(
       const std::shared_ptr<const NativeTextureResource>& texture) {
     if (!texture) return texture;
@@ -3245,7 +3265,21 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   std::unordered_map<uint64_t, NativeShader*> vertex_shaders_by_hash_;
   std::unordered_map<uint32_t, NativeShader*> shader_handles_;
   std::unordered_map<uint32_t, ProducerShaderMetadata> producer_shader_metadata_;
+  struct ProducerShaderCacheSlot {
+    uint32_t handle = 0;
+    ShaderStage stage = ShaderStage::kPixel;
+    uint32_t used_texture_mask = 0;
+    bool valid = false;
+  };
+  static constexpr size_t kProducerShaderCacheSize = 1024;
+  static constexpr uint32_t ProducerShaderCacheIndex(uint32_t handle) noexcept {
+    return (handle * 0x9E3779B1u) >> (32 - 10);
+  }
+  std::array<ProducerShaderCacheSlot, kProducerShaderCacheSize> producer_shader_cache_{};  // command_capture_mutex_
   std::unordered_map<uint32_t, ProducerDeviceShaderState> producer_device_shader_states_;
+  uint32_t last_producer_device_handle_ = 0;                            // command_capture_mutex_
+  ProducerDeviceShaderState last_producer_device_shader_state_{};       // command_capture_mutex_
+  bool last_producer_device_shader_state_valid_ = false;                // command_capture_mutex_
   std::unordered_map<uint32_t, std::shared_ptr<NativeVertexDeclaration>> vertex_declarations_;
   std::mutex buffer_resource_mutex_;
   std::unordered_map<uint32_t, std::shared_ptr<const NativeBufferResource>> buffer_resources_;
