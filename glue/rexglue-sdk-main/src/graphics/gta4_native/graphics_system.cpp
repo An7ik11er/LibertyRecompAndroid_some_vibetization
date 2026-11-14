@@ -709,6 +709,9 @@ REXCVAR_DEFINE_UINT32(
 REXCVAR_DEFINE_UINT32(
     gta4_native_texture_memory_limit_mb, 0, "GTA IV/Graphics/Native Renderer",
     "Optional native texture heap budget cap in MiB (0 uses the Vulkan driver budget)");
+REXCVAR_DEFINE_BOOL(
+    gta4_native_release_texture_payload, true, "GTA IV/Graphics/Native Renderer",
+    "Release host RAM payload of immutable streaming textures after Vulkan image creation");
 
 namespace rex::graphics::gta4_native {
 
@@ -6886,7 +6889,7 @@ Gta4NativeGraphicsSystem::CaptureTextureResourceUncached(
         resource->vector_font_id == vector_font_id &&
         resource->vector_font_replacement == wants_vector_font &&
         resource->detile_jobs.empty() == detile_jobs.empty() &&
-        (resource->vector_font_replacement || resource->payload == payload)) {
+        (resource->vector_font_replacement || resource->payload.empty() || resource->payload == payload)) {
       if (ShouldClearNativeTextureDirtyFlag(cache_entry_dirty, true)) {
         dirty_texture_handles_.erase(handle);
       }
@@ -11085,7 +11088,7 @@ void Gta4NativeGraphicsSystem::DestroyNativeFrameConstantArenas() {
 
 namespace {
 constexpr uint32_t kWorkerRingSegments = 6;
-constexpr VkDeviceSize kWorkerRingSegmentBytes = 20ull << 20;
+constexpr VkDeviceSize kWorkerRingSegmentBytes = 6ull << 20;
 // The last bank's uniform range may reach past its segment: keep it inside
 // the buffer.
 constexpr VkDeviceSize kWorkerRingGuardBytes = kVertexConstantsSize;
@@ -20383,6 +20386,16 @@ Gta4NativeGraphicsSystem::NativeTextureImage* Gta4NativeGraphicsSystem::GetOrCre
       memory::LifecycleReason::kCacheMiss, texture->handle, texture->generation, 0,
       texture->payload.size(), result->mip_views.capacity() * sizeof(VkImageView),
       result->allocation_size, result->last_used_frame, uint32_t(result->format));
+  // Batch 85: Release host RAM payload for immutable streaming textures after GPU upload.
+  // Saves 400-800 MB of host RAM duplicate while preserving VkImage in VRAM.
+  if (REXCVAR_GET(gta4_native_release_texture_payload) &&
+      !texture->gpu_produced && !texture->vector_font_replacement &&
+      !texture->payload.empty()) {
+    auto* mutable_texture = const_cast<NativeTextureResource*>(texture.get());
+    mutable_texture->payload.clear();
+    mutable_texture->payload.shrink_to_fit();
+    mutable_texture->detile_reference.reset();
+  }
   if (result->is_reflection) {
     REXLOG_INFO(
         "gta4-native-reflection: created resolved texture {:08X} logical={}x{} physical={}x{} "

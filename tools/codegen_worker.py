@@ -315,7 +315,7 @@ def call_chat_completion(url: str, headers: dict, payload: dict, timeout: int = 
         choices = res_data.get("choices", [])
         if choices:
             msg = choices[0].get("message", {})
-            return msg.get("content", "")
+            return msg.get("content") or ""
     return ""
 
 
@@ -552,7 +552,7 @@ def main():
             print(f"[-] LLM Request Error: {e}", file=sys.stderr)
             sys.exit(1)
 
-        report = re.sub(r'<think>[\s\S]*?</think>', '', raw_reply).strip()
+        report = re.sub(r'<think>[\s\S]*?</think>', '', raw_reply or '').strip()
         output_text = f"# Inspection Report: {', '.join(func_list)}\n\n{callgraph_context}\n{report}\n"
         if args.out:
             out_path = os.path.abspath(args.out)
