@@ -5260,6 +5260,8 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
   const bool draw_command = header.type == CommandType::kDrawPrimitive ||
                             header.type == CommandType::kDrawPrimitiveUp ||
                             header.type == CommandType::kDrawIndexedPrimitive;
+  const uint8_t* cached_device_memory = nullptr;
+  uint32_t cached_device_handle = 0;
   if (draw_command || header.type == CommandType::kClear) {
     const uint32_t device = CommandDevice(header.type, command);
     const NativeDirtyState* dirty_state = CommandDirtyState(header.type, command);
@@ -5267,6 +5269,8 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
     if (!device_memory) {
       return reject(header.type, "device-state-translation");
     }
+    cached_device_handle = device;
+    cached_device_memory = device_memory;
     const std::span<const uint8_t> device_state(device_memory, kGuestDeviceSize);
     // The half scene is resolved inside the composite phase, after its begin marker.
     // Capture its generation at the draw, never the previous frame's marker-time image.
@@ -5494,56 +5498,66 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
       }
     }
     {
-      // 48: render targets as a shared block too (CaptureTargetBlock compares
-      // the descriptors with the previous draw's block).
-      NativeTargetSnapshot targets;
-      // 57: with a replay, from the surface words recorded at submit.
+      // Batch 86: Producer-side target snapshot memoization verifying both surface
+      // handles and the 5 raw surface header words (0, 6, 7, 9, 10) in guest memory
+      // to stay 100% immune to in-place word-7 surface mutations.
+      static const bool share_target_blocks = REXCVAR_GET(gta4_native_shared_state_blocks);
+      std::array<uint32_t, kRenderTargetCount + 1> current_handles{};
       for (uint32_t index = 0; index < kRenderTargetCount; ++index) {
-        targets.colors[index] = CaptureSurfaceDescriptor(
-            LoadGuestWord(device_state, kRenderTargetOffset + index * sizeof(uint32_t)), replay);
-      }
-      targets.depth =
-          CaptureSurfaceDescriptor(LoadGuestWord(device_state, kDepthStencilOffset), replay);
-      native_command.snapshot_targets =
-          NativeStateRef<NativeTargetSnapshot>(CaptureTargetBlock(native_command, targets));
-    }
-  
-// Мгновенный кэш CaptureSurfaceDescriptor в ValidateAndCopyCommand. начало "патча" (крашит игру при выходе в меню)
-#if 0
-    {
-      static std::array<uint32_t, kRenderTargetCount> last_rt_handles{};
-      static std::array<SurfaceDescriptor, kRenderTargetCount> last_rt_descs{};
-      static uint32_t last_ds_handle = 0;
-      static SurfaceDescriptor last_ds_desc{};
-      const bool targets_clean = state_reported_clean;
-
-      for (uint32_t index = 0; index < kRenderTargetCount; ++index) {
-        const uint32_t h =
+        current_handles[index] =
             LoadGuestWord(device_state, kRenderTargetOffset + index * sizeof(uint32_t));
-        if (!h) {
-          native_command.snapshot_targets->colors[index] = SurfaceDescriptor{};
-        } else if (targets_clean && h == last_rt_handles[index]) {
-          native_command.snapshot_targets->colors[index] = last_rt_descs[index];
-        } else {
-          last_rt_handles[index] = h;
-          last_rt_descs[index] = CaptureSurfaceDescriptor(h);
-          native_command.snapshot_targets->colors[index] = last_rt_descs[index];
+      }
+      current_handles[kRenderTargetCount] = LoadGuestWord(device_state, kDepthStencilOffset);
+
+      bool can_reuse_targets =
+          !replay && share_target_blocks && producer_target_memo_.valid &&
+          producer_target_block_ != nullptr &&
+          producer_target_block_serial_ == capture_keepalive_serial_ &&
+          capture_keepalive_serial_ != 0 &&
+          producer_target_memo_.handles == current_handles;
+      std::array<std::array<uint32_t, 5>, kRenderTargetCount + 1> current_raw_words{};
+      if (!replay) {
+        for (uint32_t slot = 0; slot < kRenderTargetCount + 1; ++slot) {
+          const uint32_t h = current_handles[slot];
+          if (!h) continue;
+          const uint8_t* obj = memory_->TranslateVirtual<const uint8_t*>(h);
+          if (!obj) {
+            can_reuse_targets = false;
+            break;
+          }
+          uint32_t w0, w6, w7, w9, w10;
+          std::memcpy(&w0, obj + 0, sizeof(uint32_t));
+          std::memcpy(&w6, obj + 24, sizeof(uint32_t));
+          std::memcpy(&w7, obj + 28, sizeof(uint32_t));
+          std::memcpy(&w9, obj + 36, sizeof(uint32_t));
+          std::memcpy(&w10, obj + 40, sizeof(uint32_t));
+          current_raw_words[slot] = {w0, w6, w7, w9, w10};
+          if (can_reuse_targets && producer_target_memo_.raw_words[slot] != current_raw_words[slot]) {
+            can_reuse_targets = false;
+          }
         }
       }
-      const uint32_t ds_h = LoadGuestWord(device_state, kDepthStencilOffset);
-      if (!ds_h) {
-        native_command.snapshot_targets->depth = SurfaceDescriptor{};
-      } else if (targets_clean && ds_h == last_ds_handle) {
-        native_command.snapshot_targets->depth = last_ds_desc;
+      if (can_reuse_targets) [[likely]] {
+        native_command.HoldCaptureKeepAlive(capture_keepalive_);
+        native_command.snapshot_targets =
+            NativeStateRef<NativeTargetSnapshot>(producer_target_block_);
       } else {
-        last_ds_handle = ds_h;
-        last_ds_desc = CaptureSurfaceDescriptor(ds_h);
-        native_command.snapshot_targets->depth = last_ds_desc;
+        NativeTargetSnapshot targets;
+        // 57: with a replay, from the surface words recorded at submit.
+        for (uint32_t index = 0; index < kRenderTargetCount; ++index) {
+          targets.colors[index] = CaptureSurfaceDescriptor(current_handles[index], replay);
+        }
+        targets.depth = CaptureSurfaceDescriptor(current_handles[kRenderTargetCount], replay);
+        native_command.snapshot_targets =
+            NativeStateRef<NativeTargetSnapshot>(CaptureTargetBlock(native_command, targets));
+        if (!replay) {
+          producer_target_memo_.valid = true;
+          producer_target_memo_.handles = current_handles;
+          producer_target_memo_.raw_words = current_raw_words;
+        }
       }
-     }
-#endif
+    }
   }
-// конец "патча"
   if (header.type == CommandType::kDrawPrimitiveUp) {
     const auto& draw = *static_cast<const DrawPrimitiveUpCommand*>(command);
     if (draw.vertex_data_size > kMaximumUpPayloadSize ||
@@ -5565,7 +5579,9 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
   } else if (header.type == CommandType::kDrawPrimitive ||
              header.type == CommandType::kDrawIndexedPrimitive) {
     const uint32_t device = CommandDevice(header.type, command);
-    const uint8_t* device_memory = CaptureDeviceMemory(device, replay);  // 56
+    const uint8_t* device_memory = (device == cached_device_handle && cached_device_memory)
+                                       ? cached_device_memory
+                                       : CaptureDeviceMemory(device, replay);  // 56
     if (!device_memory) {
       return reject(header.type, "vertex-state-translation");
     }
@@ -5672,7 +5688,9 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
       }
     }
 
-    const uint8_t* device_memory = CaptureDeviceMemory(device, replay);  // 56
+    const uint8_t* device_memory = (device == cached_device_handle && cached_device_memory)
+                                       ? cached_device_memory
+                                       : CaptureDeviceMemory(device, replay);  // 56
     if (!device_memory) {
       return reject(header.type, "texture-state-translation");
     }
@@ -5681,16 +5699,31 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
       if (!(native_command.used_texture_mask & (uint32_t{1} << stage))) {
         continue;
       }
-      xenos::xe_gpu_texture_fetch_t& fetch = native_command.texture_fetches[stage];
-      const size_t fetch_offset = kTextureFetchBase + stage * kTextureFetchSize;
-      fetch.dword_0 = LoadGuestWord(device_state, fetch_offset);
-      fetch.dword_1 = LoadGuestWord(device_state, fetch_offset + sizeof(uint32_t));
-      fetch.dword_2 = LoadGuestWord(device_state, fetch_offset + sizeof(uint32_t) * 2);
-      fetch.dword_3 = LoadGuestWord(device_state, fetch_offset + sizeof(uint32_t) * 3);
-      fetch.dword_4 = LoadGuestWord(device_state, fetch_offset + sizeof(uint32_t) * 4);
-      fetch.dword_5 = LoadGuestWord(device_state, fetch_offset + sizeof(uint32_t) * 5);
       const uint32_t handle =
           LoadGuestWord(device_state, kTextureHandleBase + stage * sizeof(uint32_t));
+      const size_t fetch_offset = kTextureFetchBase + stage * kTextureFetchSize;
+      std::array<uint64_t, 3> raw_fetch{};
+      std::memcpy(raw_fetch.data(), device_state.data() + fetch_offset, sizeof(raw_fetch));
+      const bool is_vertex_texture = (vertex_texture_mask & (uint32_t{1} << stage)) != 0;
+      const uint32_t current_texture_epoch =
+          uint32_t(texture_resources_epoch_.load(std::memory_order_relaxed));
+      auto& memo = producer_texture_memo_[stage];
+      if (handle != 0 && !(is_vertex_texture && REXCVAR_GET(gta4_native_recheck_vertex_textures)) &&
+          memo.handle == handle && memo.epoch == current_texture_epoch &&
+          memo.keepalive_serial == capture_keepalive_serial_ && capture_keepalive_serial_ != 0 &&
+          memo.has_raw_fetch && memo.raw_fetch == raw_fetch && memo.resource) [[likely]] {
+        if (capture_keepalive_) native_command.HoldCaptureKeepAlive(capture_keepalive_);
+        native_command.texture_fetches[stage] = memo.fetch;
+        native_command.textures[stage] = memo.resource;
+        continue;
+      }
+      xenos::xe_gpu_texture_fetch_t& fetch = native_command.texture_fetches[stage];
+      fetch.dword_0 = __builtin_bswap32(uint32_t(raw_fetch[0]));
+      fetch.dword_1 = __builtin_bswap32(uint32_t(raw_fetch[0] >> 32));
+      fetch.dword_2 = __builtin_bswap32(uint32_t(raw_fetch[1]));
+      fetch.dword_3 = __builtin_bswap32(uint32_t(raw_fetch[1] >> 32));
+      fetch.dword_4 = __builtin_bswap32(uint32_t(raw_fetch[2]));
+      fetch.dword_5 = __builtin_bswap32(uint32_t(raw_fetch[2] >> 32));
       if (!handle) continue;
       // Small CPU-written vertex-shader textures (vehicle deformation, 128x128
       // 32_FLOAT) are rewritten in place without an unlock, so the clean cache
@@ -5698,8 +5731,7 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
       // path recreates the resource only when the bytes changed. Render
       // targets sampled by vertex shaders (depth, shadow maps) are GPU-owned
       // and large; re-reading guest memory for them is slow and wrong.
-      if ((vertex_texture_mask & (uint32_t{1} << stage)) &&
-          REXCVAR_GET(gta4_native_recheck_vertex_textures)) {
+      if (is_vertex_texture && REXCVAR_GET(gta4_native_recheck_vertex_textures)) {
         const uint32_t frame = g_native_memory_profile_event_frame.load(std::memory_order_relaxed);
         auto [recheck, inserted] = vertex_texture_rechecks_.try_emplace(handle);
         if (inserted || recheck->second.frame != frame) {
@@ -5731,16 +5763,21 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
         if (vertex_texture_rechecks_.size() > 4096) vertex_texture_rechecks_.clear();
         continue;
       }
-      const uint32_t current_texture_epoch =
-          uint32_t(texture_resources_epoch_.load(std::memory_order_relaxed));
-      auto& memo = producer_texture_memo_[stage];
       if (memo.handle == handle && memo.epoch == current_texture_epoch &&
+          memo.keepalive_serial == capture_keepalive_serial_ && capture_keepalive_serial_ != 0 &&
           memo.resource && NativeTextureImageFetchEqual(memo.fetch, fetch)) [[likely]] {
+        if (capture_keepalive_) native_command.HoldCaptureKeepAlive(capture_keepalive_);
+        memo.raw_fetch = raw_fetch;
+        memo.has_raw_fetch = true;
+        memo.fetch = fetch;
         native_command.textures[stage] = memo.resource;
       } else {
         auto captured = CaptureTextureResource(handle, fetch, stage);
         memo.handle = handle;
         memo.epoch = current_texture_epoch;
+        memo.keepalive_serial = capture_keepalive_serial_;
+        memo.has_raw_fetch = true;
+        memo.raw_fetch = raw_fetch;
         memo.fetch = fetch;
         memo.resource = captured;
         native_command.textures[stage] = std::move(captured);
@@ -5901,7 +5938,7 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
   // buffer re-pointed or locked without an unlock; the header read it skipped is three loads.
   const uint64_t cache_epoch = buffer_resources_epoch_.load(std::memory_order_acquire);
   const uint32_t current_serial = capture_keepalive_serial_;
-  const uint32_t fast_slot_idx = (handle >> 2) & kBufferCaptureFastTableMask;
+  const uint32_t fast_slot_idx = BufferFastTableIndex(handle);
   auto& fast_entry = buffer_capture_fast_table_[fast_slot_idx];
 
   auto reject = [handle](const char* reason, uint32_t flags, uint32_t data_address,
@@ -5922,15 +5959,14 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
     return reject("object-translation", 0, 0, 0);
   }
 
+  static_assert(kResourceSizeOffset == kResourceDataOffset + sizeof(uint32_t));
   uint32_t flags;
-  uint32_t address_word;
-  uint32_t size_word;
+  uint64_t addr_size_pair;
   std::memcpy(&flags, object, sizeof(flags));
-  std::memcpy(&address_word, object + kResourceDataOffset, sizeof(address_word));
-  std::memcpy(&size_word, object + kResourceSizeOffset, sizeof(size_word));
+  std::memcpy(&addr_size_pair, object + kResourceDataOffset, sizeof(addr_size_pair));
   flags = __builtin_bswap32(flags);
-  address_word = __builtin_bswap32(address_word);
-  size_word = __builtin_bswap32(size_word);
+  const uint32_t address_word = __builtin_bswap32(uint32_t(addr_size_pair));
+  const uint32_t size_word = __builtin_bswap32(uint32_t(addr_size_pair >> 32));
   const auto metadata = DecodeNativeBufferMetadata(flags, address_word, size_word);
   if (!metadata) {
     return reject("resource-kind", flags, address_word, size_word);
@@ -20366,8 +20402,7 @@ Gta4NativeGraphicsSystem::NativeTextureImage* Gta4NativeGraphicsSystem::GetOrCre
     accounted_texture_bytes_[result->memory_heap] += result->allocation_size;
     result->memory_accounted = true;
   }
-  if (CanDiscardNativeTextureImageContents(texture->gpu_produced, !texture->payload.empty()))
-    texture_eviction_scan_.Insert(texture->generation);
+  const size_t initial_payload_bytes = texture->payload.size();
   native_texture_images_.emplace(texture->generation, std::move(image));
   // Publication/protection and descriptor allocation have succeeded. From here
   // the image and its staging allocation are owned until GPU retirement.
@@ -20378,24 +20413,27 @@ Gta4NativeGraphicsSystem::NativeTextureImage* Gta4NativeGraphicsSystem::GetOrCre
     batch.Add(std::move(*pending_upload));
     if (!upload_batch) FlushTextureUploads(command_buffer, batch);
   }
-  if (texture->packed_depth_source) packed_alias_generations_.insert(texture->generation);
-  TraceTvImageLifecycle("image-created", *result,
-      texture->payload.empty() ? "deterministic-initialization-no-cpu-payload" : "cpu-payload-upload");
-  RecordNativeMemoryLifecycle(
-      memory::ResourceKind::kTextureImage, memory::LifecycleAction::kCreate,
-      memory::LifecycleReason::kCacheMiss, texture->handle, texture->generation, 0,
-      texture->payload.size(), result->mip_views.capacity() * sizeof(VkImageView),
-      result->allocation_size, result->last_used_frame, uint32_t(result->format));
-  // Batch 85: Release host RAM payload for immutable streaming textures after GPU upload.
-  // Saves 400-800 MB of host RAM duplicate while preserving VkImage in VRAM.
+  // Batch 85/86: Release host RAM payload for immutable streaming textures after GPU upload
+  // under texture_resource_mutex_ BEFORE checking CanDiscardNativeTextureImageContents.
   if (REXCVAR_GET(gta4_native_release_texture_payload) &&
       !texture->gpu_produced && !texture->vector_font_replacement &&
-      !texture->payload.empty()) {
+      initial_payload_bytes != 0) {
+    std::lock_guard lock(texture_resource_mutex_);
     auto* mutable_texture = const_cast<NativeTextureResource*>(texture.get());
     mutable_texture->payload.clear();
     mutable_texture->payload.shrink_to_fit();
     mutable_texture->detile_reference.reset();
   }
+  if (CanDiscardNativeTextureImageContents(texture->gpu_produced, !texture->payload.empty()))
+    texture_eviction_scan_.Insert(texture->generation);
+  if (texture->packed_depth_source) packed_alias_generations_.insert(texture->generation);
+  TraceTvImageLifecycle("image-created", *result,
+      initial_payload_bytes == 0 ? "deterministic-initialization-no-cpu-payload" : "cpu-payload-upload");
+  RecordNativeMemoryLifecycle(
+      memory::ResourceKind::kTextureImage, memory::LifecycleAction::kCreate,
+      memory::LifecycleReason::kCacheMiss, texture->handle, texture->generation, 0,
+      initial_payload_bytes, result->mip_views.capacity() * sizeof(VkImageView),
+      result->allocation_size, result->last_used_frame, uint32_t(result->format));
   if (result->is_reflection) {
     REXLOG_INFO(
         "gta4-native-reflection: created resolved texture {:08X} logical={}x{} physical={}x{} "
@@ -25452,6 +25490,7 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
     const NativePipelineState* pipe_state = nullptr;
     const EnvironmentalDataV2* env_data = nullptr;
     uint32_t descriptor_page = UINT32_MAX, descriptor_copy = UINT32_MAX;
+    uint64_t image_epoch = 0, sampler_epoch = 0, cached_epoch = 0;
     uint32_t vertex_booleans = 0, pixel_booleans = 0;
     StateVersionStamp boolean_version{};
     uint64_t texture_inputs_sig = 0;
@@ -25460,6 +25499,7 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
     uint32_t color_output_info_0 = 0;
     uint8_t temporal_mode = 0, split_postfx = 0;
     bool is_reflection = false;
+    bool temporal_jitter = false;
     NativeUploadAllocation allocation{};
   };
   static thread_local FastSharedConstMemo s_fast_shared_memo{};
@@ -25468,6 +25508,7 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
       command.shader_state->versions.Get(DirtyStateComponent::kBooleanConstants);
   const bool can_reuse_shared_allocation =
       resources.has_last_shared_key &&
+      command.texture_inputs_signature != 0 &&
       s_fast_shared_memo.frame              == diagnostic_submitted_frame_ &&
       s_fast_shared_memo.cb                 == command_buffer &&
       s_fast_shared_memo.pipe_state         == command.pipeline_state.get() &&
@@ -25479,6 +25520,9 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
       s_fast_shared_memo.boolean_version    == boolean_ver &&
       s_fast_shared_memo.descriptor_page    == command.descriptor_page &&
       s_fast_shared_memo.descriptor_copy    == command.descriptor_copy &&
+      s_fast_shared_memo.image_epoch        == command.image_descriptor_epoch &&
+      s_fast_shared_memo.sampler_epoch      == command.sampler_descriptor_epoch &&
+      s_fast_shared_memo.cached_epoch       == command.cached_descriptor_epoch &&
       s_fast_shared_memo.width              == width &&
       s_fast_shared_memo.height             == height &&
       s_fast_shared_memo.logical_width      == logical_width &&
@@ -25487,7 +25531,8 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
       s_fast_shared_memo.color_mask         == target.color_attachment_mask &&
       s_fast_shared_memo.temporal_mode      == command.temporal_composite_mode &&
       s_fast_shared_memo.split_postfx       == command.split_postfx_applied &&
-      s_fast_shared_memo.is_reflection      == target.is_reflection;
+      s_fast_shared_memo.is_reflection      == target.is_reflection &&
+      s_fast_shared_memo.temporal_jitter    == target.temporal_jitter;
 
   NativeSharedConstantSemanticKey shared_key{};
   if (can_reuse_shared_allocation) [[likely]] {
@@ -25741,6 +25786,9 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
   s_fast_shared_memo.boolean_version    = boolean_ver;
   s_fast_shared_memo.descriptor_page    = command.descriptor_page;
   s_fast_shared_memo.descriptor_copy    = command.descriptor_copy;
+  s_fast_shared_memo.image_epoch        = command.image_descriptor_epoch;
+  s_fast_shared_memo.sampler_epoch      = command.sampler_descriptor_epoch;
+  s_fast_shared_memo.cached_epoch       = command.cached_descriptor_epoch;
   s_fast_shared_memo.width              = width;
   s_fast_shared_memo.height             = height;
   s_fast_shared_memo.logical_width      = logical_width;
@@ -25751,6 +25799,7 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
   s_fast_shared_memo.temporal_mode      = command.temporal_composite_mode;
   s_fast_shared_memo.split_postfx       = command.split_postfx_applied;
   s_fast_shared_memo.is_reflection      = target.is_reflection;
+  s_fast_shared_memo.temporal_jitter    = target.temporal_jitter;
   s_fast_shared_memo.allocation         = shared_constants_allocation;
   }
 

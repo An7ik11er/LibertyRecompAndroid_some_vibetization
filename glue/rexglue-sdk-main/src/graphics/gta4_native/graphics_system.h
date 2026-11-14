@@ -3007,6 +3007,9 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   };
   static constexpr size_t kBufferCaptureFastTableSize = 4096;
   static constexpr uint32_t kBufferCaptureFastTableMask = kBufferCaptureFastTableSize - 1;
+  static constexpr uint32_t BufferFastTableIndex(uint32_t handle) noexcept {
+    return (handle * 0x9E3779B1u) >> (32 - 12);
+  }
   std::array<BufferMruEntry, kBufferCaptureFastTableSize> buffer_capture_fast_table_{};  // command_capture_mutex_
 
 
@@ -3016,7 +3019,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     return CaptureCacheWay(buffer_capture_cache_, handle);
   }
   void ForgetBufferCapture(uint32_t handle) {
-    auto& entry = buffer_capture_fast_table_[(handle >> 2) & kBufferCaptureFastTableMask];
+    auto& entry = buffer_capture_fast_table_[BufferFastTableIndex(handle)];
     if (entry.handle == handle) {
       entry.handle = 0;
       entry.alias = nullptr;
@@ -3263,19 +3266,38 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   struct ProducerTextureMemo {
     uint32_t handle = 0;
     uint32_t epoch = 0;
+    uint32_t keepalive_serial = 0;
+    bool has_raw_fetch = false;
+    std::array<uint64_t, 3> raw_fetch{};
     xenos::xe_gpu_texture_fetch_t fetch{};
     std::shared_ptr<const NativeTextureResource> resource;
   };
   [[maybe_unused]] std::array<ProducerTextureMemo, kTextureStageCount> producer_texture_memo_{};
   void InvalidateProducerTextureMemo(uint32_t handle = 0) {
     if (!handle) {
-      for (auto& memo : producer_texture_memo_) memo.handle = 0;
+      for (auto& memo : producer_texture_memo_) {
+        memo.handle = 0;
+        memo.has_raw_fetch = false;
+        memo.keepalive_serial = 0;
+        memo.resource.reset();
+      }
     } else {
       for (auto& memo : producer_texture_memo_) {
-        if (memo.handle == handle) memo.handle = 0;
+        if (memo.handle == handle) {
+          memo.handle = 0;
+          memo.has_raw_fetch = false;
+          memo.keepalive_serial = 0;
+          memo.resource.reset();
+        }
       }
     }
   }
+  struct ProducerTargetMemo {
+    bool valid = false;
+    std::array<uint32_t, kRenderTargetCount + 1> handles{};
+    std::array<std::array<uint32_t, 5>, kRenderTargetCount + 1> raw_words{};
+  };
+  ProducerTargetMemo producer_target_memo_{};
   // 29.10: texture references of captured commands until they are published
   // (StageTextureProtection / PublishStagedTextureProtectionLocked). The worker
   // never takes this lock; readers take it after render_mutex_.
