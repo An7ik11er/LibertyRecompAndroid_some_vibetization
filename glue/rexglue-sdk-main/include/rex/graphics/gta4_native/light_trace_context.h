@@ -15,6 +15,7 @@ namespace rex::graphics::gta4_native {
 
 // Rendering semantics are always maintained. Environment switches below only
 // govern diagnostic output and must never determine state capture or replay.
+inline std::atomic<uint32_t> g_native_lighting_context_depth{0};
 inline thread_local LightingContext g_native_lighting_context{};
 inline thread_local std::vector<LightingContext> g_native_lighting_selector_stack;
 inline thread_local std::size_t g_native_lighting_selector_floor = 0;
@@ -24,35 +25,59 @@ inline uint64_t AcquireNativeLightingOccurrence() {
   return next.fetch_add(1, std::memory_order_relaxed);
 }
 
-inline const LightingContext& GetNativeLightingContext() {
+inline bool HasActiveNativeLightingContext() {
+  return g_native_lighting_context_depth.load(std::memory_order_relaxed) != 0;
+}
+
+[[gnu::noinline]] inline const LightingContext& GetNativeLightingContextSlow() {
   return g_native_lighting_context;
 }
 
-inline void BeginNativeLightingSelector(const LightingContext& selected) {
-  g_native_lighting_selector_stack.push_back(g_native_lighting_context);
-  g_native_lighting_context = selected;
+inline const LightingContext& GetNativeLightingContext() {
+  static constexpr LightingContext kDefaultLightingContext{};
+  if (!HasActiveNativeLightingContext()) [[likely]] {
+    return kDefaultLightingContext;
+  }
+  return GetNativeLightingContextSlow();
 }
 
-inline void EndNativeLightingSelector() {
+[[gnu::noinline]] inline void BeginNativeLightingSelector(const LightingContext& selected) {
+  g_native_lighting_selector_stack.push_back(g_native_lighting_context);
+  g_native_lighting_context = selected;
+  g_native_lighting_context_depth.fetch_add(1, std::memory_order_relaxed);
+}
+
+[[gnu::noinline]] inline void EndNativeLightingSelector() {
+  if (!HasActiveNativeLightingContext()) [[likely]] {
+    return;
+  }
   if (g_native_lighting_selector_stack.size() <= g_native_lighting_selector_floor) {
     return;
   }
   g_native_lighting_context = g_native_lighting_selector_stack.back();
   g_native_lighting_selector_stack.pop_back();
+  g_native_lighting_context_depth.fetch_sub(1, std::memory_order_relaxed);
 }
 
 class ScopedNativeLightingContext {
  public:
-  explicit ScopedNativeLightingContext(const LightingContext& context)
-      : previous_(g_native_lighting_context),
-        selector_depth_(g_native_lighting_selector_stack.size()),
-        previous_floor_(g_native_lighting_selector_floor) {
-    g_native_lighting_context = context;
-    g_native_lighting_selector_floor = selector_depth_;
+  explicit ScopedNativeLightingContext(const LightingContext& context) {
+    EnterSlow(context);
   }
   ScopedNativeLightingContext(const ScopedNativeLightingContext&) = delete;
   ScopedNativeLightingContext& operator=(const ScopedNativeLightingContext&) = delete;
-  ~ScopedNativeLightingContext() {
+  ~ScopedNativeLightingContext() { ExitSlow(); }
+
+ private:
+  [[gnu::noinline]] void EnterSlow(const LightingContext& context) {
+    previous_ = g_native_lighting_context;
+    selector_depth_ = g_native_lighting_selector_stack.size();
+    previous_floor_ = g_native_lighting_selector_floor;
+    g_native_lighting_context = context;
+    g_native_lighting_selector_floor = selector_depth_;
+    g_native_lighting_context_depth.fetch_add(1, std::memory_order_relaxed);
+  }
+  [[gnu::noinline]] void ExitSlow() {
     // An executor owns its nested selector scopes, including paths with an
     // optional early return. It cannot close a selector belonging to its caller.
     while (g_native_lighting_selector_stack.size() > selector_depth_) {
@@ -60,9 +85,9 @@ class ScopedNativeLightingContext {
     }
     g_native_lighting_context = previous_;
     g_native_lighting_selector_floor = previous_floor_;
+    g_native_lighting_context_depth.fetch_sub(1, std::memory_order_relaxed);
   }
 
- private:
   LightingContext previous_{};
   std::size_t selector_depth_ = 0;
   std::size_t previous_floor_ = 0;

@@ -2647,10 +2647,9 @@ void WaitForDeferredCapture(uint32_t resource, uint32_t kind) {
   if (!(state & 2u)) g_capture_barrier_state.store(0, std::memory_order_relaxed);
 }
 
-bool ShouldLogNativeHookCall(uint64_t call_count);
-
 template <typename Command>
 bool SubmitNativeCommand(const Command& command);
+bool ShouldLogNativeHookCall(uint64_t call_count);
 
 void RegisterNativeVirtualResource(uint32_t resource, VirtualResourceKind kind, uint32_t wrapper,
                                    uint32_t companion, uint32_t backing_width,
@@ -3011,8 +3010,6 @@ NativeResolutionOverride GetNativeResolutionOverride(uint32_t requested_width,
                              {result.display_width, result.display_height});
   return result;
 }
-
-bool ShouldLogNativeHookCall(uint64_t call_count);
 
 bool IsNativeDisplayResourceConstructorCaller(uint32_t return_address) {
   switch (return_address) {
@@ -3495,7 +3492,34 @@ bool SubmitNativeCommand(const Command& command) {
   return false;
 }
 
-bool ShouldLogNativeHookCall(uint64_t call_count);
+inline bool SubmitNativeDrawIndexed(DrawIndexedPrimitiveCommand& command) {
+  if (HasActiveNativeLightingContext()) [[unlikely]] {
+    ApplyDrawLightingContext(command, GetNativeLightingContextSlow());
+  }
+  if (g_active_native_capture_count.load(std::memory_order_relaxed) == 0) [[likely]] {
+    if (auto* graphics = GetNativeGraphicsSystem()) [[likely]] {
+      static const bool s_no_static_traces =
+          !FireTraceConfig().enabled && !TvTraceConfig().enabled && !PhoneTraceConfig().enabled;
+      if (s_no_static_traces && !gta4::gpu_pass::Enabled()) [[likely]] {
+        const bool accepted =
+            graphics->SubmitTitleCommand(kTitleId, kTitleCommandAbi, &command, sizeof(command));
+        GTA4_HelpTraceNativeSubmission(uint32_t(CommandType::kDrawIndexedPrimitive),
+                                       command.device, accepted, false);
+        if (!accepted && rex::diagnostics::IsEnabled(rex::diagnostics::Category::kGuestHooks))
+            [[unlikely]] {
+          static std::atomic<uint64_t> rejection_count{0};
+          const uint64_t count = NextNativeHookDiagnosticCall(rejection_count);
+          if (ShouldLogNativeHookCall(count)) {
+            REXLOG_WARN("gta4-native-hook: rejected command #{} type={} size={}", count,
+                        uint32_t(command.header.type), sizeof(command));
+          }
+        }
+        return accepted;
+      }
+    }
+  }
+  return SubmitNativeCommand(command);
+}
 
 template <size_t Count>
 bool LoadFiniteGuestFloats(uint8_t* base, uint32_t address, std::array<float, Count>& values) {
@@ -3913,7 +3937,8 @@ void RegisterNativeShader(PPCContext& ctx, uint8_t* base, GuestFunction implemen
   }
 }
 
-bool SubmitNativeVertexDeclaration(uint8_t* base, uint32_t device, uint32_t declaration) {
+[[gnu::noinline]] bool SubmitNativeVertexDeclaration(uint8_t* base, uint32_t device,
+                                                   uint32_t declaration) {
   // The GTA IV default-state table binds 0xFFFF before any declaration object
   // exists. The generated setter stores this value but never dereferences it.
   if (declaration <= UINT16_MAX || declaration == UINT32_MAX ||
@@ -4372,8 +4397,8 @@ void InitializeNativeCommandScratch(uint8_t* base, uint32_t device) {
   StoreU32(base, device + kCommandScratchEndOffset, scratch ? scratch + kCommandScratchSize : 0);
 }
 
-NativeDirtyState ConsumeNativeDrawDirtyState(uint8_t* base, uint32_t device) {
-  NativeDirtyState dirty_state{};
+inline void ConsumeNativeDrawDirtyStateInto(uint8_t* base, uint32_t device,
+                                         NativeDirtyState& dirty_state) {
   uint8_t* cursor = GuestPointer(base, device);
   for (uint32_t index = 0; index < dirty_state.words.size(); ++index) {
     uint64_t raw = 0;
@@ -4383,6 +4408,11 @@ NativeDirtyState ConsumeNativeDrawDirtyState(uint8_t* base, uint32_t device) {
       std::memset(cursor + index * sizeof(uint64_t), 0, sizeof(uint64_t));
     }
   }
+}
+
+NativeDirtyState ConsumeNativeDrawDirtyState(uint8_t* base, uint32_t device) {
+  NativeDirtyState dirty_state{};
+  ConsumeNativeDrawDirtyStateInto(base, device, dirty_state);
   return dirty_state;
 }
 
@@ -4981,7 +5011,6 @@ extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
 
   DrawIndexedPrimitiveCommand command{};
   command.device = device;
-  ApplyDrawLightingContext(command, GetNativeLightingContext());
   command.primitive_type = prim_type;
   command.base_vertex = 0;
   command.start_index = 0;
@@ -4997,9 +5026,9 @@ extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
   command.batch_vb = vb_buf;
   command.batch_stride = vb_stride;
 
-  command.dirty_state = ConsumeNativeDrawDirtyState(base, device);
+  ConsumeNativeDrawDirtyStateInto(base, device, command.dirty_state);
   temporal_host::Draw(base, command.device);
-  SubmitNativeCommand(command);
+  SubmitNativeDrawIndexed(command);
 }
 
 extern "C" void sub_828C8DB0(PPCContext& ctx, uint8_t* base) {
@@ -7616,7 +7645,6 @@ extern "C" void sub_82A3E348(PPCContext& ctx, uint8_t* base) {
   const uint32_t device = ctx.r3.u32;
   DrawIndexedPrimitiveCommand command{};
   command.device = device;
-  ApplyDrawLightingContext(command, GetNativeLightingContext());
   command.primitive_type = ctx.r4.u32;
   command.base_vertex = ctx.r5.s32;
   command.start_index = ctx.r6.u32;
@@ -7628,9 +7656,9 @@ extern "C" void sub_82A3E348(PPCContext& ctx, uint8_t* base) {
   command.command_list = 0;
   command.draw_id = call;
 
-  command.dirty_state = ConsumeNativeDrawDirtyState(base, device);
+  ConsumeNativeDrawDirtyStateInto(base, device, command.dirty_state);
   temporal_host::Draw(base,command.device);
-  SubmitNativeCommand(command);
+  SubmitNativeDrawIndexed(command);
 }
 
 extern "C" void sub_82A457B0(PPCContext& ctx, uint8_t* base) {

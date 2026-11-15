@@ -235,6 +235,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   uint32_t GetTitleCommandAbi(uint32_t title_id) const override;
   bool SubmitTitleCommand(uint32_t title_id, uint32_t abi_version, const void* command,
                           size_t command_size) override;
+  bool SubmitDirectDrawIndexed(const DrawIndexedPrimitiveCommand& command);
   bool ExecuteTitleCommand(uint32_t title_id, uint32_t abi_version, const void* command,
                            size_t command_size, void* result, size_t result_size) override;
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
@@ -2093,6 +2094,12 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   bool ValidateAndCopyCommand(const void* command, size_t command_size,
                               NativeCommand& native_command,
                               const CaptureReplay* replay = nullptr);
+  bool CaptureDrawCommandBody(CommandType type, bool draw_command, bool is_draw_indexed,
+                              const void* command, size_t command_size, uint32_t fast_device,
+                              NativeCommand& native_command, const CaptureReplay* replay);
+  bool FlushOrEnqueueCapturedCommand(NativeCommandPool<NativeCommand>::Owner native_command_owner,
+                                     bool is_present,
+                                     std::unique_lock<gta4::InlineMutex>& capture_lock);
   void TraceNativeRendererEvent(std::string_view point, std::string_view details = {});
   void ObserveNativeGpuProfileDraw(const NativeCommand& command, VkPipeline pipeline,
                                    VkSampleCountFlagBits samples, uint32_t vertices, uint32_t indices);
@@ -3068,9 +3075,9 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   struct BufferL1MruEntry {
     uint32_t handle = 0;
     uint32_t alias_serial = 0;
-    uint32_t flags = 0;
-    uint32_t address = 0;
-    uint32_t size = 0;
+    uint32_t raw_flags = 0;
+    uint32_t raw_address_word = 0;
+    uint32_t raw_size_word = 0;
     uint32_t last_frame = 0;
     // Batch 89: Non-owning raw pointer valid while capture_keepalive_serial_ == alias_serial
     // and buffer_fast_table_clear_epoch_ == clear_epoch (guaranteed pinned in capture_keepalive_).
@@ -3158,6 +3165,10 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   void ForgetTextureCapture(uint32_t handle) {
     ForgetCaptureCache(texture_capture_cache_, handle);
     InvalidateProducerTextureMemo(handle);
+    if (handle == producer_postfx_half_scene_memo_handle_) {
+      producer_postfx_half_scene_memo_handle_ = 0;
+      producer_postfx_half_scene_memo_resource_.reset();
+    }
   }
   // 32: capture keep-alive. Every command used to hold its own reference to
   // each captured texture / vertex / index buffer: the title thread took it
@@ -3508,6 +3519,9 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   ShaderOverrideMode shader_override_mode_ = ShaderOverrideMode::kPair;
   ModernShaderFramePolicy modern_shader_frame_;
   uint32_t producer_postfx_half_scene_ = 0;
+  uint32_t producer_postfx_half_scene_memo_handle_ = 0;
+  uint64_t producer_postfx_half_scene_memo_epoch_ = 0;
+  std::shared_ptr<const NativeTextureResource> producer_postfx_half_scene_memo_resource_;
   PostFxScheduler postfx_scheduler_;
   std::shared_ptr<const NativeTextureResource> postfx_filtered_scene_;
   ModernShaderDiagnostics modern_diagnostics_;

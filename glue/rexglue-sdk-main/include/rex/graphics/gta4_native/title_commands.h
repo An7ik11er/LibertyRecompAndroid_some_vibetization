@@ -304,7 +304,7 @@ struct DrawPrimitiveCommand {
   uint32_t device{};
   uint32_t light_trace_id = 0;
   uint32_t light_trace_technique = 0xFFFFFFFFu;
-  uint32_t light_trace_mode = 0;
+  uint32_t light_trace_mode = 0xFFFFFFFFu;
   uint32_t flags{};
   uint32_t primitive_type{};
   uint32_t start_vertex{};
@@ -320,7 +320,7 @@ struct DrawPrimitiveUpCommand {
   uint32_t device{};
   uint32_t light_trace_id = 0;
   uint32_t light_trace_technique = 0xFFFFFFFFu;
-  uint32_t light_trace_mode = 0;
+  uint32_t light_trace_mode = 0xFFFFFFFFu;
   uint32_t primitive_type{};
   uint32_t vertex_count{};
   uint32_t stride{};
@@ -335,7 +335,7 @@ struct DrawIndexedPrimitiveCommand {
   uint32_t device{};
   uint32_t light_trace_id = 0;
   uint32_t light_trace_technique = 0xFFFFFFFFu;
-  uint32_t light_trace_mode = 0;
+  uint32_t light_trace_mode = 0xFFFFFFFFu;
   uint32_t primitive_type{};
   int32_t base_vertex{};
   uint32_t start_index{};
@@ -527,6 +527,7 @@ static_assert(std::is_trivially_copyable<NativeDirtyState>::value);
 static_assert(std::is_trivially_copyable<DrawPrimitiveCommand>::value);
 static_assert(std::is_trivially_copyable<DrawPrimitiveUpCommand>::value);
 static_assert(std::is_trivially_copyable<DrawIndexedPrimitiveCommand>::value);
+static_assert(sizeof(DrawIndexedPrimitiveCommand) <= 256);
 static_assert(std::is_trivially_copyable<ResolveRectangle>::value);
 static_assert(std::is_trivially_copyable<ResolvePoint>::value);
 static_assert(std::is_trivially_copyable<ResolveCommand>::value);

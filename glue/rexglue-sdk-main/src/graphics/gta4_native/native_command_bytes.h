@@ -13,7 +13,7 @@ namespace rex::graphics::gta4_native {
 // leaves the contents unspecified: callers copy the command in right after.
 class NativeCommandBytes {
  public:
-  static constexpr size_t kInlineCapacity = 192;
+  static constexpr size_t kInlineCapacity = 256;
 
   NativeCommandBytes() {}
   NativeCommandBytes(const NativeCommandBytes& other) { *this = other; }
@@ -23,6 +23,17 @@ class NativeCommandBytes {
       if (size_) std::memcpy(data(), other.data(), size_);
     }
     return *this;
+  }
+
+  template <typename T>
+  void AssignPod(const T& value) noexcept {
+    static_assert(sizeof(T) <= kInlineCapacity);
+    if (heap_) [[unlikely]] {
+      heap_.reset();
+      heap_capacity_ = 0;
+    }
+    size_ = sizeof(T);
+    std::memcpy(inline_, &value, sizeof(T));
   }
 
   void resize(size_t size) {
