@@ -4933,67 +4933,24 @@ extern "C" void sub_828BD250(PPCContext& ctx, uint8_t* base) {
 #endif
 }
 
-extern "C" void sub_828E7000(PPCContext& ctx, uint8_t* base) {
-  if (!IsNativeMode()) {
-    __imp__sub_828E7000(ctx, base);
-    return;
-  }
-
-  const uint32_t r31_geom = ctx.r3.u32;
-
-  // Secondary stream / skinning (offset +68) - fallback to full recomp if active
-  if (REX_LOAD_U32(r31_geom + 68u) != 0u) [[unlikely]] {
-    __imp__sub_828E7000(ctx, base);
-    return;
-  }
-
-  // Fast path (loc_828E7080): bypass 112-byte guest stack frame allocation
-  uint32_t r30_slot = 0u;
-  if (static_cast<int32_t>(REX_LOAD_U32(r31_geom + 72u)) != 0) [[unlikely]] {
-    r30_slot = REX_LOAD_U32(0x831C6214u);
-  }
-
-  const uint32_t r11_ib_off = ((r30_slot + 7u) << 2) & 0xFFFFFFFCu;
-  const uint32_t r10_vb_off = ((r30_slot + 3u) << 2) & 0xFFFFFFFCu;
-
-  ctx.r11.u64 = r11_ib_off;
-  ctx.r10.u64 = r10_vb_off;
-  ctx.r7.u64 = REX_LOAD_U32(r31_geom + 44u);
-  ctx.r4.u64 = REX_LOAD_U32(r31_geom + 4u);
-  ctx.r3.u64 = REX_LOAD_U16(r31_geom + 54u);
-  ctx.r6.u64 = REX_LOAD_U32(r31_geom + r11_ib_off);
-  ctx.r5.u64 = REX_LOAD_U32(r31_geom + r10_vb_off);
-
-  const uint64_t saved_lr = ctx.lr;
-  ctx.lr = 0x828E70A8u;
-  sub_828BFC00(ctx, base);
-  ctx.r12.u64 = saved_lr;
-  ctx.lr = saved_lr;
-}
-
 uint32_t EncodeNativeFetchAddress(uint32_t address);
 
-extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
-  if (!IsNativeMode()) {
-    __imp__sub_828BFC00(ctx, base);
-    return;
-  }
-  // Native C++ unified geometry draw (Batch 74 - D3D9 bypass):
-  // Directly batches VertexDeclaration, IndexBuffer, StreamSource 0, and DrawIndexedPrimitive
-  // into a single NativeCommand submission. Eliminates 3 separate D3D9 calls, 3 mutex locks,
-  // and guest stack frame overhead for ~1,500 draws per frame (-4,500 commands/frame).
-  uint32_t primitive_count = ctx.r7.u32;
-  const uint32_t index_buf = ctx.r6.u32;
+inline void FastGeometryDraw(uint8_t* base, uint32_t prim_type_idx,
+                             uint32_t vdecl, uint32_t stream_buf, uint32_t index_buf,
+                             uint32_t primitive_count, uint32_t caller) {
   const uint32_t index_buf_prims = LoadU32(base, index_buf + 4);
   if (primitive_count == 0 || primitive_count > index_buf_prims) {
     primitive_count = index_buf_prims;
   }
 
   constexpr uint32_t kGlobalBase = 0x831C0000u;
-  const uint32_t device = LoadU32(base, kGlobalBase + 8868);  // 0x831C22A4 (g_pD3DDevice)
+  static uint32_t s_device = 0;
+  if (!s_device) [[unlikely]] {
+    s_device = LoadU32(base, kGlobalBase + 8868);  // 0x831C22A4 (g_pD3DDevice)
+  }
+  const uint32_t device = s_device;
 
   // 1. Batched Vertex Declaration:
-  const uint32_t vdecl = ctx.r4.u32;
   uint32_t decl_val = 0;
   if (vdecl != 0) {
     decl_val = LoadU32(base, vdecl);
@@ -5017,7 +4974,6 @@ extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
   }
 
   // 3. Batched Stream Source 0:
-  const uint32_t stream_buf = ctx.r5.u32;
   if (stream_buf != LoadU32(base, kGlobalBase + 9236)) {
     StoreU32(base, kGlobalBase + 9236, stream_buf);  // 0x831C2414
   }
@@ -5047,8 +5003,15 @@ extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
   }
 
   // 4. Batched Draw Submission (Unified Direct to Native Queue):
-  constexpr uint32_t kPrimTypeTable = 0x82B0B4F4u;
-  const uint32_t prim_type = LoadU32(base, kPrimTypeTable + (ctx.r3.u32 << 2));
+  static thread_local uint32_t s_last_rage_prim = 0xFFFFFFFF;
+  static thread_local uint32_t s_last_d3d_prim = 4;
+  uint32_t prim_type = s_last_d3d_prim;
+  if (prim_type_idx != s_last_rage_prim) [[unlikely]] {
+    constexpr uint32_t kPrimTypeTable = 0x82B0B4F4u;
+    prim_type = LoadU32(base, kPrimTypeTable + (prim_type_idx << 2));
+    s_last_rage_prim = prim_type_idx;
+    s_last_d3d_prim = prim_type;
+  }
 
   static std::atomic<uint64_t> call_count{0};
   const uint64_t call = NextNativeHookDiagnosticCall(call_count);
@@ -5061,7 +5024,7 @@ extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
   command.index_count = primitive_count;
   command.primitive_restart_enabled = (LoadU32(base, device + 10568) & uint32_t(1u << 21)) != 0;
   command.primitive_restart_index = LoadU32(base, device + 10444) & 0x00FFFFFF;
-  command.caller = static_cast<uint32_t>(ctx.lr);
+  command.caller = caller;
   command.origin_flags = kDrawCommandOriginDirect;
   command.command_list = 0;
   command.draw_id = call;
@@ -5073,6 +5036,43 @@ extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
   ConsumeNativeDrawDirtyStateInto(base, device, command.dirty_state);
   temporal_host::Draw(base, command.device);
   SubmitNativeDrawIndexed(command);
+}
+
+extern "C" void sub_828E7000(PPCContext& ctx, uint8_t* base) {
+  if (!IsNativeMode()) {
+    __imp__sub_828E7000(ctx, base);
+    return;
+  }
+
+  const uint32_t r31_geom = ctx.r3.u32;
+
+  // Secondary stream / skinning (offset +68) - fallback to full recomp if active
+  if (REX_LOAD_U32(r31_geom + 68u) != 0u) [[unlikely]] {
+    __imp__sub_828E7000(ctx, base);
+    return;
+  }
+
+  // Fast path (loc_828E7080): bypass 112-byte guest stack frame allocation
+  uint32_t r30_slot = 0u;
+  if (static_cast<int32_t>(REX_LOAD_U32(r31_geom + 72u)) != 0) [[unlikely]] {
+    r30_slot = REX_LOAD_U32(0x831C6214u);
+  }
+
+  const uint32_t r11_ib_off = ((r30_slot + 7u) << 2) & 0xFFFFFFFCu;
+  const uint32_t r10_vb_off = ((r30_slot + 3u) << 2) & 0xFFFFFFFCu;
+
+  FastGeometryDraw(base, REX_LOAD_U16(r31_geom + 54u), REX_LOAD_U32(r31_geom + 4u),
+                   REX_LOAD_U32(r31_geom + r10_vb_off), REX_LOAD_U32(r31_geom + r11_ib_off),
+                   REX_LOAD_U32(r31_geom + 44u), 0x828E70A8u);
+}
+
+extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
+  if (!IsNativeMode()) {
+    __imp__sub_828BFC00(ctx, base);
+    return;
+  }
+  FastGeometryDraw(base, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32,
+                   static_cast<uint32_t>(ctx.lr));
 }
 
 extern "C" void sub_828C8DB0(PPCContext& ctx, uint8_t* base) {
