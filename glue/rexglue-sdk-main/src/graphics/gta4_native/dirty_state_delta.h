@@ -286,6 +286,15 @@ void ForEachDirtyElement(const NativeDirtyWords& dirty_words, const DirtyCompone
 inline void BuildRangeSet(const NativeDirtyWords& dirty_words, const DirtyComponentLayout& layout,
                           DirtyRangeSet& result, DirtyDeltaScratch& scratch) {
   result.ranges.clear();
+  bool any_dirty = false;
+  for (const DirtyBitSpan& span : layout.spans) {
+    if ((dirty_words[span.dirty_word] >> span.first_dirty_bit) & LowBitMask(span.bit_count)) {
+      any_dirty = true;
+      break;
+    }
+  }
+  if (!any_dirty) return;
+
   if (layout.spans.size() <= 1) {
     // Быстрый путь (99.9% вызовов): один спан уже даёт строго возрастающие элементы без сортировки!
     ForEachDirtyElement(dirty_words, layout, [&](uint32_t element) {

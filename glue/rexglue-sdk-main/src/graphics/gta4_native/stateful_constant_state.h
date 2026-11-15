@@ -401,8 +401,7 @@ class AuthoritativeConstantState {
   template <typename HashCallback>
   ConstantApplyStatusOnly ApplyStatus(const ConstantPayloadDelta& delta,
                                       HashCallback&& hash_callback, bool consume = false) {
-    if (consume && initialized_ && !delta.complete_snapshot && delta.ranges.empty() &&
-        delta.payload.empty()) {
+    if (initialized_ && !delta.complete_snapshot && delta.ranges.empty()) [[likely]] {
       return ConstantApplyStatusOnly{ConstantApplyStatus::kApplied, false};
     }
     return ApplyImpl<false>(delta, std::forward<HashCallback>(hash_callback), consume);

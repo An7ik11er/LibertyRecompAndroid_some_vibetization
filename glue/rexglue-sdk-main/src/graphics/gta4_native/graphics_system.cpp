@@ -9551,6 +9551,7 @@ void Gta4NativeGraphicsSystem::TakeProducerPendingState(NativeCommand& command) 
 // PrefetchForAcquire requested one command earlier.
 void Gta4NativeGraphicsSystem::PrefetchProducerBuffers(NativeCommand& command, bool prefetch_vs,
                                                        bool prefetch_ps) {
+  if (direct_record_) return;
   auto prefetch_bank = [](ConstantPayloadDelta& delta) {
     // 54/94/99: skip clean banks, guard zero capacities, and cap DC ZVA lines to (1, 2).
     const size_t range_bytes = delta.ranges.capacity() * sizeof(ConstantDeltaRange);
@@ -10057,10 +10058,19 @@ bool Gta4NativeGraphicsSystem::SnapshotDrawConstants(NativeCommand& command,
       if (source.size() < bytes) return;
       // Batch 91: Skip XXH3_64bits when this version already fits in the active worker constant ring.
       // Any rare ring-full fallback in BindCommonDrawState safely recomputes XXH3 if upload_hash == 0.
-      if (ring_fast &&
-          version->cached_ring_serial == worker_ring_serial_ &&
-          version->cached_ring_bytes >= bytes && version->cached_ring_offset) [[likely]] {
-        return;
+      if (ring_fast) {
+        if (version->cached_ring_serial == worker_ring_serial_ &&
+            version->cached_ring_bytes >= bytes && version->cached_ring_offset) [[likely]] {
+          return;
+        }
+        if (worker_ring_last_[slot][0].version == version.get() &&
+            worker_ring_last_[slot][0].bytes >= bytes && worker_ring_last_[slot][0].offset) [[likely]] {
+          return;
+        }
+        if (worker_ring_last_[slot][1].version == version.get() &&
+            worker_ring_last_[slot][1].bytes >= bytes && worker_ring_last_[slot][1].offset) [[likely]] {
+          return;
+        }
       }
       if (version->cached_prefix_bytes == bytes && version->cached_prefix_hash != 0) [[likely]] {
         hash = version->cached_prefix_hash;
