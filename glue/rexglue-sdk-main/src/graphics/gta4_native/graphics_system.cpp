@@ -6020,6 +6020,9 @@ bool Gta4NativeGraphicsSystem::CaptureDrawCommandBody(
         native_command.textures[stage] = memo.resource;
         continue;
       }
+      if (handle) {
+        __builtin_prefetch(&texture_capture_l1_table_[TextureL1SetBase(handle)], 0, 3);
+      }
       xenos::xe_gpu_texture_fetch_t& fetch = native_command.texture_fetches[stage];
       fetch.dword_0 = __builtin_bswap32(uint32_t(raw_fetch[0]));
       fetch.dword_1 = __builtin_bswap32(uint32_t(raw_fetch[0] >> 32));
@@ -6760,18 +6763,44 @@ Gta4NativeGraphicsSystem::CaptureTextureResource(uint32_t handle,
   // Sampler words (filters, clamps, LOD bias) change between draws of the same
   // image and select neither the resource nor its Prepare shape.
   const std::array<uint32_t, 6> fetch_words = NativeTextureImageFetchKey(fetch);
-  TextureCaptureCacheSlot& slot = TextureCaptureSlot(handle);
   const uint64_t epoch = texture_resources_epoch_.load(std::memory_order_acquire);
+  const uint32_t epoch32 = uint32_t(epoch);
+  const uint32_t current_serial = capture_keepalive_serial_;
   static const bool use_keepalive = REXCVAR_GET(gta4_native_capture_keepalive);
-  if (slot.handle == handle && slot.epoch == uint32_t(epoch) && slot.fetch == fetch_words &&
+
+  // Batch 95: Tier 1 L1D-resident keepalive table (12 KB, zero weak_ptr CAS).
+  const uint32_t l1_base = TextureL1SetBase(handle);
+  if (use_keepalive && current_serial && stage < kShaderTextureCount) [[likely]] {
+    const TextureL1MruEntry& l0 = texture_capture_l1_table_[l1_base];
+    if (l0.handle == handle && l0.alias_serial == current_serial && l0.epoch == epoch32 &&
+        l0.raw && l0.fetch == fetch_words) [[likely]] {
+      return AliasCaptured(l0.raw);
+    }
+    const TextureL1MruEntry& l1 = texture_capture_l1_table_[l1_base + 1];
+    if (l1.handle == handle && l1.alias_serial == current_serial && l1.epoch == epoch32 &&
+        l1.raw && l1.fetch == fetch_words) [[likely]] {
+      return AliasCaptured(l1.raw);
+    }
+  }
+
+  TextureCaptureCacheSlot& slot = TextureCaptureSlot(handle);
+  if (slot.handle == handle && slot.epoch == epoch32 && slot.fetch == fetch_words &&
       stage < kShaderTextureCount) {
     // 32: see CaptureBufferResource.
-    if (slot.alias && slot.alias_serial == capture_keepalive_serial_ && capture_keepalive_serial_) {
+    if (slot.alias && slot.alias_serial == current_serial && current_serial) {
+      if (use_keepalive) {
+        TextureL1MruEntry& l1_slot = SelectTextureL1Slot(l1_base, handle, current_serial);
+        l1_slot = {handle, current_serial, epoch32, 0, fetch_words, slot.alias};
+      }
       return AliasCaptured(slot.alias);
     }
     if (auto cached = slot.resource.lock()) {
-      if (use_keepalive)
-        return KeepCaptured(std::move(cached), slot.alias, slot.alias_serial);
+      if (use_keepalive) {
+        auto kept = KeepCaptured(std::move(cached), slot.alias, slot.alias_serial);
+        TextureL1MruEntry& l1_slot = SelectTextureL1Slot(l1_base, handle, slot.alias_serial);
+        l1_slot = {handle, slot.alias_serial, epoch32, 0, fetch_words, slot.alias};
+        return kept;
+      }
       return cached;
     }
     slot.handle = 0;
@@ -6781,10 +6810,16 @@ Gta4NativeGraphicsSystem::CaptureTextureResource(uint32_t handle,
   if (cacheable && resource) {
     slot.handle = handle;
     slot.fetch = fetch_words;
-    slot.epoch = uint32_t(epoch);
+    slot.epoch = epoch32;
     slot.resource = resource;
-    slot.alias = nullptr;
-    slot.alias_serial = 0;
+    if (use_keepalive) {
+      resource = KeepCaptured(std::move(resource), slot.alias, slot.alias_serial);
+      TextureL1MruEntry& l1_slot = SelectTextureL1Slot(l1_base, handle, slot.alias_serial);
+      l1_slot = {handle, slot.alias_serial, epoch32, 0, fetch_words, slot.alias};
+    } else {
+      slot.alias = nullptr;
+      slot.alias_serial = 0;
+    }
   }
   return resource;
 }
@@ -42701,6 +42736,7 @@ void Gta4NativeGraphicsSystem::Shutdown() {
   {
     std::lock_guard capture_lock(command_capture_mutex_);
     buffer_capture_l1_table_.fill({});
+    texture_capture_l1_table_.fill({});
     for (auto& slot : buffer_capture_fast_table_) {
       slot = {};
     }

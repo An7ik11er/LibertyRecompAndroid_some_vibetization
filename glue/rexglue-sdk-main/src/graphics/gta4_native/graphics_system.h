@@ -3188,12 +3188,49 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     const NativeTextureResource* alias = nullptr;
   };
   static_assert(sizeof(TextureCaptureCacheSlot) == 64 && sizeof(BufferCaptureCacheSlot) == 64);
+  // Batch 95: Compact L1D-resident keepalive cache (12 KB, 128 sets x 2 ways)
+  // in front of 256 KB texture_capture_cache_ to prevent L1D misses & weak_ptr CAS.
+  struct TextureL1MruEntry {
+    uint32_t handle = 0;
+    uint32_t alias_serial = 0;
+    uint32_t epoch = 0;
+    uint32_t _pad = 0;
+    std::array<uint32_t, 6> fetch{};
+    const NativeTextureResource* raw = nullptr;
+  };
+  static_assert(sizeof(TextureL1MruEntry) == 48);
+  static constexpr size_t kTextureCaptureL1SetCount = 128;
+  static constexpr size_t kTextureCaptureL1Ways = 2;
+  static constexpr size_t kTextureCaptureL1TableSize =
+      kTextureCaptureL1SetCount * kTextureCaptureL1Ways;
+  static constexpr uint32_t TextureL1SetBase(uint32_t handle) noexcept {
+    return ((handle * 0x9E3779B1u) >> (32 - 7)) * uint32_t(kTextureCaptureL1Ways);
+  }
+  std::array<TextureL1MruEntry, kTextureCaptureL1TableSize> texture_capture_l1_table_{};  // command_capture_mutex_
+  uint8_t texture_l1_replace_rr_ = 0;  // command_capture_mutex_
+  TextureL1MruEntry& SelectTextureL1Slot(uint32_t set_base, uint32_t handle,
+                                         uint32_t serial) noexcept {
+    TextureL1MruEntry& e0 = texture_capture_l1_table_[set_base];
+    TextureL1MruEntry& e1 = texture_capture_l1_table_[set_base + 1];
+    if (e0.handle == handle) return e0;
+    if (e1.handle == handle) return e1;
+    if (e0.handle == 0 || e0.alias_serial != serial) return e0;
+    if (e1.handle == 0 || e1.alias_serial != serial) return e1;
+    return texture_capture_l1_table_[set_base + ((++texture_l1_replace_rr_) & 1u)];
+  }
   std::array<TextureCaptureCacheSlot, 4096> texture_capture_cache_{};  // command_capture_mutex_
   std::atomic<uint64_t> texture_resources_epoch_{1};
   TextureCaptureCacheSlot& TextureCaptureSlot(uint32_t handle) {
     return CaptureCacheWay(texture_capture_cache_, handle);
   }
   void ForgetTextureCapture(uint32_t handle) {
+    const uint32_t l1_base = TextureL1SetBase(handle);
+    for (size_t way = 0; way < kTextureCaptureL1Ways; ++way) {
+      auto& l1 = texture_capture_l1_table_[l1_base + way];
+      if (l1.handle == handle) {
+        l1 = {};
+      }
+    }
     ForgetCaptureCache(texture_capture_cache_, handle);
     InvalidateProducerTextureMemo(handle);
     if (handle == producer_postfx_half_scene_memo_handle_) {

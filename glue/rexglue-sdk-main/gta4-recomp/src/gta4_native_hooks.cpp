@@ -92,6 +92,12 @@ REXCVAR_DEFINE_BOOL(
     "Diagnostic-only removal of the authored filler-light flag from apartment bulb x890")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+void BindRAGEEffectTextureStage(PPCContext& ctx, uint8_t* base, uint32_t stage,
+                                uint32_t resource_owner, int32_t override_count,
+                                uint32_t overrides);
+void SetPixelShaderConstantFromRAGE(PPCContext& ctx, uint8_t* base, uint32_t reg,
+                                    uint32_t param_type, uint32_t src, uint32_t count);
+
 namespace {
 
 using namespace rex::graphics::gta4_native;
@@ -5035,50 +5041,64 @@ extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
 
 extern "C" void sub_828C8DB0(PPCContext& ctx, uint8_t* base) {
   const uint64_t saved_lr = ctx.lr;
-  const uint32_t r28_pass        = ctx.r3.u32;
-  const uint32_t r29_arg1        = ctx.r4.u32;
-  const uint32_t r31_shader_data = ctx.r5.u32;
-  const uint32_t r27_effect_ptr  = ctx.r6.u32;
+  const uint32_t pass = ctx.r3.u32;
+  const uint32_t arg1 = ctx.r4.u32;
+  const uint32_t shader_data = ctx.r5.u32;
+  const uint32_t effect_ptr = ctx.r6.u32;
 
-  ctx.r3.u64 = r29_arg1;
-  ctx.lr = 0x828C8DD4u;
-  sub_828DFF00(ctx, base);
+  // Inlined sub_828DFF00: only emit SetVertexShader when bound handle changes.
+  constexpr uint32_t kBoundVertexShaderGlobal = 0x831C5DD8u;
+  const uint32_t vs = LoadU32(base, arg1 + 8u);
+  if (LoadU32(base, kBoundVertexShaderGlobal) != vs) {
+    StoreU32(base, kBoundVertexShaderGlobal, vs);
+    ctx.r3.u64 = LoadU32(base, 0x831C22A4u);
+    ctx.r4.u64 = vs;
+    ctx.lr = 0x828C8DD4u;
+    sub_82A42760(ctx, base);
+  }
 
-  const uint16_t count = REX_LOAD_U16(r28_pass + 8u);
+  const uint16_t count = LoadU16(base, pass + 8u);
   if (count > 0u) {
-    // Invariants hoisted outside loop
-    const uint32_t pair_table   = REX_LOAD_U32(r28_pass + 4u);
-    const uint32_t type_table   = REX_LOAD_U32(r31_shader_data + 16u);
-    const uint32_t val_table    = REX_LOAD_U32(r31_shader_data);
-    const uint32_t effect_base  = REX_LOAD_U32(r27_effect_ptr);
+    const uint32_t pair_table = LoadU32(base, pass + 4u);
+    const uint32_t type_table = LoadU32(base, shader_data + 16u);
+    const uint32_t val_table = LoadU32(base, shader_data);
+    const uint32_t effect_base = LoadU32(base, effect_ptr);
+    const uint32_t arg1_table = LoadU32(base, arg1 + 4u);
+    const bool native_mode = IsNativeMode();
 
-    uint32_t r30_offset = 0u;
-    uint32_t r26_rem = count;
-    do {
-      const uint32_t entry = pair_table + r30_offset;
-      const uint8_t idx0 = REX_LOAD_U8(entry);
-      const uint8_t is_const = REX_LOAD_U8(type_table + idx0);
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint32_t entry = pair_table + (i << 1);
+      const uint8_t idx0 = LoadU8(base, entry);
+      const uint8_t param_idx = LoadU8(base, entry + 1u);
+      const uint8_t is_const = LoadU8(base, type_table + idx0);
+      const uint32_t val = LoadU32(base, val_table + (static_cast<uint32_t>(idx0) << 2));
 
-      ctx.r3.u64 = r29_arg1;
       if (is_const == 0u) {
-        const uint8_t stage = REX_LOAD_U8(entry + 1u);
-        const uint32_t desc = effect_base + ((static_cast<uint32_t>(idx0) * 3u) << 4);
-        ctx.r4.u64 = stage;
-        ctx.r5.u64 = REX_LOAD_U32(val_table + (static_cast<uint32_t>(idx0) << 2));
-        ctx.r6.u64 = (static_cast<uint32_t>(REX_LOAD_U8(desc + 2u)) >> 1) & 0x7FFFFFFFu;
-        ctx.r7.u64 = REX_LOAD_U32(desc + 24u);
-        ctx.lr = 0x828C8E3Cu;
-        sub_828E01B8(ctx, base);
+        const uint32_t desc = effect_base + (static_cast<uint32_t>(idx0) * 48u);
+        const int32_t override_count =
+            static_cast<int32_t>((static_cast<uint32_t>(LoadU8(base, desc + 2u)) >> 1) & 0x7FFFFFFFu);
+        const uint32_t overrides = LoadU32(base, desc + 24u);
+        if (native_mode) [[likely]] {
+          const uint32_t stage = 16u + LoadU16(base, arg1_table + (uint32_t(param_idx) << 3) + 2u);
+          BindRAGEEffectTextureStage(ctx, base, stage, val, override_count, overrides);
+        } else {
+          ctx.r3.u64 = arg1;
+          ctx.r4.u64 = param_idx;
+          ctx.r5.u64 = val;
+          ctx.r6.u64 = uint32_t(override_count);
+          ctx.r7.u64 = overrides;
+          ctx.lr = 0x828C8E3Cu;
+          sub_828E01B8(ctx, base);
+        }
       } else {
-        ctx.r4.u64 = REX_LOAD_U8(entry + 1u);
+        ctx.r3.u64 = arg1;
+        ctx.r4.u64 = param_idx;
         ctx.r6.u64 = is_const;
-        ctx.r5.u64 = REX_LOAD_U32(val_table + (static_cast<uint32_t>(idx0) << 2));
+        ctx.r5.u64 = val;
         ctx.lr = 0x828C8E64u;
         sub_828E0348(ctx, base);
       }
-      --r26_rem;
-      r30_offset += 2u;
-    } while (r26_rem != 0u);
+    }
   }
 
   ctx.r12.u64 = saved_lr;
@@ -5086,7 +5106,60 @@ extern "C" void sub_828C8DB0(PPCContext& ctx, uint8_t* base) {
 }
 
 extern "C" void sub_828C8E80(PPCContext& ctx, uint8_t* base) {
-  __imp__sub_828C8E80(ctx, base);
+  if (!IsNativeMode()) {
+    __imp__sub_828C8E80(ctx, base);
+    return;
+  }
+  const uint64_t saved_lr = ctx.lr;
+  const uint32_t pass = ctx.r3.u32;
+  const uint32_t arg1 = ctx.r4.u32;
+  const uint32_t shader_data = ctx.r5.u32;
+  const uint32_t effect_ptr = ctx.r6.u32;
+
+  // Inlined sub_828DFF28: only emit SetPixelShader when bound handle changes.
+  constexpr uint32_t kBoundPixelShaderGlobal = 0x82B0D8BCu;
+  const uint32_t ps = LoadU32(base, arg1 + 8u);
+  if (LoadU32(base, kBoundPixelShaderGlobal) != ps) {
+    StoreU32(base, kBoundPixelShaderGlobal, ps);
+    ctx.r3.u64 = LoadU32(base, 0x831C22A4u);
+    ctx.r4.u64 = ps;
+    ctx.lr = 0x828C8EA8u;
+    sub_82A424A8(ctx, base);
+  }
+
+  const uint16_t count = LoadU16(base, pass + 8u);
+  if (count > 0u) {
+    const uint32_t pair_table = LoadU32(base, pass + 4u);
+    const uint32_t type_table = LoadU32(base, shader_data + 16u);
+    const uint32_t val_table = LoadU32(base, shader_data);
+    const uint32_t effect_base = LoadU32(base, effect_ptr);
+    const uint32_t arg1_table = LoadU32(base, arg1 + 4u);
+
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint32_t entry = pair_table + (i << 1);
+      const uint8_t idx0 = LoadU8(base, entry);
+      const uint8_t param_idx = LoadU8(base, entry + 1u);
+      const uint8_t is_const = LoadU8(base, type_table + idx0);
+      const uint32_t val = LoadU32(base, val_table + (static_cast<uint32_t>(idx0) << 2));
+      const uint32_t param_entry = arg1_table + (static_cast<uint32_t>(param_idx) << 3);
+
+      if (is_const == 0u) {
+        const uint32_t stage = LoadU16(base, param_entry + 2u);
+        const uint32_t desc = effect_base + (static_cast<uint32_t>(idx0) * 48u);
+        const int32_t override_count =
+            static_cast<int32_t>((static_cast<uint32_t>(LoadU8(base, desc + 2u)) >> 1) & 0x7FFFFFFFu);
+        const uint32_t overrides = LoadU32(base, desc + 24u);
+        BindRAGEEffectTextureStage(ctx, base, stage, val, override_count, overrides);
+      } else {
+        const uint32_t reg_type = LoadU8(base, param_entry);
+        const uint32_t reg = LoadU16(base, param_entry + 2u);
+        SetPixelShaderConstantFromRAGE(ctx, base, reg, reg_type, val, is_const);
+      }
+    }
+  }
+
+  ctx.r12.u64 = saved_lr;
+  ctx.lr = saved_lr;
 }
 
 [[gnu::noinline]] void SlowSub828C8F38(PPCContext& ctx, uint8_t* base) {
@@ -6125,42 +6198,8 @@ extern "C" void sub_82A4A600(PPCContext& ctx, uint8_t* base) {
   }
 }
 
-extern "C" void sub_828E0048(PPCContext& ctx, uint8_t* base) {
-  const uint32_t resource_owner = ctx.r4.u32;
-  const uint32_t logical_font_id =
-      IsNativeMode() ? IdentifyVectorFontOwner(base, resource_owner) : 0;
-  ScopedVectorFontBinding binding(logical_font_id, resource_owner, ctx.r3.u32);
-
-  if (rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeTrace) && logical_font_id &&
-      g_vector_font_owner_trace_count.load(std::memory_order_relaxed) < 64 &&
-      REXCVAR_QUERY(bool, gta4_trace_vector_fonts)) {
-    const uint64_t trace = ++g_vector_font_owner_trace_count;
-    if (trace <= 64) {
-      REXLOG_INFO(
-          "gta4-native-font-debug: owner-bind #{} font={} outer-stage={} owner={:08X} "
-          "lr={:08X} live-slots=font1:{:08X},font3:{:08X},font2:{:08X}",
-          trace, logical_font_id, ctx.r3.u32, resource_owner, uint32_t(ctx.lr),
-          LoadU32(base, kVectorFontOwnerBindings[0].owner_slot),
-          LoadU32(base, kVectorFontOwnerBindings[1].owner_slot),
-          LoadU32(base, kVectorFontOwnerBindings[2].owner_slot));
-    }
-  }
-
-  // Preserve the complete retail binding path, including the virtual resource
-  // accessor that converts the owner into the inner D3D texture handle.
-  __imp__sub_828E0048(ctx, base);
-}
-
-extern "C" void sub_82A44B78(PPCContext& ctx, uint8_t* base) {
-  if (!IsNativeMode()) {
-    __imp__sub_82A44B78(ctx, base);
-    return;
-  }
-
-  const uint32_t device = ctx.r3.u32;
-  const uint32_t stage = ctx.r4.u32;
-  const uint32_t texture = ctx.r5.u32;
-  const uint64_t dirty_mask = ctx.r6.u64;
+void BindNativeTextureStage(uint8_t* base, uint32_t device, uint32_t stage, uint32_t texture,
+                            uint64_t dirty_mask) {
   if (stage >= kTextureStageCount) {
     return;
   }
@@ -6245,6 +6284,147 @@ extern "C" void sub_82A44B78(PPCContext& ctx, uint8_t* base) {
   }
   GTA4_FontSelectionTraceBinding(g_vector_font_id, g_vector_font_owner, texture, stage);
   SubmitNativeCommand(command);
+}
+
+void SetPixelShaderConstantFromRAGE(PPCContext& ctx, uint8_t* base, uint32_t reg,
+                                    uint32_t param_type, uint32_t src, uint32_t count) {
+  const uint32_t device = LoadU32(base, 0x831C22A4u);
+  if (param_type == 1u) {
+    ctx.r3.u64 = device;
+    ctx.r4.u64 = reg;
+    ctx.r5.u64 = src;
+    ctx.r6.u64 = 1u;
+    D3DDevice_SetPixelShaderConstantI(ctx, base);
+    return;
+  }
+  if (param_type == 7u) {
+    ctx.r3.u64 = device;
+    ctx.r4.u64 = reg;
+    ctx.r5.u64 = src;
+    ctx.r6.u64 = 1u;
+    sub_82A42398(ctx, base);
+    return;
+  }
+  const int32_t reg_stride = int32_t(LoadU8(base, 0x82B0D32Cu + param_type));
+  const int32_t effective_count = reg_stride * int32_t(count);
+  const uint32_t start_word = reg >> 2;
+  const uint32_t end_word = uint32_t(int32_t(reg) + effective_count - 1);
+  const uint32_t end_block = end_word >> 2;
+  const uint32_t diff = end_block - start_word;
+  const uint32_t shift = std::min<uint32_t>(diff, 63u);
+  const uint64_t mask_raw =
+      static_cast<uint64_t>(std::bit_cast<int64_t>(0x8000000000000000ULL) >> shift);
+  const uint64_t dirty_mask = (start_word & 0x40u) ? 0ULL : (mask_raw >> (start_word & 0x7Fu));
+
+  ctx.r3.u64 = device;
+  ctx.r4.u64 = reg;
+  ctx.r5.u64 = src;
+  ctx.r6.u64 = uint32_t(effective_count);
+  ctx.r7.u64 = dirty_mask;
+  sub_82A42250(ctx, base);
+}
+
+void BindRAGEEffectTextureStage(PPCContext& ctx, uint8_t* base, uint32_t stage,
+                                uint32_t resource_owner, int32_t override_count,
+                                uint32_t overrides) {
+  const uint32_t device = LoadU32(base, 0x831C22A4u);
+  const uint32_t shift = (stage + 32u) & 0x7Fu;
+  const uint64_t dirty_mask = (shift & 0x40u) ? 0ULL : (0x8000000000000000ULL >> shift);
+  if (!resource_owner) {
+    BindNativeTextureStage(base, device, stage, 0u, dirty_mask);
+    return;
+  }
+
+  const uint32_t logical_font_id = IdentifyVectorFontOwner(base, resource_owner);
+  ScopedVectorFontBinding binding(logical_font_id, resource_owner, stage);
+
+  if (rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeTrace) && logical_font_id &&
+      g_vector_font_owner_trace_count.load(std::memory_order_relaxed) < 64 &&
+      REXCVAR_QUERY(bool, gta4_trace_vector_fonts)) {
+    const uint64_t trace = ++g_vector_font_owner_trace_count;
+    if (trace <= 64) {
+      REXLOG_INFO(
+          "gta4-native-font-debug: owner-bind #{} font={} outer-stage={} owner={:08X} "
+          "lr={:08X} live-slots=font1:{:08X},font3:{:08X},font2:{:08X}",
+          trace, logical_font_id, stage, resource_owner, uint32_t(ctx.lr),
+          LoadU32(base, kVectorFontOwnerBindings[0].owner_slot),
+          LoadU32(base, kVectorFontOwnerBindings[1].owner_slot),
+          LoadU32(base, kVectorFontOwnerBindings[2].owner_slot));
+    }
+  }
+
+  // Obtain D3D texture handle via grcTexture's virtual accessor (vtable+60).
+  const uint32_t vtable = LoadU32(base, resource_owner);
+  const uint32_t get_texture_fn = LoadU32(base, vtable + 60u);
+  ctx.r3.u64 = resource_owner;
+  ctx.lr = 0x828E00B4u;
+  REX_CALL_INDIRECT_FUNC(get_texture_fn);
+  const uint32_t tex_handle = ctx.r3.u32;
+
+  BindNativeTextureStage(base, device, stage, tex_handle, dirty_mask);
+
+  // Batch 95: Check sampler states directly on host stack instead of pushing
+  // 208B PPC frames and copying 13 guest words on every texture bind.
+  const uint8_t* defaults_ptr = GuestPointer(base, 0x82B0D24Cu);
+  uint8_t* cached_ptr = GuestPointer(base, 0x831C5890u + stage * 52u);
+  std::array<uint32_t, 13> desired_raw{};
+  if (override_count <= 0) {
+    if (std::memcmp(cached_ptr, defaults_ptr, 48u) == 0) {
+      return;
+    }
+    std::memcpy(desired_raw.data(), defaults_ptr, 48u);
+  } else {
+    std::memcpy(desired_raw.data(), defaults_ptr, 48u);
+    for (int32_t j = 0; j < override_count; ++j) {
+      const uint32_t pair_addr = overrides + uint32_t(j) * 8u;
+      const uint32_t idx = LoadU32(base, pair_addr);
+      if (idx < desired_raw.size()) {
+        std::memcpy(&desired_raw[idx], GuestPointer(base, pair_addr + 4u), sizeof(uint32_t));
+      }
+    }
+    if (std::memcmp(cached_ptr, desired_raw.data(), 48u) == 0) {
+      return;
+    }
+  }
+
+  for (uint32_t i = 0; i < 12u; ++i) {
+    uint32_t cur_raw = 0;
+    std::memcpy(&cur_raw, cached_ptr + i * 4u, sizeof(uint32_t));
+    if (cur_raw == desired_raw[i]) continue;
+    std::memcpy(cached_ptr + i * 4u, &desired_raw[i], sizeof(uint32_t));
+    const uint32_t method_offset = LoadU32(base, 0x82B0D8C0u + i * 4u);
+    const uint32_t setter_fn = LoadU32(base, device + method_offset + 468u);
+    ctx.r3.u64 = device;
+    ctx.r4.u64 = stage;
+    ctx.r5.u64 = __builtin_bswap32(desired_raw[i]);
+    ctx.lr = 0x828E0188u;
+    REX_CALL_INDIRECT_FUNC(setter_fn);
+  }
+}
+
+extern "C" void sub_828E0048(PPCContext& ctx, uint8_t* base) {
+  if (!IsNativeMode()) {
+    __imp__sub_828E0048(ctx, base);
+    return;
+  }
+  const uint32_t stage = ctx.r3.u32;
+  const uint32_t resource_owner = ctx.r4.u32;
+  const int32_t override_count = ctx.r5.s32;
+  const uint32_t overrides = ctx.r6.u32;
+  BindRAGEEffectTextureStage(ctx, base, stage, resource_owner, override_count, overrides);
+}
+
+extern "C" void sub_82A44B78(PPCContext& ctx, uint8_t* base) {
+  if (!IsNativeMode()) {
+    __imp__sub_82A44B78(ctx, base);
+    return;
+  }
+
+  const uint32_t device = ctx.r3.u32;
+  const uint32_t stage = ctx.r4.u32;
+  const uint32_t texture = ctx.r5.u32;
+  const uint64_t dirty_mask = ctx.r6.u64;
+  BindNativeTextureStage(base, device, stage, texture, dirty_mask);
 }
 
 extern "C" void sub_82A46FB0(PPCContext& ctx, uint8_t* base) {
