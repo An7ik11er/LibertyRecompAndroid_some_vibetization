@@ -76,8 +76,11 @@ class NativeDescriptorWorkingSet {
     in_flight_submission_ = 0;
     return true;
   }
+  static constexpr uint32_t kAllStagesMask =
+      Stages >= 32 ? ~0u : ((uint32_t{1} << Stages) - 1u);
   std::optional<Assignment> Assign(const std::array<uint64_t, Stages>& images,
-                                   const std::array<uint64_t, Stages>& samplers) {
+                                   const std::array<uint64_t, Stages>& samplers,
+                                   uint32_t stage_mask = kAllStagesMask) {
     if (!maximum_pages_)
       return std::nullopt;
     if (!active_pages_ && !StartPage())
@@ -96,7 +99,8 @@ class NativeDescriptorWorkingSet {
     Assignment out;
     out.page = uint32_t(active_pages_ - 1);
     Page& page = pages_[out.page];
-    for (size_t i = 0; i < Stages; ++i) {
+    for (uint32_t mask = stage_mask & kAllStagesMask; mask; mask &= mask - 1) {
+      const size_t i = size_t(std::countr_zero(mask));
       out.images[i] =
           images[i] ? Insert(page.image_lookup, page.previous_images, page.images, images[i],
                              image_capacity_, page.image_free_cursor)

@@ -21644,13 +21644,16 @@ NativeFrameTask Gta4NativeGraphicsSystem::PrepareFrameTexturesTask(
   // within a frame and published once at the end, so any earlier draw of this
   // batch is as valid a source as the previous one. Cleared wherever
   // previous_prepared_draw is.
-  constexpr size_t kPreparedDrawCacheSize = 512;
+  constexpr size_t kPreparedDrawCacheSize = 256;
   struct PreparedDrawCacheEntry {
     const NativeCommand* command = nullptr;
     uint64_t signature = 0;
     uint32_t used_texture_mask = 0;
+    uint32_t resolve_generation = 0;
   };
+  static_assert(sizeof(PreparedDrawCacheEntry) == 24);
   std::array<std::array<PreparedDrawCacheEntry, 2>, kPreparedDrawCacheSize> prepared_draw_cache{};
+  uint32_t resolve_generation = 1;
   // With the worker's signatures on both draws, equal inputs are equal
   // signatures (a 64-bit hash of the same fields the full comparison reads).
   const auto prepared_inputs_equal = [](const NativeCommand& previous, const NativeCommand& next) {
@@ -21666,7 +21669,7 @@ NativeFrameTask Gta4NativeGraphicsSystem::PrepareFrameTexturesTask(
   const auto prepared_draw_slot = [](const NativeCommand& draw) -> size_t {
     if (draw.texture_inputs_signature == 0x1ull) return 0;
     if (draw.texture_inputs_signature) {
-      const size_t slot = size_t((draw.texture_inputs_signature >> 55) & (kPreparedDrawCacheSize - 1));
+      const size_t slot = size_t((draw.texture_inputs_signature >> 56) & (kPreparedDrawCacheSize - 1));
       return slot ? slot : 1;
     }
     uint64_t hash = uint64_t(draw.used_texture_mask) * 0x9E3779B97F4A7C15ull;
@@ -21676,7 +21679,7 @@ NativeFrameTask Gta4NativeGraphicsSystem::PrepareFrameTexturesTask(
       hash = (hash ^ uint64_t(reinterpret_cast<uintptr_t>(draw.textures[stage].get()))) *
              0xBF58476D1CE4E5B9ull;
     }
-    const size_t slot = size_t((hash >> 55) & (kPreparedDrawCacheSize - 1));
+    const size_t slot = size_t((hash >> 56) & (kPreparedDrawCacheSize - 1));
     return slot ? slot : 1;
   };
   const bool reuse_prepared_bindings = !trace_reflections && !FireTraceConfig().enabled &&
@@ -21845,13 +21848,17 @@ if (!PrepareFrameDescriptorPool(descriptor_pool_draw_count, combined_descriptor_
     cached_draws.reserve(draw_count);
   }
 
-   NativeDrawDescriptorKey null_descriptor_key{};
+  NativeDrawDescriptorKey null_descriptor_key{};
   null_descriptor_key.layout_epoch = next_cached_descriptor_epoch_;
   null_descriptor_key.images_2d.fill(null_texture_2d_.view);
   null_descriptor_key.images_2d_array.fill(null_texture_2d_array_.view);
   null_descriptor_key.images_3d.fill(null_texture_3d_.view);
   null_descriptor_key.images_cube.fill(null_texture_cube_.view);
   null_descriptor_key.samplers.fill(null_sampler_);
+  // Batch 96: Keep one scratch key & reset only previously modified stages per miss
+  // instead of memcpying 1,256 B from null_descriptor_key on every cache miss.
+  NativeDrawDescriptorKey descriptor_key = null_descriptor_key;
+  uint32_t descriptor_key_dirty_mask = 0;
 
   const bool prefetch_commands = REXCVAR_GET(gta4_native_recorder_prefetch);
   struct alignas(64) DescriptorKeyMRUEntry {
@@ -21862,9 +21869,13 @@ if (!PrepareFrameDescriptorPool(descriptor_pool_draw_count, combined_descriptor_
     std::array<uint32_t, kTextureStageCount> texture_indices{};
     std::array<uint32_t, kTextureStageCount> sampler_indices{};
     uint64_t epoch = 0;
+    uint32_t dirty_mask = 0;
     bool valid = false;
   };
   std::array<DescriptorKeyMRUEntry, 4> descriptor_mru{};
+  for (auto& entry : descriptor_mru) {
+    entry.key = null_descriptor_key;
+  }
   std::array<uint8_t, 4> descriptor_mru_order{0, 1, 2, 3};
 
   const auto compute_stage_fingerprint = [](size_t stage, const NativeDrawDescriptorKey& key) -> uint64_t {
@@ -21925,7 +21936,11 @@ if (!PrepareFrameDescriptorPool(descriptor_pool_draw_count, combined_descriptor_
     if (command.type == CommandType::kResolve && resolve_destination_image && !trace_reflections &&
         PlanResolveSwap(command, *resolve_destination_image, texture_commands, command_index)) {
       previous_prepared_draw = nullptr;
-      prepared_draw_cache.fill({});
+      ++resolve_generation;
+      if (resolve_generation == 0) {
+        prepared_draw_cache.fill({});
+        resolve_generation = 1;
+      }
       for (auto& entry : descriptor_mru) entry.valid = false;
       descriptor_mru_order = {0, 1, 2, 3};
     }
@@ -21944,7 +21959,10 @@ if (!PrepareFrameDescriptorPool(descriptor_pool_draw_count, combined_descriptor_
         native_descriptor_backend_ == NativeDescriptorBackend::kIndexed && native_descriptor_paging_) {
       const NativeCommand* source = nullptr;
       const auto way_matches = [&](const PreparedDrawCacheEntry& way) {
-        if (!way.command || way.command == previous_prepared_draw) return false;
+        if (way.resolve_generation != resolve_generation || !way.command ||
+            way.command == previous_prepared_draw) {
+          return false;
+        }
         if (command.texture_inputs_signature && command.pipeline_state) {
           return way.signature == command.texture_inputs_signature &&
                  way.used_texture_mask == command.used_texture_mask;
@@ -21987,15 +22005,27 @@ if (!PrepareFrameDescriptorPool(descriptor_pool_draw_count, combined_descriptor_
       alpha_card_category = ClassifyAlphaCardDiagnosticShader(alpha_card_pixel_shader->filename);
     }
 
-    NativeDrawDescriptorKey descriptor_key = null_descriptor_key;
+    const bool fast_indexed_paging =
+        native_descriptor_backend_ == NativeDescriptorBackend::kIndexed && native_descriptor_paging_;
+    const uint32_t stage_mask =
+        fast_indexed_paging ? (command.used_texture_mask & kSupportedShaderTextureMask)
+                            : kSupportedShaderTextureMask;
+    for (uint32_t reset_mask = descriptor_key_dirty_mask; reset_mask; reset_mask &= reset_mask - 1) {
+      const uint32_t s = uint32_t(std::countr_zero(reset_mask));
+      descriptor_key.image_lifetimes[s] = 0;
+      descriptor_key.images_2d[s] = null_texture_2d_.view;
+      descriptor_key.images_2d_array[s] = null_texture_2d_array_.view;
+      descriptor_key.images_3d[s] = null_texture_3d_.view;
+      descriptor_key.images_cube[s] = null_texture_cube_.view;
+      descriptor_key.samplers[s] = null_sampler_;
+    }
     descriptor_key.layout_epoch = next_cached_descriptor_epoch_;
+    descriptor_key_dirty_mask = stage_mask;
     command.descriptor_page = UINT32_MAX;
     command.image_descriptor_epoch = 0;
     command.sampler_descriptor_epoch = 0;
     command.cached_descriptor_epoch = 0;
     command.descriptor_copy = active_descriptor_copy_;
-    const bool fast_indexed_paging =
-        native_descriptor_backend_ == NativeDescriptorBackend::kIndexed && native_descriptor_paging_;
     if (command.bindings_prepared || command.failed_texture_mask || !fast_indexed_paging) [[unlikely]] {
       command.texture_descriptor_indices.fill(0);
       command.sampler_descriptor_indices.fill(0);
@@ -22023,9 +22053,6 @@ if (!PrepareFrameDescriptorPool(descriptor_pool_draw_count, combined_descriptor_
     command.guest_null_texture_mask = 0;
     command.failed_texture_mask = 0;
     command.bindings_prepared = false;
-    const uint32_t stage_mask =
-        fast_indexed_paging ? (command.used_texture_mask & kSupportedShaderTextureMask)
-                            : kSupportedShaderTextureMask;
     
     for (uint32_t mask = stage_mask; mask; mask &= mask - 1) {
       const uint32_t stage = uint32_t(std::countr_zero(mask));
@@ -22401,8 +22428,25 @@ if (!PrepareFrameDescriptorPool(descriptor_pool_draw_count, combined_descriptor_
       int hit_pos = -1;
       for (int pos = 0; pos < 4; ++pos) {
         const auto& candidate = descriptor_mru[descriptor_mru_order[pos]];
-        if (candidate.valid && candidate.fingerprint == key_fp &&
-            candidate.key == descriptor_key) {
+        if (!candidate.valid || candidate.fingerprint != key_fp ||
+            candidate.key.layout_epoch != descriptor_key.layout_epoch) {
+          continue;
+        }
+        bool match = true;
+        for (uint32_t cmp_mask = candidate.dirty_mask | stage_mask; cmp_mask;
+             cmp_mask &= cmp_mask - 1) {
+          const uint32_t s = uint32_t(std::countr_zero(cmp_mask));
+          if (candidate.key.image_lifetimes[s] != descriptor_key.image_lifetimes[s] ||
+              candidate.key.images_2d[s] != descriptor_key.images_2d[s] ||
+              candidate.key.images_2d_array[s] != descriptor_key.images_2d_array[s] ||
+              candidate.key.images_3d[s] != descriptor_key.images_3d[s] ||
+              candidate.key.images_cube[s] != descriptor_key.images_cube[s] ||
+              candidate.key.samplers[s] != descriptor_key.samplers[s]) {
+            match = false;
+            break;
+          }
+        }
+        if (match) {
           hit_pos = pos;
           break;
         }
@@ -22424,7 +22468,7 @@ if (!PrepareFrameDescriptorPool(descriptor_pool_draw_count, combined_descriptor_
           descriptor_mru_order[0] = hit_slot;
         }
       } else {
-        if (!AssignIndexedWorkingSet(command, descriptor_key)) co_return false;
+        if (!AssignIndexedWorkingSet(command, descriptor_key, stage_mask)) co_return false;
         const uint8_t evict_slot = descriptor_mru_order[3];
         for (int j = 3; j > 0; --j) {
           descriptor_mru_order[j] = descriptor_mru_order[j - 1];
@@ -22433,7 +22477,27 @@ if (!PrepareFrameDescriptorPool(descriptor_pool_draw_count, combined_descriptor_
         auto& mru_slot = descriptor_mru[evict_slot];
         mru_slot.valid = true;
         mru_slot.fingerprint = key_fp;
-        mru_slot.key = descriptor_key;
+        for (uint32_t clear_mask = mru_slot.dirty_mask & ~stage_mask; clear_mask;
+             clear_mask &= clear_mask - 1) {
+          const uint32_t s = uint32_t(std::countr_zero(clear_mask));
+          mru_slot.key.image_lifetimes[s] = 0;
+          mru_slot.key.images_2d[s] = null_texture_2d_.view;
+          mru_slot.key.images_2d_array[s] = null_texture_2d_array_.view;
+          mru_slot.key.images_3d[s] = null_texture_3d_.view;
+          mru_slot.key.images_cube[s] = null_texture_cube_.view;
+          mru_slot.key.samplers[s] = null_sampler_;
+        }
+        mru_slot.key.layout_epoch = descriptor_key.layout_epoch;
+        for (uint32_t copy_mask = stage_mask; copy_mask; copy_mask &= copy_mask - 1) {
+          const uint32_t s = uint32_t(std::countr_zero(copy_mask));
+          mru_slot.key.image_lifetimes[s] = descriptor_key.image_lifetimes[s];
+          mru_slot.key.images_2d[s] = descriptor_key.images_2d[s];
+          mru_slot.key.images_2d_array[s] = descriptor_key.images_2d_array[s];
+          mru_slot.key.images_3d[s] = descriptor_key.images_3d[s];
+          mru_slot.key.images_cube[s] = descriptor_key.images_cube[s];
+          mru_slot.key.samplers[s] = descriptor_key.samplers[s];
+        }
+        mru_slot.dirty_mask = stage_mask;
         mru_slot.page = command.descriptor_page;
         mru_slot.copy = command.descriptor_copy;
         mru_slot.texture_indices = command.texture_descriptor_indices;
@@ -22444,13 +22508,14 @@ if (!PrepareFrameDescriptorPool(descriptor_pool_draw_count, combined_descriptor_
       if (use_prepared_draw_cache && !command.temporal_scene_binding && !TvCommandRole(command) &&
           command.bindings_prepared && !command.failed_texture_mask && command.pipeline_state) {
         auto& ways = prepared_draw_cache[prepared_slot];
-        if (ways[0].command != &command) {
+        if (ways[0].resolve_generation != resolve_generation || ways[0].command != &command) {
           ways[1] = ways[0];
-          ways[0] = {&command, command.texture_inputs_signature, command.used_texture_mask};
+          ways[0] = {&command, command.texture_inputs_signature, command.used_texture_mask,
+                     resolve_generation};
         }
       }
     } else {
-      cached_draws.emplace_back(&command, std::move(descriptor_key));
+      cached_draws.emplace_back(&command, descriptor_key);
     }
   }
   g_hitch_tex_loop_ns.store(FrameTimelineNow() - tex_loop_t0, std::memory_order_relaxed);
@@ -26338,10 +26403,13 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
   auto* vulkan_provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
   const auto* vulkan_device = vulkan_provider->vulkan_device();
 
+  const uint64_t pipeline_serial = command.pipeline_state.serial();
+  const uint32_t command_device = CommandDevice(command.type, command.bytes.data());
   const size_t fast_shared_slot =
-      (size_t((reinterpret_cast<uintptr_t>(command.pipeline_state.get()) >> 6) * 0x9E3779B97F4A7C15ull) ^
+      (size_t(pipeline_serial * 0x9E3779B97F4A7C15ull) ^
        size_t((reinterpret_cast<uintptr_t>(command.fixed_function_state.get()) >> 6) * 0xBF58476D1CE4E5B9ull) ^
        size_t(command.texture_inputs_signature) ^
+       size_t(command_device) ^
        size_t(vertex_booleans) ^ (size_t(pixel_booleans) << 16)) &
       (fast_shared_memo_cache_.size() - 1);
   FastSharedConstMemo& s_fast_shared_memo = fast_shared_memo_cache_[fast_shared_slot];
@@ -26349,11 +26417,12 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
   const StateVersionStamp boolean_ver =
       command.shader_state->versions.Get(DirtyStateComponent::kBooleanConstants);
   const bool can_reuse_shared_allocation =
-      resources.has_last_shared_key &&
+      pipeline_serial != 0 &&
       command.texture_inputs_signature != 0 &&
       s_fast_shared_memo.frame              == diagnostic_submitted_frame_ &&
       s_fast_shared_memo.cb                 == command_buffer &&
-      s_fast_shared_memo.pipe_state         == command.pipeline_state.get() &&
+      s_fast_shared_memo.pipeline_serial    == pipeline_serial &&
+      s_fast_shared_memo.device             == command_device &&
       s_fast_shared_memo.fixed_state        == command.fixed_function_state.get() &&
       s_fast_shared_memo.env_data           == command.environmental_data.get() &&
       s_fast_shared_memo.texture_inputs_sig == command.texture_inputs_signature &&
@@ -26376,11 +26445,12 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
       s_fast_shared_memo.is_reflection      == target.is_reflection &&
       s_fast_shared_memo.temporal_jitter    == target.temporal_jitter;
 
-  NativeSharedConstantSemanticKey shared_key{};
+  uint32_t shared_color_output_info_0 = 0;
   if (can_reuse_shared_allocation) [[likely]] {
     shared_constants_allocation = s_fast_shared_memo.allocation;
-    shared_key.color_output_info[0] = s_fast_shared_memo.color_output_info_0;
+    shared_color_output_info_0 = s_fast_shared_memo.color_output_info_0;
   } else {
+  NativeSharedConstantSemanticKey shared_key{};
   shared_key.texture_descriptor_indices = command.texture_descriptor_indices;
   shared_key.sampler_descriptor_indices = command.sampler_descriptor_indices;
   shared_key.boolean_version =
@@ -26481,11 +26551,15 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
     return false;
   }
   bool shared_hit = false;
+  uint64_t shared_key_hash = 0;
   if (resources.has_last_shared_key && shared_key == resources.last_shared_key) {
     shared_constants_allocation = resources.last_shared_allocation;
     shared_hit = true;
   } else {
-    for (const auto& entry : resources.shared_mru) {
+    shared_key_hash = NativeSharedConstantSemanticKeyHash{}(shared_key);
+    for (size_t i = 0; i < NativeFrameResources::kSharedMruSize; ++i) {
+      if (resources.shared_mru_hashes[i] != shared_key_hash) continue;
+      const auto& entry = resources.shared_mru[i];
       if (entry.valid && entry.key == shared_key) {
         shared_constants_allocation = entry.allocation;
         shared_hit = true;
@@ -26608,18 +26682,23 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
         return false;
       }
     }
-    auto& mru_entry = resources.shared_mru[resources.shared_mru_cursor++ & (NativeFrameResources::kSharedMruSize - 1)];
+    const uint32_t mru_slot =
+        resources.shared_mru_cursor++ & (NativeFrameResources::kSharedMruSize - 1);
+    auto& mru_entry = resources.shared_mru[mru_slot];
     mru_entry.valid = true;
     mru_entry.key = shared_key;
     mru_entry.allocation = shared_constants_allocation;
+    resources.shared_mru_hashes[mru_slot] = shared_key_hash;
     resources.has_last_shared_key = true;
     resources.last_shared_key = shared_key;
     resources.last_shared_allocation = shared_constants_allocation;
   }
 
+  shared_color_output_info_0 = shared_key.color_output_info[0];
   s_fast_shared_memo.frame              = diagnostic_submitted_frame_;
   s_fast_shared_memo.cb                 = command_buffer;
-  s_fast_shared_memo.pipe_state         = command.pipeline_state.get();
+  s_fast_shared_memo.pipeline_serial    = pipeline_serial;
+  s_fast_shared_memo.device             = command_device;
   s_fast_shared_memo.fixed_state        = command.fixed_function_state.get();
   s_fast_shared_memo.env_data           = command.environmental_data.get();
   s_fast_shared_memo.texture_inputs_sig = command.texture_inputs_signature;
@@ -26637,7 +26716,7 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
   s_fast_shared_memo.logical_height     = logical_height;
   s_fast_shared_memo.samples            = uint32_t(samples);
   s_fast_shared_memo.color_mask         = target.color_attachment_mask;
-  s_fast_shared_memo.color_output_info_0= shared_key.color_output_info[0];
+  s_fast_shared_memo.color_output_info_0= shared_color_output_info_0;
   s_fast_shared_memo.temporal_mode      = command.temporal_composite_mode;
   s_fast_shared_memo.split_postfx       = command.split_postfx_applied;
   s_fast_shared_memo.is_reflection      = target.is_reflection;
@@ -26654,7 +26733,7 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
     static std::atomic<uint32_t> glass_output_records{0};
     const uint32_t record = glass_output_records.fetch_add(1, std::memory_order_relaxed);
     if (record < 128) {
-      const auto output = NativeColorOutput(shared_key.color_output_info[0]);
+      const auto output = NativeColorOutput(shared_color_output_info_0);
       REXLOG_INFO("gta4-native-glass-output: frame={} cmd={} record={} ps={:016X} "
                   "target={:08X} color-info={:08X} exponent={} scale={} alpha-bounds={},{} "
                   "alpha-test={},{},{} blend={},{},{} output-contract=post-coverage-v1 "
@@ -26662,7 +26741,7 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
                   diagnostic_submitted_frame_, diagnostic_command_index_, record,
                   command.pipeline_state->pixel_shader_resource->hash,
                   command.pipeline_state->render_targets[0].handle,
-                  shared_key.color_output_info[0], NativeColorExponent(shared_key.color_output_info[0]),
+                  shared_color_output_info_0, NativeColorExponent(shared_color_output_info_0),
                   output.scale[0], output.minimum[3], output.maximum[3], fixed.alpha_test_enable,
                   fixed.alpha_function, fixed.alpha_reference, fixed.source_blend,
                   fixed.destination_blend, fixed.blend_operation,

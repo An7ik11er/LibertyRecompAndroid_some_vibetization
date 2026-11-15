@@ -11,7 +11,7 @@ if (bulb_trace_frame_ && command.bulb_trace) {
   };
   const auto* pixel_shader=command.pipeline_state->pixel_shader_resource;
   const auto selection=ResolvePipelineShaderOverrides(command.pipeline_state->vertex_shader_resource,pixel_shader,target.samples);
-  const auto color=NativeColorOutput(shared_key.color_output_info[0]);
+  const auto color=NativeColorOutput(shared_color_output_info_0);
   TraceBulbCommand("bound",command,"actual-gpu-bindings");
   REXLOG_INFO("gta4-bulb: point=upload run={} frame={} cmd={} seq={} fixture={} vertex-upload-equal={} pixel-upload-equal={} "
               "vertex-buffer={} offset={} address={} pixel-buffer={} offset={} address={} shared-buffer={} offset={} address={} "
@@ -117,11 +117,11 @@ if (bulb_trace_frame_ && !bulb_routes_.empty() && command.pipeline_state &&
       const std::span<const uint8_t> snapshot(command.device_snapshot.data(), command.device_snapshot.size());
       dump("-producer-pixel.bin", snapshot.subspan(kPixelConstantsOffset, kPixelConstantsSize));
     }
-    const auto output = NativeColorOutput(shared_key.color_output_info[0]);
+    const auto output = NativeColorOutput(shared_color_output_info_0);
     REXLOG_INFO("gta4-bulb: point=postfx-bind frame={} cmd={} seq={} ps={:016X} target={:08X}/{:08X} extent={}x{} "
                 "used={:08X} realized={:08X} failed={:08X} color-scale={} blend={:08X} source-snapshot={}",
                 diagnostic_submitted_frame_, diagnostic_command_index_, command.diagnostic_submit_sequence,
-                shader.hash, command.pipeline_state->render_targets[0].handle, shared_key.color_output_info[0],
+                shader.hash, command.pipeline_state->render_targets[0].handle, shared_color_output_info_0,
                 width, height, command.used_texture_mask, command.realized_image_mask, command.failed_texture_mask,
                 output.scale[0], fixed.blend_controls[0], command.device_snapshot.size() >= kGuestDeviceSize);
     for (uint32_t slot = 0; slot < command.textures.size(); ++slot) {
@@ -182,7 +182,7 @@ if (NeedsBulbInterference(command, target)) {
               fixed.blend_enable,fixed.blend_controls[0],fixed.depth_enable,fixed.depth_function,fixed.depth_write_enable,
               fixed.stencil_enable,fixed.cull_mode,viewport.x,viewport.y,viewport.width,viewport.height,viewport.minDepth,viewport.maxDepth,
               scissor.offset.x,scissor.offset.y,scissor.extent.width,scissor.extent.height,target.color_write_mask,
-              shared_key.color_output_info[0],command.bindings_prepared);
+              shared_color_output_info_0,command.bindings_prepared);
   for (uint32_t stage=0;stage<command.textures.size();++stage) {
     if (!(command.used_texture_mask & (uint32_t{1}<<stage))) continue;
     const auto& fetch=command.texture_fetches[stage];

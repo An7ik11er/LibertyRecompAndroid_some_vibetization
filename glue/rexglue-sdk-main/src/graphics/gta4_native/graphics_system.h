@@ -526,6 +526,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     const NativePipelineState* operator->() const { return &state_; }
     const NativePipelineState& operator*() const { return state_; }
     const NativePipelineState* get() const { return present_ ? &state_ : nullptr; }
+    uint64_t serial() const { return present_ ? serial_ : 0; }
     explicit operator bool() const { return present_; }
     void reset() {
       if (!present_) return;
@@ -2010,6 +2011,8 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
       NativeUploadAllocation allocation{};
     };
     std::array<SharedMruEntry, kSharedMruSize> shared_mru{};
+    // Batch 96: 2-cache-line fingerprint table avoids touching 140 cache lines across shared_mru[16] on miss.
+    std::array<uint64_t, kSharedMruSize> shared_mru_hashes{};
     uint32_t shared_mru_cursor = 0;
     struct LastVbUploadMemo {
       const NativeBufferResource* resource = nullptr;
@@ -2048,6 +2051,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
       last_shared_key = {};
       last_shared_allocation = {};
       for (auto& entry : shared_mru) entry.valid = false;
+      shared_mru_hashes.fill(0);
       shared_mru_cursor = 0;
       last_vb_uploads = {};
       last_ib_upload = {};
@@ -3942,7 +3946,8 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
       native_descriptor_working_sets_;
   bool BeginIndexedWorkingSet();
   template <typename DescriptorKey>
-  bool AssignIndexedWorkingSet(NativeCommand& command, const DescriptorKey& key);
+  bool AssignIndexedWorkingSet(NativeCommand& command, const DescriptorKey& key,
+                               uint32_t active_stage_mask = ~0u);
   bool PublishIndexedWorkingSet();
   std::unique_ptr<NativeCachedDescriptorState> native_cached_descriptor_state_;
   std::map<uint64_t, std::vector<NativeDescriptorRetirement>> native_descriptor_retirement_journal_;
@@ -4057,7 +4062,8 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     uint64_t frame = ~0ull;
     VkCommandBuffer cb = VK_NULL_HANDLE;
     const NativeFixedFunctionState* fixed_state = nullptr;
-    const NativePipelineState* pipe_state = nullptr;
+    uint64_t pipeline_serial = 0;
+    uint32_t device = 0;
     const EnvironmentalDataV2* env_data = nullptr;
     uint32_t descriptor_page = UINT32_MAX, descriptor_copy = UINT32_MAX;
     uint64_t image_epoch = 0, sampler_epoch = 0, cached_epoch = 0;

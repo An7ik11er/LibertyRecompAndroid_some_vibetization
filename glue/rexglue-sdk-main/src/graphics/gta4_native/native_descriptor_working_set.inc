@@ -16,13 +16,18 @@ bool Gta4NativeGraphicsSystem::BeginIndexedWorkingSet() {
 
 template <typename DescriptorKey>
 bool Gta4NativeGraphicsSystem::AssignIndexedWorkingSet(NativeCommand& command,
-                                                       const DescriptorKey& key) {
+                                                       const DescriptorKey& key,
+                                                       uint32_t active_stage_mask) {
   auto& planner = native_descriptor_working_sets_[active_frame_slot_];
+  const uint32_t active_mask =
+      active_stage_mask & ((uint32_t{1} << kShaderTextureCount) - 1u);
   std::array<uint64_t, kShaderTextureCount> sampler_ids{};
-  for (size_t i = 0; i < sampler_ids.size(); ++i)
+  for (uint32_t mask = active_mask; mask; mask &= mask - 1) {
+    const size_t i = size_t(std::countr_zero(mask));
     sampler_ids[i] =
         key.samplers[i] == null_sampler_ ? 0 : NativeVulkanHandleIdentity(key.samplers[i]);
-  const auto assignment = planner.Assign(key.image_lifetimes, sampler_ids);
+  }
+  const auto assignment = planner.Assign(key.image_lifetimes, sampler_ids, active_mask);
   if (!assignment) {
     // This is a real per-frame device-budget overflow, not history exhaustion.
     // PrepareFrameTextures will replay its preparation once with exact cached
@@ -48,7 +53,8 @@ bool Gta4NativeGraphicsSystem::AssignIndexedWorkingSet(NativeCommand& command,
     page.sampler_slots[0] = null_sampler;
     page.samplers_dirty = true;
   }
-  for (size_t i = 0; i < kShaderTextureCount; ++i) {
+  for (uint32_t mask = active_mask; mask; mask &= mask - 1) {
+    const size_t i = size_t(std::countr_zero(mask));
     const uint32_t image_index = assignment->images[i];
     const uint32_t sampler_index = assignment->samplers[i];
     if (image_index) {
