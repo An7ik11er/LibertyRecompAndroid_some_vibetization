@@ -27736,6 +27736,14 @@ bool Gta4NativeGraphicsSystem::RecordPrimitiveUp(VkCommandBuffer command_buffer,
 bool Gta4NativeGraphicsSystem::GetRequiredVertexStreams(
     const NativePipelineState& state,
     std::array<bool, kVertexStreamCount>& required_streams) const {
+  if (state.required_streams_mask != 0xFFFFFFFFu) [[likely]] {
+    required_streams.fill(false);
+    for (uint32_t mask = state.required_streams_mask; mask; mask &= mask - 1) {
+      const uint32_t stream = uint32_t(std::countr_zero(mask));
+      if (stream < kVertexStreamCount) required_streams[stream] = true;
+    }
+    return true;
+  }
   const NativeShader* vs = state.vertex_shader_resource;
   const NativeVertexDeclaration* vdecl = state.vertex_declaration_resource.get();
   if (!vs || !vdecl) {
@@ -27745,26 +27753,11 @@ bool Gta4NativeGraphicsSystem::GetRequiredVertexStreams(
   if (vdecl->maximum_stream == 0 && !vs->vertex_inputs.empty() && !vdecl->elements.empty()) {
     required_streams.fill(false);
     required_streams[0] = true;
-    return true;
-  }
-  struct StreamMemo {
-    const NativeShader* vs = nullptr;
-    const NativeVertexDeclaration* vdecl = nullptr;
-    uint64_t vs_hash = 0;
-    uint64_t vdecl_gen = 0;
-    std::array<bool, kVertexStreamCount> streams{};
-    bool valid = false;
-  };
-  static thread_local std::array<StreamMemo, 64> s_memo{};
-  const size_t slot = ((reinterpret_cast<uintptr_t>(vs) >> 4) ^
-                       (reinterpret_cast<uintptr_t>(vdecl) >> 2)) & 63;
-  StreamMemo& m = s_memo[slot];
-  if (m.valid && m.vs == vs && m.vdecl == vdecl &&
-      m.vs_hash == vs->hash && m.vdecl_gen == vdecl->generation) {
-    required_streams = m.streams;
+    state.required_streams_mask = 1u;
     return true;
   }
 
+  uint32_t mask = 0;
   required_streams.fill(false);
   for (const NativeVertexInput& shader_input : vs->vertex_inputs) {
     const VertexElement* matching_element = nullptr;
@@ -27782,8 +27775,9 @@ bool Gta4NativeGraphicsSystem::GetRequiredVertexStreams(
       return false;
     }
     required_streams[matching_element->stream] = true;
+    mask |= (1u << matching_element->stream);
   }
-  m = {vs, vdecl, vs->hash, vdecl->generation, required_streams, true};
+  state.required_streams_mask = mask;
   return true;
 }
 
