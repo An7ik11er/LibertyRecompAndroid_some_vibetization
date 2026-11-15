@@ -133,7 +133,9 @@ void Event(TemporalEvent event) {
   SubmitNativeCommand(command);
 }
 void Draw(uint8_t* base, uint32_t device) {
-  if (!enabled.load(std::memory_order_acquire) || !device)
+  if (!enabled.load(std::memory_order_relaxed) || !device)
+    return;
+  if (!enabled.load(std::memory_order_acquire))
     return;
   TemporalCommand c;
   c.event = TemporalEvent::kInstance;

@@ -481,6 +481,7 @@ struct ActiveNativeCommandCapture {
 };
 
 thread_local ActiveNativeCommandCapture g_active_native_capture;
+std::atomic<uint32_t> g_active_native_capture_count{0};
 std::mutex g_cached_native_command_lists_mutex;
 std::unordered_map<uint32_t, std::shared_ptr<const CachedNativeCommandList>>
     g_cached_native_command_lists;
@@ -2607,9 +2608,17 @@ rex::system::IGraphicsSystem* GetNativeGraphicsSystem() {
     return nullptr;
   }
   auto* graphics = runtime->graphics_system();
-  if (!graphics || graphics->GetTitleCommandAbi(kTitleId) != kTitleCommandAbi) {
+  if (!graphics) {
     return nullptr;
   }
+  static std::atomic<rex::system::IGraphicsSystem*> cached_verified_graphics{nullptr};
+  if (cached_verified_graphics.load(std::memory_order_relaxed) == graphics) [[likely]] {
+    return graphics;
+  }
+  if (graphics->GetTitleCommandAbi(kTitleId) != kTitleCommandAbi) {
+    return nullptr;
+  }
+  cached_verified_graphics.store(graphics, std::memory_order_relaxed);
   return graphics;
 }
 
@@ -3453,16 +3462,24 @@ template <typename Command>
 bool SubmitNativeCommand(const Command& command) {
   uint32_t help_device = 0;
   if constexpr (requires { command.device; }) help_device = command.device;
-  if (CaptureNativeCommand(command)) {
+  if (g_active_native_capture_count.load(std::memory_order_relaxed) != 0 &&
+      CaptureNativeCommand(command)) [[unlikely]] {
     GTA4_HelpTraceNativeSubmission(uint32_t(command.header.type), help_device, true, true);
     return true;
   }
-  if (auto* graphics = GetNativeGraphicsSystem()) {
-    uint32_t phone_device = 0;
-    if constexpr (requires { command.device; }) phone_device = command.device;
-    const bool accepted = SubmitFireTracedCommand(&command, sizeof(command), phone_device);
+  if (auto* graphics = GetNativeGraphicsSystem()) [[likely]] {
+    static const bool s_no_static_traces =
+        !FireTraceConfig().enabled && !TvTraceConfig().enabled && !PhoneTraceConfig().enabled;
+    bool accepted = false;
+    if (s_no_static_traces && !gta4::gpu_pass::Enabled()) [[likely]] {
+      accepted = graphics->SubmitTitleCommand(kTitleId, kTitleCommandAbi, &command, sizeof(command));
+    } else {
+      uint32_t phone_device = 0;
+      if constexpr (requires { command.device; }) phone_device = command.device;
+      accepted = SubmitFireTracedCommand(&command, sizeof(command), phone_device);
+    }
     GTA4_HelpTraceNativeSubmission(uint32_t(command.header.type), help_device, accepted, false);
-    if (!accepted && rex::diagnostics::IsEnabled(rex::diagnostics::Category::kGuestHooks)) {
+    if (!accepted && rex::diagnostics::IsEnabled(rex::diagnostics::Category::kGuestHooks)) [[unlikely]] {
       static std::atomic<uint64_t> rejection_count{0};
       const uint64_t count = NextNativeHookDiagnosticCall(rejection_count);
       if (ShouldLogNativeHookCall(count)) {
@@ -3621,13 +3638,27 @@ void SubmitEnvironmentalData(uint8_t* base, uint32_t device, uint32_t postfx) {
 
 #include "gta4_temporal_hooks.inc"
 
+inline bool CachedGuestHooksEnabled() {
+  static std::atomic<int> cached{-1};
+  int value = cached.load(std::memory_order_relaxed);
+  if (value < 0) [[unlikely]] {
+    const bool enabled = rex::diagnostics::IsEnabled(rex::diagnostics::Category::kGuestHooks);
+    if (!rex::diagnostics::IsConfigured()) {
+      return enabled;
+    }
+    value = enabled ? 1 : 0;
+    cached.store(value, std::memory_order_relaxed);
+  }
+  return value != 0;
+}
+
 bool ShouldLogNativeHookCall(uint64_t call_count) {
-  return call_count != 0 && rex::diagnostics::IsEnabled(rex::diagnostics::Category::kGuestHooks) &&
+  return call_count != 0 && CachedGuestHooksEnabled() &&
          (call_count <= 32 || !(call_count % 4096));
 }
 
 uint64_t NextNativeHookDiagnosticCall(std::atomic<uint64_t>& counter) {
-  if (!rex::diagnostics::IsEnabled(rex::diagnostics::Category::kGuestHooks)) {
+  if (!CachedGuestHooksEnabled()) [[likely]] {
     return 0;
   }
   return counter.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -4324,12 +4355,13 @@ void InitializeNativeCommandScratch(uint8_t* base, uint32_t device) {
 
 NativeDirtyState ConsumeNativeDrawDirtyState(uint8_t* base, uint32_t device) {
   NativeDirtyState dirty_state{};
+  uint8_t* cursor = GuestPointer(base, device);
   for (uint32_t index = 0; index < dirty_state.words.size(); ++index) {
-    const uint32_t offset = device + index * sizeof(uint64_t);
-    const uint64_t val = LoadU64(base, offset);
-    dirty_state.words[index] = val;
-    if (val != 0) {
-      StoreU64(base, offset, 0);
+    uint64_t raw = 0;
+    std::memcpy(&raw, cursor + index * sizeof(uint64_t), sizeof(uint64_t));
+    if (raw != 0) [[unlikely]] {
+      dirty_state.words[index] = __builtin_bswap64(raw);
+      std::memset(cursor + index * sizeof(uint64_t), 0, sizeof(uint64_t));
     }
   }
   return dirty_state;
@@ -5340,12 +5372,16 @@ extern "C" void sub_828C01E0(PPCContext& ctx, uint8_t* base) {
     return;
   }
 
-  if (g_active_native_capture.active) {
+  const bool was_active = g_active_native_capture.active;
+  if (was_active) {
     REXLOG_WARN("gta4-native-cache: replacing unfinished build object={:08X} commands={}",
                 g_active_native_capture.build_object, g_active_native_capture.commands.size());
   }
   g_active_native_capture = {};
   g_active_native_capture.active = true;
+  if (!was_active) {
+    g_active_native_capture_count.fetch_add(1, std::memory_order_relaxed);
+  }
   g_active_native_capture.base = base;
   g_active_native_capture.build_object = ctx.r3.u32;
   __imp__sub_828C01E0(ctx, base);
@@ -5371,6 +5407,7 @@ extern "C" void sub_828C0338(PPCContext& ctx, uint8_t* base) {
   const uint32_t command_list = output ? LoadU32(base, output) : 0;
   std::vector<CapturedNativeCommand> commands = std::move(g_active_native_capture.commands);
   g_active_native_capture = {};
+  g_active_native_capture_count.fetch_sub(1, std::memory_order_relaxed);
 
   if (command_list) {
     const size_t command_count = commands.size();

@@ -807,9 +807,23 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     void RetireResources() {
       const uint32_t texture_mask = used_texture_mask;
       const uint32_t stream_mask = captured_stream_mask;
+      const bool clear_indexed_descriptors =
+          bindings_prepared || failed_texture_mask || realized_image_mask || realized_sampler_mask;
+      const bool indexed_sparse_clear =
+          clear_indexed_descriptors && descriptor_page != UINT32_MAX && !failed_texture_mask;
       for (uint32_t mask = texture_mask; mask; mask &= mask - 1) {
         const uint32_t stage = uint32_t(std::countr_zero(mask));
         if (stage < texture_fetches.size()) texture_fetches[stage] = xenos::xe_gpu_texture_fetch_t{};
+        if (indexed_sparse_clear && stage < texture_descriptor_indices.size()) {
+          texture_descriptor_indices[stage] = 0;
+          sampler_descriptor_indices[stage] = 0;
+          binding_realization[stage] = NativeBindingRealization::kUnused;
+        }
+      }
+      if (clear_indexed_descriptors && !indexed_sparse_clear) {
+        texture_descriptor_indices.fill(0);
+        sampler_descriptor_indices.fill(0);
+        binding_realization.fill(NativeBindingRealization::kUnused);
       }
       if (!bytes.empty()) bytes.resize(0);
 
@@ -2057,6 +2071,8 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   std::shared_ptr<const NativeTextureResource> CreateResolvedTextureResource(
       const ResolveCommand& command);
   std::shared_ptr<const NativeBufferResource> CaptureBufferResource(uint32_t handle);
+  bool CaptureBufferResourceInto(uint32_t handle, NativeCommand& command,
+                                 std::shared_ptr<const NativeBufferResource>& out);
   SurfaceDescriptor CaptureSurfaceDescriptor(uint32_t handle) const;
   std::shared_ptr<const NativeTextureResource> CaptureTextureResource(
       uint32_t handle, const xenos::xe_gpu_texture_fetch_t& fetch, uint32_t stage);
@@ -2864,6 +2880,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   size_t direct_stage_batch_ = 1;
   const NativeTargetSnapshot* last_pipeline_snapshot_targets_ = nullptr;
   std::shared_ptr<const NativeShaderState> last_shader_snapshot_;
+  const NativeShaderState* last_shader_snapshot_raw_ = nullptr;
   // 33: worker snapshot keep-alive. The worker makes a NativeShaderState and a
   // NativePipelineState for nearly every draw (constants and texture / stream
   // bindings change per draw), and the command retirer on a Little core used
@@ -2879,6 +2896,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     SnapshotKeepAlive();
     ~SnapshotKeepAlive();
     std::vector<std::shared_ptr<const void>> refs;
+    std::deque<NativeShaderState> shader_states;
   };
   std::shared_ptr<SnapshotKeepAlive> snapshot_keepalive_;
   std::deque<std::shared_ptr<SnapshotKeepAlive>> retired_snapshot_keepalives_;
@@ -2907,7 +2925,8 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   // Render worker: the last prefix hashed per bank (vertex, pixel), reused
   // while consecutive draws upload the same version.
   struct ConstantUploadHashMemo {
-    std::shared_ptr<const ConstantStateVersion> version;
+    const void* version_ptr = nullptr;
+    StateVersionStamp token{};
     uint32_t bytes = 0;
     uint64_t hash = 0;
   };
@@ -3013,9 +3032,9 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     const NativeBufferResource* raw = nullptr;
   };
   static_assert(sizeof(BufferL1MruEntry) == 32);
-  static constexpr size_t kBufferCaptureL1TableSize = 128;
+  static constexpr size_t kBufferCaptureL1TableSize = 1024;
   static constexpr uint32_t BufferL1TableIndex(uint32_t handle) noexcept {
-    return (handle * 0x9E3779B1u) >> (32 - 7);
+    return (handle * 0x9E3779B1u) >> (32 - 10);
   }
   struct alignas(64) BufferMruEntry {
     uint32_t handle = 0;
