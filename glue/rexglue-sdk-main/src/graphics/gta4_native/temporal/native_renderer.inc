@@ -460,11 +460,11 @@ bool Gta4NativeGraphicsSystem::ReplayTemporalDraw(VkCommandBuffer cb, const Nati
   target.color_attachment_mask = 1; target.color_write_mask = original.color_write_mask & 0xFu;
   target.width = image.extent.width; target.height = image.extent.height;
   target.logical_width = original.logical_width; target.logical_height = original.logical_height;
-  VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, nullptr};
   attachment.imageView = image.view; attachment.imageLayout = image.layout;
   attachment.loadOp = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
   attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-  VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+  VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO, nullptr};
   rendering.renderArea.extent = {target.width, target.height}; rendering.layerCount = 1;
   rendering.colorAttachmentCount = 1; rendering.pColorAttachments = &attachment;
   native_draw_state_cache_.Reset();
@@ -537,7 +537,7 @@ bool Gta4NativeGraphicsSystem::CompleteTemporalCoverage(VkCommandBuffer cb, bool
   for (const auto& buffer : overflow_upload_buffers_) flush(buffer);
   flush(frame_constant_arenas_[active_frame_slot_].storage);
   VkFence& fence = temporal_partial_fence_;
-  VkFenceCreateInfo create{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  VkFenceCreateInfo create{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, nullptr};
   if (fn.vkCreateFence(device->device(), &create, nullptr, &fence) != VK_SUCCESS) return false;
   const auto destroy_fence = MakeScopeExit([&] {
     if (!temporal_partial_pending_) {
@@ -545,7 +545,7 @@ bool Gta4NativeGraphicsSystem::CompleteTemporalCoverage(VkCommandBuffer cb, bool
     }
   });
   if (fn.vkEndCommandBuffer(cb) != VK_SUCCESS) return false;
-  VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr};
   submit.commandBufferCount = 1; submit.pCommandBuffers = &cb;
   VkResult accepted;
   {
@@ -585,10 +585,10 @@ bool Gta4NativeGraphicsSystem::CompleteTemporalCoverage(VkCommandBuffer cb, bool
   temporal_partial_pending_ = false;
   valid = temporal_scene_.ReadAuditAfterCompletion();
   if (fn.vkResetCommandPool(device->device(), command_pool_, 0) != VK_SUCCESS) return false;
-  VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr};
   begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   if (fn.vkBeginCommandBuffer(cb, &begin) != VK_SUCCESS) return false;
-  VkMemoryBarrier memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  VkMemoryBarrier memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr};
   memory.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
   memory.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
   fn.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,

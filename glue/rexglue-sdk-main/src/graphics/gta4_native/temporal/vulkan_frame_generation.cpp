@@ -40,7 +40,7 @@ bool SupportsFrameImages(const ui::vulkan::VulkanDevice& device) {
 
 VkImageMemoryBarrier Barrier(const Image& image, VkImageLayout old_layout, VkImageLayout new_layout,
                              VkAccessFlags source_access, VkAccessFlags destination_access) {
-  VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr};
   barrier.srcAccessMask = source_access;
   barrier.dstAccessMask = destination_access;
   barrier.oldLayout = old_layout;
@@ -97,7 +97,7 @@ struct FrameGenerationResources {
     const std::array families{device.queue_family_graphics_compute(),
                               device.queue_family_native_offscreen()};
     const bool concurrent = families.front() != families.back();
-    VkImageCreateInfo create{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    VkImageCreateInfo create{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, nullptr};
     create.imageType = VK_IMAGE_TYPE_2D;
     create.format = kFormat;
     create.extent = {extent.width, extent.height, 1};
@@ -118,7 +118,7 @@ struct FrameGenerationResources {
       if (!ui::vulkan::util::CreateDedicatedAllocationImage(
               &device, create, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
               image.image, resources->memory[index])) return {};
-      VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+      VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, nullptr};
       view.image = image.image;
       view.viewType = VK_IMAGE_VIEW_TYPE_2D;
       view.format = kFormat;

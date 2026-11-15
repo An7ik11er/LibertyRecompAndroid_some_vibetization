@@ -38,8 +38,8 @@ class NativeGpuCounters {
     family_ = device->queue_family_graphics_compute();
     uint32_t count = 0;
     if (enumerate_(physical, family_, &count, nullptr, nullptr) != VK_SUCCESS || !count) return fail("no-counters");
-    counters_.assign(count, {VK_STRUCTURE_TYPE_PERFORMANCE_COUNTER_KHR});
-    descriptions_.assign(count, {VK_STRUCTURE_TYPE_PERFORMANCE_COUNTER_DESCRIPTION_KHR});
+    counters_.assign(count, {VK_STRUCTURE_TYPE_PERFORMANCE_COUNTER_KHR, nullptr});
+    descriptions_.assign(count, {VK_STRUCTURE_TYPE_PERFORMANCE_COUNTER_DESCRIPTION_KHR, nullptr});
     if (enumerate_(physical, family_, &count, counters_.data(), descriptions_.data()) != VK_SUCCESS)
       return false;
     if (log) {
@@ -67,11 +67,11 @@ class NativeGpuCounters {
     }
     if (selected_.empty()) return fail("no-single-pass-set");
     VkQueryPoolPerformanceCreateInfoKHR performance_info{
-        VK_STRUCTURE_TYPE_QUERY_POOL_PERFORMANCE_CREATE_INFO_KHR};
+        VK_STRUCTURE_TYPE_QUERY_POOL_PERFORMANCE_CREATE_INFO_KHR, nullptr};
     performance_info.queueFamilyIndex = family_;
     performance_info.counterIndexCount = uint32_t(selected_.size());
     performance_info.pCounterIndices = selected_.data();
-    VkQueryPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    VkQueryPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, nullptr};
     pool_info.pNext = &performance_info;
     pool_info.queryType = VK_QUERY_TYPE_PERFORMANCE_QUERY_KHR;
     pool_info.queryCount = 1;
@@ -79,7 +79,7 @@ class NativeGpuCounters {
     for (auto& pool : pools_) {
       if (dfn.vkCreateQueryPool(device->device(), &pool_info, nullptr, &pool) != VK_SUCCESS) return fail("create-pool");
     }
-    VkAcquireProfilingLockInfoKHR lock_info{VK_STRUCTURE_TYPE_ACQUIRE_PROFILING_LOCK_INFO_KHR};
+    VkAcquireProfilingLockInfoKHR lock_info{VK_STRUCTURE_TYPE_ACQUIRE_PROFILING_LOCK_INFO_KHR, nullptr};
     lock_info.timeout = UINT64_MAX;
     if (acquire_(device->device(), &lock_info) != VK_SUCCESS) return fail("profiling-lock");
     sums_.assign(selected_.size(), 0.0);
@@ -141,7 +141,8 @@ class NativeGpuCounters {
 
  private:
   uint32_t PassCount() {
-    VkQueryPoolPerformanceCreateInfoKHR info{VK_STRUCTURE_TYPE_QUERY_POOL_PERFORMANCE_CREATE_INFO_KHR};
+    VkQueryPoolPerformanceCreateInfoKHR info{
+        VK_STRUCTURE_TYPE_QUERY_POOL_PERFORMANCE_CREATE_INFO_KHR, nullptr};
     info.queueFamilyIndex = family_;
     info.counterIndexCount = uint32_t(selected_.size());
     info.pCounterIndices = selected_.data();

@@ -28,7 +28,7 @@ static_assert(sizeof(AuditCounts) == 16 && offsetof(AuditCounts, invalid_previou
 
 void VulkanScene::Barrier(const ui::vulkan::VulkanDevice* device, VkCommandBuffer cb,
                           Image& image, VkImageLayout next, VkImageAspectFlags aspect) {
-  VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr};
   barrier.srcAccessMask = image.layout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 :
       VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
   barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -47,7 +47,7 @@ bool VulkanScene::Initialize(const ui::vulkan::VulkanDevice* device) {
   if (!device) return false;
   device_ = device;
   const auto& fn = device->functions();
-  VkSamplerCreateInfo sampler{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+  VkSamplerCreateInfo sampler{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, nullptr};
   sampler.magFilter = sampler.minFilter = VK_FILTER_NEAREST;
   sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
   sampler.addressModeU = sampler.addressModeV = sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
@@ -69,13 +69,13 @@ bool VulkanScene::Initialize(const ui::vulkan::VulkanDevice* device) {
   }
   bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   bindings[0].pImmutableSamplers = &sampler_;
-  VkDescriptorSetLayoutCreateInfo set{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  VkDescriptorSetLayoutCreateInfo set{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr};
   set.bindingCount = uint32_t(bindings.size()); set.pBindings = bindings.data();
   if (fn.vkCreateDescriptorSetLayout(device->device(), &set, nullptr, &set_layout_) != VK_SUCCESS) {
     error_ = "temporal image descriptor layout creation failed"; Shutdown(); return false;
   }
   VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Parameters)};
-  VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr};
   layout.setLayoutCount = 1; layout.pSetLayouts = &set_layout_;
   layout.pushConstantRangeCount = 1; layout.pPushConstantRanges = &push;
   if (fn.vkCreatePipelineLayout(device->device(), &layout, nullptr, &pipeline_layout_) != VK_SUCCESS) {
@@ -84,8 +84,8 @@ bool VulkanScene::Initialize(const ui::vulkan::VulkanDevice* device) {
   const VkShaderModule shader = ui::vulkan::util::CreateShaderModule(device,
       kVulkanSceneSpirv, sizeof(kVulkanSceneSpirv));
   if (!shader) { error_ = "temporal depth/background shader creation failed"; Shutdown(); return false; }
-  VkComputePipelineCreateInfo pipeline{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-  pipeline.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+  VkComputePipelineCreateInfo pipeline{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, nullptr};
+  pipeline.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr};
   pipeline.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
   pipeline.stage.module = shader; pipeline.stage.pName = "main";
   pipeline.layout = pipeline_layout_;
@@ -107,7 +107,7 @@ bool VulkanScene::Create(OwnedImage& out, VkFormat format, Extent extent, VkImag
   if ((properties.optimalTilingFeatures & required) != required) {
     error_ = "device does not support the temporal image format/usage"; return false;
   }
-  VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, nullptr};
   info.imageType = VK_IMAGE_TYPE_2D; info.format = format;
   info.extent = {extent.width, extent.height, 1}; info.mipLevels = info.arrayLayers = 1;
   info.samples = VK_SAMPLE_COUNT_1_BIT; info.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -116,7 +116,7 @@ bool VulkanScene::Create(OwnedImage& out, VkFormat format, Extent extent, VkImag
       ui::vulkan::util::MemoryPurpose::kDeviceLocal, out.image.image, out.memory)) {
     error_ = "temporal image allocation failed"; return false;
   }
-  VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, nullptr};
   view.image = out.image.image; view.viewType = VK_IMAGE_VIEW_TYPE_2D; view.format = format;
   view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
   if (device_->functions().vkCreateImageView(device_->device(), &view, nullptr, &out.image.view) != VK_SUCCESS) {
@@ -179,7 +179,7 @@ void VulkanScene::AttachmentsWritable(VkCommandBuffer cb) {
 }
 
 bool VulkanScene::BindScene(VkCommandBuffer cb, VkDescriptorPool pool, const Image& input) {
-  VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr};
   allocation.descriptorPool = pool; allocation.descriptorSetCount = 1; allocation.pSetLayouts = &set_layout_;
   VkDescriptorSet set = VK_NULL_HANDLE;
   if (device_->functions().vkAllocateDescriptorSets(device_->device(), &allocation, &set) != VK_SUCCESS) {
@@ -192,13 +192,13 @@ bool VulkanScene::BindScene(VkCommandBuffer cb, VkDescriptorPool pool, const Ima
     {VK_NULL_HANDLE, previous_depth_.image.view, VK_IMAGE_LAYOUT_GENERAL}}};
   std::array<VkWriteDescriptorSet, 5> writes{};
   for (uint32_t i = 0; i < images.size(); ++i) {
-    writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr};
     writes[i].dstSet = set; writes[i].dstBinding = i; writes[i].descriptorCount = 1;
     writes[i].descriptorType = i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     writes[i].pImageInfo = &images[i];
   }
   const VkDescriptorBufferInfo audit{audit_buffer_, 0, sizeof(AuditCounts)};
-  writes[4] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  writes[4] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr};
   writes[4].dstSet = set; writes[4].dstBinding = 4; writes[4].descriptorCount = 1;
   writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[4].pBufferInfo = &audit;
   const auto& fn = device_->functions();
@@ -242,7 +242,7 @@ bool VulkanScene::RecordAudit(VkCommandBuffer cb, VkDescriptorPool pool) {
     Barrier(device_, cb, image->image, VK_IMAGE_LAYOUT_GENERAL);
   if (!BindScene(cb, pool, depth_.image)) return false;
   const auto& fn = device_->functions();
-  VkBufferMemoryBarrier buffer{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+  VkBufferMemoryBarrier buffer{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr};
   buffer.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
   buffer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
   buffer.srcQueueFamilyIndex = buffer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -269,7 +269,7 @@ bool VulkanScene::ReadAuditAfterCompletion() {
   audit_recorded_ = false;
   // The entire allocation is mapped. Whole-size invalidation is valid on both
   // coherent and noncoherent host-visible memory without alignment rounding.
-  VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+  VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, nullptr};
   range.memory = audit_memory_; range.size = VK_WHOLE_SIZE;
   if (device_->functions().vkInvalidateMappedMemoryRanges(device_->device(), 1, &range) != VK_SUCCESS) {
     error_ = "temporal motion coverage readback invalidation failed"; return false;

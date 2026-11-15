@@ -24,8 +24,8 @@
 
 namespace rex::graphics::gta4_native::temporal {
 
-bool FsrSupportsDevice(const ui::vulkan::VulkanDevice& device,
-                       std::string* reason, bool frame_generation) {
+bool FsrSupportsDevice([[maybe_unused]] const ui::vulkan::VulkanDevice& device,
+                       std::string* reason, [[maybe_unused]] bool frame_generation) {
   const auto reject = [&](const char* message) {
     if (reason) *reason = message;
     return false;
@@ -90,7 +90,7 @@ struct History {
   }
 };
 
-bool ValidConfiguration(const Configuration& configuration) {
+[[maybe_unused]] bool ValidConfiguration(const Configuration& configuration) {
   return configuration.render_extent && configuration.output_extent &&
          configuration.output_extent.width <= uint32_t(std::numeric_limits<int32_t>::max()) &&
          configuration.output_extent.height <= uint32_t(std::numeric_limits<int32_t>::max()) &&
@@ -98,7 +98,7 @@ bool ValidConfiguration(const Configuration& configuration) {
          configuration.render_extent.height <= configuration.output_extent.height;
 }
 
-bool ValidFormats(const FrameInput& frame) {
+[[maybe_unused]] bool ValidFormats(const FrameInput& frame) {
   const auto mask = [&](const Image& image) {
     return !image.image ||
            (image.extent == frame.render_extent && image.aspect == VK_IMAGE_ASPECT_COLOR_BIT &&
@@ -122,7 +122,7 @@ bool ValidFormats(const FrameInput& frame) {
             frame.exposure.format == VK_FORMAT_R32_SFLOAT)));
 }
 
-bool ValidCamera(const FsrFrameGenerationInput& input) {
+[[maybe_unused]] bool ValidCamera(const FsrFrameGenerationInput& input) {
   const auto finite = [](const float (&vector)[3]) {
     return std::all_of(std::begin(vector), std::end(vector),
                        [](float value) { return std::isfinite(value); });
@@ -329,8 +329,9 @@ struct FsrUpscalerVulkan::Impl {
 FsrUpscalerVulkan::FsrUpscalerVulkan() : impl_(std::make_unique<Impl>()) {}
 FsrUpscalerVulkan::~FsrUpscalerVulkan() { Shutdown(); }
 
-bool FsrUpscalerVulkan::Initialize(VkPhysicalDevice physical, VkDevice device,
-                                  PFN_vkGetDeviceProcAddr resolver) {
+bool FsrUpscalerVulkan::Initialize([[maybe_unused]] VkPhysicalDevice physical,
+                                   [[maybe_unused]] VkDevice device,
+                                   [[maybe_unused]] PFN_vkGetDeviceProcAddr resolver) {
 #if REX_FSR_VK
   return impl_->state.Initialize(physical, device, resolver);
 #else
@@ -338,7 +339,9 @@ bool FsrUpscalerVulkan::Initialize(VkPhysicalDevice physical, VkDevice device,
 #endif
 }
 
-bool FsrUpscalerVulkan::QueryRenderExtent(Extent output, Quality quality, Extent& render) {
+bool FsrUpscalerVulkan::QueryRenderExtent([[maybe_unused]] Extent output,
+                                          [[maybe_unused]] Quality quality,
+                                          Extent& render) {
   render = {};
 #if REX_FSR_VK
   if (!output) return false;
@@ -357,7 +360,10 @@ bool FsrUpscalerVulkan::QueryRenderExtent(Extent output, Quality quality, Extent
 #endif
 }
 
-bool FsrUpscalerVulkan::QueryJitter(uint64_t index, Extent render, Extent output, float& x, float& y) {
+bool FsrUpscalerVulkan::QueryJitter([[maybe_unused]] uint64_t index,
+                                    [[maybe_unused]] Extent render,
+                                    [[maybe_unused]] Extent output,
+                                    float& x, float& y) {
   x = y = 0.0f;
 #if REX_FSR_VK
   if (!render || !output || render.width > output.width || render.height > output.height) return false;
@@ -384,7 +390,7 @@ bool FsrUpscalerVulkan::QueryJitter(uint64_t index, Extent render, Extent output
 #endif
 }
 
-bool FsrUpscalerVulkan::Configure(const Configuration& configuration) {
+bool FsrUpscalerVulkan::Configure([[maybe_unused]] const Configuration& configuration) {
 #if REX_FSR_VK
   auto& state = impl_->state;
   if (!state.initialized || !ValidConfiguration(configuration) || state.history.pending) {
@@ -427,8 +433,10 @@ bool FsrUpscalerVulkan::Configure(const Configuration& configuration) {
 #endif
 }
 
-bool FsrUpscalerVulkan::Encode(VkCommandBuffer command, const FrameInput& frame,
-                              bool sharpening, float sharpness) {
+bool FsrUpscalerVulkan::Encode([[maybe_unused]] VkCommandBuffer command,
+                              [[maybe_unused]] const FrameInput& frame,
+                              [[maybe_unused]] bool sharpening,
+                              [[maybe_unused]] float sharpness) {
 #if REX_FSR_VK
   auto& state = impl_->state;
   if (!state.Validate(command, frame)) return false;
@@ -537,15 +545,17 @@ struct FsrFrameGenerationVulkan::Impl {
 
 FsrFrameGenerationVulkan::FsrFrameGenerationVulkan() : impl_(std::make_unique<Impl>()) {}
 FsrFrameGenerationVulkan::~FsrFrameGenerationVulkan() { Shutdown(); }
-bool FsrFrameGenerationVulkan::Initialize(VkPhysicalDevice physical, VkDevice device,
-                                         PFN_vkGetDeviceProcAddr resolver) {
+bool FsrFrameGenerationVulkan::Initialize([[maybe_unused]] VkPhysicalDevice physical,
+                                         [[maybe_unused]] VkDevice device,
+                                         [[maybe_unused]] PFN_vkGetDeviceProcAddr resolver) {
 #if REX_FSR_FG
   return impl_->state.Initialize(physical, device, resolver);
 #else
   return false;
 #endif
 }
-bool FsrFrameGenerationVulkan::Configure(const Configuration& configuration, VkFormat format) {
+bool FsrFrameGenerationVulkan::Configure([[maybe_unused]] const Configuration& configuration,
+                                         [[maybe_unused]] VkFormat format) {
 #if REX_FSR_FG
   auto& state = impl_->state;
   const uint32_t ffx_format = ffxApiGetSurfaceFormatVK(format);
@@ -591,8 +601,9 @@ bool FsrFrameGenerationVulkan::Configure(const Configuration& configuration, VkF
   return false;
 #endif
 }
-bool FsrFrameGenerationVulkan::Encode(VkCommandBuffer command, const FrameInput& frame,
-                                     const FsrFrameGenerationInput& presentation) {
+bool FsrFrameGenerationVulkan::Encode([[maybe_unused]] VkCommandBuffer command,
+                                     [[maybe_unused]] const FrameInput& frame,
+                                     [[maybe_unused]] const FsrFrameGenerationInput& presentation) {
 #if REX_FSR_FG
   auto& state = impl_->state;
   impl_->generated = false;

@@ -109,7 +109,7 @@ void Gta4NativeGraphicsSystem::RecordBulbFullImage(VkCommandBuffer cb, std::stri
     skip("readback-map"); return;
   }
   const auto sync = ImageLayoutSynchronization(layout, aspect);
-  VkImageMemoryBarrier to_copy{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  VkImageMemoryBarrier to_copy{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr};
   to_copy.srcAccessMask = sync.access; to_copy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
   to_copy.oldLayout = layout; to_copy.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
   to_copy.srcQueueFamilyIndex = to_copy.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -123,7 +123,7 @@ void Gta4NativeGraphicsSystem::RecordBulbFullImage(VkCommandBuffer cb, std::stri
   auto restore = to_copy;
   restore.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; restore.dstAccessMask = sync.access;
   restore.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; restore.newLayout = layout;
-  VkBufferMemoryBarrier host{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+  VkBufferMemoryBarrier host{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr};
   host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
   host.srcQueueFamilyIndex = host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   host.buffer = p.buffer; host.size = bytes;
@@ -163,7 +163,7 @@ void Gta4NativeGraphicsSystem::PublishBulbFullProbe(uint32_t slot, uint64_t subm
     const auto& dfn = device->functions(); const auto vk_device = device->device();
     bool visible = p.mapping != nullptr;
     if (visible && !(device->memory_types().host_coherent & (uint32_t{1} << p.memory_type))) {
-      VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+      VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, nullptr};
       range.memory = p.memory; range.size = VK_WHOLE_SIZE;
       visible = dfn.vkInvalidateMappedMemoryRanges(vk_device, 1, &range) == VK_SUCCESS;
     }

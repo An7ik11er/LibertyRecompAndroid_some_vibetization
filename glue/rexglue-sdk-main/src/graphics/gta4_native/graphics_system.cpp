@@ -1565,7 +1565,7 @@ struct NativeProcessMemorySnapshot {
   std::array<memory::ProcessVmRegionUsage, memory::kProcessVmCategoryCount> vm_regions{};
 };
 
-NativeProcessMemorySnapshot QueryNativeProcessMemorySnapshot(bool include_vm_regions = false) {
+NativeProcessMemorySnapshot QueryNativeProcessMemorySnapshot([[maybe_unused]] bool include_vm_regions = false) {
   NativeProcessMemorySnapshot snapshot;
 #if defined(__APPLE__) && defined(__MACH__)
   const auto nonnegative = [](int64_t value) { return value > 0 ? uint64_t(value) : uint64_t(0); };
@@ -1807,7 +1807,7 @@ void RunLightProbeAnalysisInline(Callable& analyze) {
   }
 }
 
-const char* DepthHandoffTransportName(DepthHandoffTransport transport) {
+[[maybe_unused]] const char* DepthHandoffTransportName(DepthHandoffTransport transport) {
   switch (transport) {
     case DepthHandoffTransport::kBuffer:
       return "buffer";
@@ -8156,6 +8156,8 @@ void Gta4NativeGraphicsSystem::RenderWorkerLoop(WorkerLoopMode mode) {
       case CommandType::kTemporalUpdate:
         (pipelined_recording_ ? assembly_has_temporal_updates_ : frame_has_temporal_updates_) = true;
         retain_assembled(command_owner, false);
+        break;
+      case CommandType::kQueryTemporalUpscaler:
         break;
       case CommandType::kReleaseResource: {
         ReleaseResourceCommand release{};
@@ -18062,7 +18064,7 @@ bool Gta4NativeGraphicsSystem::CreateNativeDescriptors() {
     layout_info.bindingCount = binding_count;
     layout_info.pBindings = bindings.data();
     if (textures) {
-      VkDescriptorSetLayoutSupport support{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT};
+      VkDescriptorSetLayoutSupport support{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT, nullptr};
       dfn.vkGetDescriptorSetLayoutSupport(device, &layout_info, &support);
       REXLOG_INFO("gta4-native-descriptors: merged texture set supported={} images-per-binding={} "
                   "samplers={}", support.supported, bindings[0].descriptorCount,
@@ -18231,7 +18233,7 @@ bool Gta4NativeGraphicsSystem::CreateNativeDescriptors() {
       ubo_bindings[index].stageFlags = index == 2 ? VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT
                                        : index ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
     }
-    VkDescriptorSetLayoutCreateInfo ubo_layout_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    VkDescriptorSetLayoutCreateInfo ubo_layout_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr};
     ubo_layout_info.bindingCount = uint32_t(ubo_bindings.size());
     ubo_layout_info.pBindings = ubo_bindings.data();
     if (dfn.vkCreateDescriptorSetLayout(device, &ubo_layout_info, nullptr,
@@ -18241,7 +18243,7 @@ bool Gta4NativeGraphicsSystem::CreateNativeDescriptors() {
     // Per frame slot: one set over its arena, one over the worker's ring.
     VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
                                    3 * 2 * uint32_t(NativeFrameContextRing::kSlotCount)};
-    VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr};
     pool_info.maxSets = 2 * NativeFrameContextRing::kSlotCount;
     pool_info.poolSizeCount = 1;
     pool_info.pPoolSizes = &pool_size;
@@ -18250,7 +18252,7 @@ bool Gta4NativeGraphicsSystem::CreateNativeDescriptors() {
     }
     std::array<VkDescriptorSetLayout, NativeFrameContextRing::kSlotCount> layouts;
     layouts.fill(ubo_constants_set_layout_);
-    VkDescriptorSetAllocateInfo allocate_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    VkDescriptorSetAllocateInfo allocate_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr};
     allocate_info.descriptorPool = ubo_constants_pool_;
     allocate_info.descriptorSetCount = uint32_t(layouts.size());
     allocate_info.pSetLayouts = layouts.data();
@@ -25834,7 +25836,7 @@ bool Gta4NativeGraphicsSystem::BindUboConstantBanks(VkCommandBuffer command_buff
   if (ring && !descriptor_up_to_date) {
     // Same rule as below: the slot has no work in flight when its arena changes.
     VkDescriptorBufferInfo shared_info{arena.storage.buffer, 0, sizeof(NativeSharedConstants)};
-    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr};
     write.dstSet = set;
     write.dstBinding = 2;
     write.descriptorCount = 1;
@@ -26246,7 +26248,7 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
   if (modern_shader_frame_.settings().enabled && !fusion_tone_lut_.buffer) {
     if (!CreateNativeUploadBuffer(sizeof(kFusionToneLut), fusion_tone_lut_, true)) return false;
     std::memcpy(fusion_tone_lut_.mapping, kFusionToneLut.data(), sizeof(kFusionToneLut));
-    VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+    VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, nullptr};
     range.memory = fusion_tone_lut_.memory;
     range.size = VK_WHOLE_SIZE;
     if (vulkan_device->functions().vkFlushMappedMemoryRanges(vulkan_device->device(), 1, &range) != VK_SUCCESS) {
@@ -30775,7 +30777,7 @@ bool Gta4NativeGraphicsSystem::RecordDepthSurfaceHandoff(VkCommandBuffer command
               NativeResolveConversionPipeline::Kind::kSceneDepthHandoff, destination->samples)
         : GetOrCreateDepthHandoffPipeline(destination->format, destination->samples);
     if (attachment_pipeline) {
-      VkDescriptorSetAllocateInfo allocate_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+      VkDescriptorSetAllocateInfo allocate_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr};
       allocate_info.descriptorPool = frame_descriptor_pool_;
       allocate_info.descriptorSetCount = 1;
       allocate_info.pSetLayouts = &resolve_conversion_descriptor_set_layout_;
@@ -31730,7 +31732,7 @@ bool Gta4NativeGraphicsSystem::RecordResolve(VkCommandBuffer command_buffer,
       const auto& swap_dfn = swap_provider->vulkan_device()->functions();
       const NativeImageLayoutSynchronization synchronization =
           ImageLayoutSynchronization(surface_layout, VK_IMAGE_ASPECT_COLOR_BIT);
-      VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+      VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr};
       barrier.srcAccessMask = synchronization.access;
       barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
       barrier.oldLayout = surface_layout;
@@ -34961,7 +34963,7 @@ NativeFrameTask Gta4NativeGraphicsSystem::RecordNativeFrameTask(
     // per-draw queries, their reset and their readback are off by default.
     const bool water_occlusion_queries = REXCVAR_GET(gta4_native_water_occlusion_queries);
     if (water_occlusion_queries && !water_query_pool_) {
-      VkQueryPoolCreateInfo create_info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+      VkQueryPoolCreateInfo create_info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, nullptr};
       create_info.queryType = VK_QUERY_TYPE_OCCLUSION;
       create_info.queryCount = kWaterQueriesPerSlot * uint32_t(water_query_counts_.size());
       if (water_dfn.vkCreateQueryPool(water_device, &create_info, nullptr, &water_query_pool_) !=
@@ -37053,7 +37055,7 @@ const bool keeps_draw_state =
         if (index < fusion_cloud_buffers_.size()) {
           if (rendering) { end_rendering(__LINE__); rendering = false; }
           const auto& buffer = fusion_cloud_buffers_[index];
-          VkMemoryBarrier memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+          VkMemoryBarrier memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr};
           memory.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
           memory.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
           (++g_barrier_sites[__LINE__], dfn.vkCmdPipelineBarrier)(command_buffer, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
@@ -37235,7 +37237,7 @@ const bool keeps_draw_state =
             sun_parameters.cloud_mask_address = fusion_cloud_buffers_[fusion_cloud_buffer_index_].device_address;
             sun_parameters.cloud_width = fusion_cloud_extent_.width;
             sun_parameters.cloud_height = fusion_cloud_extent_.height;
-            VkMemoryBarrier cloud_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            VkMemoryBarrier cloud_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr};
             cloud_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
             cloud_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
             (++g_barrier_sites[__LINE__], dfn.vkCmdPipelineBarrier)(command_buffer, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
@@ -38942,7 +38944,7 @@ const bool keeps_draw_state =
             temporal_scene_.reactive().view, temporal_scene_.previous_depth().view};
         for (uint32_t i = 0; i < auxiliary.size(); ++i) {
           auto& attachment = color_attachments[kRenderTargetCount + i];
-          attachment = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+          attachment = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, nullptr};
           attachment.imageView = auxiliary[i];
           attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
           attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;

@@ -3348,6 +3348,8 @@ bool IsCachedListCommandType(CommandType type) {
     case CommandType::kUpdateEnvironmentalData:
     case CommandType::kDepthSurfaceHandoff:
     case CommandType::kRegisterVirtualResource:
+    case CommandType::kTemporalUpdate:
+    case CommandType::kQueryTemporalUpscaler:
       return false;
   }
   return false;

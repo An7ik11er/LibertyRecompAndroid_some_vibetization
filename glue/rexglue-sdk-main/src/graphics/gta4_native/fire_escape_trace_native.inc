@@ -60,7 +60,7 @@ void Gta4NativeGraphicsSystem::BeginFireFrame(VkCommandBuffer cb, uint32_t frame
   q.ready = false;
   if (!q.rows.empty()) { FireTraceLog("incomplete","reason=query-slot-not-retired"); return; }
   if (!q.pool) {
-    VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, nullptr};
     info.queryType = VK_QUERY_TYPE_OCCLUSION; info.queryCount = 128;
     if (device->functions().vkCreateQueryPool(device->device(),&info,nullptr,&q.pool) != VK_SUCCESS) {
       FireTraceLog("incomplete","reason=query-pool-allocation"); return;
@@ -174,16 +174,16 @@ void Gta4NativeGraphicsSystem::FireImage(VkCommandBuffer cb,std::string_view rol
   auto release=[&] {if(p.mapping)dfn.vkUnmapMemory(vk_device,p.memory);if(p.buffer)dfn.vkDestroyBuffer(vk_device,p.buffer,nullptr);if(p.memory)dfn.vkFreeMemory(vk_device,p.memory,nullptr);};
   if (dfn.vkMapMemory(vk_device,p.memory,0,VK_WHOLE_SIZE,0,reinterpret_cast<void**>(&p.mapping))!=VK_SUCCESS) {release();skip("map");return;}
   if (samples!=VK_SAMPLE_COUNT_1_BIT) {
-    VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};info.imageType=VK_IMAGE_TYPE_2D;info.format=format;info.extent={width,height,1};info.mipLevels=1;info.arrayLayers=1;info.samples=VK_SAMPLE_COUNT_1_BIT;info.tiling=VK_IMAGE_TILING_OPTIMAL;info.usage=VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT;info.sharingMode=VK_SHARING_MODE_EXCLUSIVE;
+    VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, nullptr};info.imageType=VK_IMAGE_TYPE_2D;info.format=format;info.extent={width,height,1};info.mipLevels=1;info.arrayLayers=1;info.samples=VK_SAMPLE_COUNT_1_BIT;info.tiling=VK_IMAGE_TILING_OPTIMAL;info.usage=VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT;info.sharingMode=VK_SHARING_MODE_EXCLUSIVE;
     if (!ui::vulkan::util::CreateDedicatedAllocationImage(device,info,ui::vulkan::util::MemoryPurpose::kDeviceLocal,probe.scratch,probe.scratch_memory)) {release();skip("msaa-readback-image");return;}
   }
   const auto sync=ImageLayoutSynchronization(layout,aspect);
-  VkImageMemoryBarrier before{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};before.srcAccessMask=sync.access;before.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;before.oldLayout=layout;before.newLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;before.srcQueueFamilyIndex=before.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;before.image=image;
+  VkImageMemoryBarrier before{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr};before.srcAccessMask=sync.access;before.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;before.oldLayout=layout;before.newLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;before.srcQueueFamilyIndex=before.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;before.image=image;
   before.subresourceRange=ui::vulkan::util::InitializeSubresourceRange(surface?surface->aspect:texture?texture->aspect:aspect,mip,1,0,1);
   dfn.vkCmdPipelineBarrier(cb,sync.stages,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&before);
   VkImage copy_image=image;uint32_t copy_mip=mip;
   if (probe.scratch) {
-    VkImageMemoryBarrier scratch{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};scratch.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;scratch.oldLayout=VK_IMAGE_LAYOUT_UNDEFINED;scratch.newLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;scratch.srcQueueFamilyIndex=scratch.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;scratch.image=probe.scratch;scratch.subresourceRange=ui::vulkan::util::InitializeSubresourceRange();
+    VkImageMemoryBarrier scratch{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr};scratch.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;scratch.oldLayout=VK_IMAGE_LAYOUT_UNDEFINED;scratch.newLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;scratch.srcQueueFamilyIndex=scratch.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;scratch.image=probe.scratch;scratch.subresourceRange=ui::vulkan::util::InitializeSubresourceRange();
     dfn.vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&scratch);
     VkImageResolve r{};r.srcSubresource={aspect,mip,0,1};r.dstSubresource={aspect,0,0,1};r.srcOffset={int32_t(region->x),int32_t(region->y),0};r.extent={width,height,1};
     dfn.vkCmdResolveImage(cb,image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,probe.scratch,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&r);
@@ -195,7 +195,7 @@ void Gta4NativeGraphicsSystem::FireImage(VkCommandBuffer cb,std::string_view rol
   if (!probe.scratch) copy.imageOffset={int32_t(region->x),int32_t(region->y),0};
   dfn.vkCmdCopyImageToBuffer(cb,copy_image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,p.buffer,1,&copy);
   auto restore=before;restore.srcAccessMask=VK_ACCESS_TRANSFER_READ_BIT;restore.dstAccessMask=sync.access;restore.oldLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;restore.newLayout=layout;
-  VkBufferMemoryBarrier host{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};host.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;host.dstAccessMask=VK_ACCESS_HOST_READ_BIT;host.srcQueueFamilyIndex=host.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;host.buffer=p.buffer;host.size=bytes;
+  VkBufferMemoryBarrier host{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr};host.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;host.dstAccessMask=VK_ACCESS_HOST_READ_BIT;host.srcQueueFamilyIndex=host.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;host.buffer=p.buffer;host.size=bytes;
   dfn.vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_TRANSFER_BIT,sync.stages|VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&host,1,&restore);
   fire_frame_bytes_+=bytes;probes.push_back(std::move(probe));
   FireTraceLog("probe-scheduled",fmt::format("frame={} cmd={} role={} mip={} image={} bytes={} samples={} slot={} completed=false",diagnostic_submitted_frame_,diagnostic_command_index_,role,mip,NativeVulkanHandleIdentity(image),bytes,uint32_t(samples),active_frame_slot_));
@@ -257,7 +257,7 @@ void Gta4NativeGraphicsSystem::PublishFireProbes(uint32_t slot,uint64_t submissi
   for(auto& probe:probes) {
     auto& p=probe.data;if(!p.submission || p.submission>submission) continue;
     bool visible=p.mapping!=nullptr;
-    if(visible && !(device->memory_types().host_coherent&(1u<<p.memory_type))) {VkMappedMemoryRange r{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};r.memory=p.memory;r.size=VK_WHOLE_SIZE;visible=dfn.vkInvalidateMappedMemoryRanges(vk,1,&r)==VK_SUCCESS;}
+    if(visible && !(device->memory_types().host_coherent&(1u<<p.memory_type))) {VkMappedMemoryRange r{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, nullptr};r.memory=p.memory;r.size=VK_WHOLE_SIZE;visible=dfn.vkInvalidateMappedMemoryRanges(vk,1,&r)==VK_SUCCESS;}
     auto bytes=std::make_shared<std::vector<uint8_t>>();
     if(visible) bytes->assign(p.mapping,p.mapping+p.bytes);
     const auto meta=probe;

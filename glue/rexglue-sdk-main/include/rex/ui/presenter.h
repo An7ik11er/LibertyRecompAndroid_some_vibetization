@@ -776,7 +776,7 @@ class Presenter {
   // Implementations may deliver the already-selected pacing deadline through
   // their native event source. Returning false retains the portable window path.
   // This requests a wakeup only; it never advances the FramePacer schedule.
-  virtual bool ScheduleFramePacingWakeup(uint64_t delay_ns) { return false; }
+  virtual bool ScheduleFramePacingWakeup([[maybe_unused]] uint64_t delay_ns) { return false; }
   virtual void PollPresentationTiming() {}
   // nullopt: software-paced; zero: awaiting a display-link callback; otherwise
   // an upcoming display opportunity already translated into the host clock.

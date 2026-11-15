@@ -62,23 +62,23 @@ class NativePipelineStats {
     std::string summary;
   };
   std::string Describe(VkPipeline pipeline) {
-    VkPipelineInfoKHR info{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
+    VkPipelineInfoKHR info{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, nullptr};
     info.pipeline = pipeline;
     uint32_t count = 0;
     if (properties_(device_->device(), &info, &count, nullptr) != VK_SUCCESS || !count)
       return "no-executables";
     std::vector<VkPipelineExecutablePropertiesKHR> executables(
-        count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
+        count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR, nullptr});
     properties_(device_->device(), &info, &count, executables.data());
     std::string out;
     for (uint32_t index = 0; index < count; ++index) {
-      VkPipelineExecutableInfoKHR executable{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
+      VkPipelineExecutableInfoKHR executable{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, nullptr};
       executable.pipeline = pipeline;
       executable.executableIndex = index;
       uint32_t statistic_count = 0;
       statistics_(device_->device(), &executable, &statistic_count, nullptr);
       std::vector<VkPipelineExecutableStatisticKHR> statistics(
-          statistic_count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
+          statistic_count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR, nullptr});
       statistics_(device_->device(), &executable, &statistic_count, statistics.data());
       out += fmt::format(" [{}:", executables[index].name);
       for (const auto& statistic : statistics) {
