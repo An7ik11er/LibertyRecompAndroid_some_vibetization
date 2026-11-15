@@ -487,6 +487,13 @@ REXCVAR_DEFINE_BOOL(gta4_native_backend_thread, false, "GTA IV/Graphics/Native R
                     "Two-thread renderer: with pipelined recording on, the render worker "
                     "records each assembled frame itself (no GtaRecorder thread); the worker "
                     "is named GtaBackend and pinned like the recorder");
+// TEST-ONLY / EXPERIMENTAL TOGGLE (Rule 10):
+// Keep false in all normal development, profiling, benchmarking, and RAGE->Vulkan work.
+// When true, overrides direct_record / inline backend_thread to decompose RenderGuest
+// across RenderGuest -> GtaRenderWork -> GtaRecorder threads for isolated user testing.
+REXCVAR_DEFINE_BOOL(gta4_native_split_render_guest, false, "GTA IV/Diagnostics",
+                    "Test-only: split command assembly and Vulkan recording off RenderGuest onto "
+                    "GtaRenderWork + GtaRecorder threads; default false (1-thread RenderGuest)");
 REXCVAR_DEFINE_BOOL(gta4_native_async_command_retire, true, "GTA IV/Graphics/Native Renderer",
                     "Destroy recorded frame commands on a background thread");
 REXCVAR_DEFINE_BOOL(gta4_native_capture_keepalive, true, "GTA IV/Graphics/Native Renderer",
@@ -7541,8 +7548,11 @@ void Gta4NativeGraphicsSystem::StartRenderWorker() {
     std::lock_guard lock(deferred_diagnostic_mutex_);
     deferred_diagnostic_shutdown_ = false;
   }
+  // TEST-ONLY toggle (gta4_native_split_render_guest): strictly for isolated user testing;
+  // ignore in all normal 1-thread RenderGuest engineering and benchmarks.
+  const bool split_render_guest = REXCVAR_GET(gta4_native_split_render_guest);
   // 58: direct record — no thread; the first pump initializes the worker state.
-  direct_record_ = REXCVAR_GET(gta4_native_direct_record);
+  direct_record_ = !split_render_guest && REXCVAR_GET(gta4_native_direct_record);
   direct_stage_batch_ =
       size_t(std::clamp<uint32_t>(REXCVAR_GET(gta4_native_direct_stage_batch), 1, 64));  // 64
   stream_record_ = direct_record_ && REXCVAR_GET(gta4_native_stream_record);  // 60
@@ -7682,12 +7692,18 @@ void Gta4NativeGraphicsSystem::TraceModernShaderDraw(
 }
 
 void Gta4NativeGraphicsSystem::RenderWorkerLoop(WorkerLoopMode mode) {
+  // TEST-ONLY toggle (gta4_native_split_render_guest): ignore in all normal 1-thread
+  // RenderGuest engineering and benchmarks. When true, forces GtaRenderWork + GtaRecorder split.
+  const bool split_render_guest = REXCVAR_GET(gta4_native_split_render_guest);
   // 58: direct record runs this loop on the submitting thread, one pump per submission; it
   // records frames inline, as GtaBackend does (no GtaRecorder).
   const bool direct = mode != WorkerLoopMode::kThread;
   // 46: read once per worker lifetime, like pipelined_recording_ below.
-  const bool backend_thread = direct || (REXCVAR_GET(gta4_native_pipelined_recording) &&
-                                         REXCVAR_GET(gta4_native_backend_thread));
+  const bool pipelined_setting =
+      split_render_guest || REXCVAR_GET(gta4_native_pipelined_recording);
+  const bool backend_thread =
+      !split_render_guest &&
+      (direct || (pipelined_setting && REXCVAR_GET(gta4_native_backend_thread)));
 #if defined(__ANDROID__)
   if (!direct) pthread_setname_np(pthread_self(), backend_thread ? "GtaBackend" : "GtaRenderWork");
 #endif
@@ -7800,8 +7816,8 @@ void Gta4NativeGraphicsSystem::RenderWorkerLoop(WorkerLoopMode mode) {
   if (!worker_loop_started_) {  // 58: once, also for direct record
   worker_loop_started_ = true;
   worker_command_batch_.reserve(32);
-  pipelined_recording_ = REXCVAR_GET(gta4_native_pipelined_recording);
-  inline_recording_ = pipelined_recording_ && backend_thread;
+  pipelined_recording_ = pipelined_setting;
+  inline_recording_ = !split_render_guest && pipelined_recording_ && backend_thread;
   if (pipelined_recording_) {
     {
       std::lock_guard lock(frame_recorder_mutex_);
@@ -7816,7 +7832,13 @@ void Gta4NativeGraphicsSystem::RenderWorkerLoop(WorkerLoopMode mode) {
       REXLOG_WARN("gta4-native: two-thread backend: frames are recorded on GtaBackend");
     } else {
       frame_recorder_ = std::thread([this]() { FrameRecorderMain(); });
-      REXLOG_INFO("gta4-native: pipelined frame recording enabled");
+      if (split_render_guest) {
+        REXLOG_WARN(
+            "gta4-native: test-only split RenderGuest mode active "
+            "(RenderGuest -> GtaRenderWork -> GtaRecorder)");
+      } else {
+        REXLOG_INFO("gta4-native: pipelined frame recording enabled");
+      }
     }
   }
   }  // 58: worker_loop_started_
@@ -9195,8 +9217,9 @@ void Gta4NativeGraphicsSystem::RunRecorderJob(NativeRecorderJob& job) {
 void Gta4NativeGraphicsSystem::WaitForFrameRecorderIdle() {
   TRACE_SCOPE("RW: wait recorder free");
   std::unique_lock lock(frame_recorder_mutex_);
-  frame_recorder_condition_.wait_for(lock, std::chrono::milliseconds(50),
-                                     [this]() { return !frame_recorder_busy_; });
+  // Wait until GtaRecorder finishes its in-flight frame so SwapAssemblyFrame()
+  // never races with RunRecorderJob() on >50 ms frames (Shutdown cancels presenter waits).
+  frame_recorder_condition_.wait(lock, [this]() { return !frame_recorder_busy_; });
 }
 
 void Gta4NativeGraphicsSystem::StopFrameRecorder() {

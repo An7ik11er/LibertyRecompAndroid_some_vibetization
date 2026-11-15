@@ -68,6 +68,8 @@ public class LibertyActivity extends SDLActivity {
     private static final String LAUNCH_REPORT = "last_launch.txt";
     /** Intent extra from the launcher's "Play (Debug Log)". */
     static final String EXTRA_DEBUG_LOG = "debug_log";
+    /** Launcher "Performance test settings": test-only multi-thread split of RenderGuest. */
+    static final String EXTRA_SPLIT_RENDER_GUEST = "perf_split_render_guest";
     /** Launcher "Performance test settings": no sun shadow map. */
     static final String EXTRA_SHADOWS_OFF = "perf_shadows_off";
     /** Launcher "Performance test settings": fixed 0.5 draw distance. */
@@ -244,6 +246,11 @@ public class LibertyActivity extends SDLActivity {
             Log.i(TAG, "thread affinity " + spec);
         }
         if (intent == null || !intent.hasExtra(EXTRA_SHADOWS_OFF)) return;
+        boolean splitRenderGuest = intent.getBooleanExtra(EXTRA_SPLIT_RENDER_GUEST, false);
+        arguments.removeIf(a -> a.startsWith("--gta4_native_split_render_guest"));
+        if (splitRenderGuest) {
+            arguments.add("--gta4_native_split_render_guest=true");
+        }
         boolean shadowsOff = intent.getBooleanExtra(EXTRA_SHADOWS_OFF, false);
         // 0 = off.
         int water = Math.max(0, Math.min(intent.getIntExtra(EXTRA_WATER_REFLECTION_INTERVAL, 1), 3));

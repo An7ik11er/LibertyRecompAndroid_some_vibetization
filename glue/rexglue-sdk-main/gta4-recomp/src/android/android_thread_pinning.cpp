@@ -369,6 +369,17 @@ const Rule& RuleFor(Layout layout, ThreadId id) {
   }
 }
 
+uint32_t AutoMaskFor(Layout layout, ThreadId id, bool has_gta_recorder, const CpuTopology& topo) {
+  // TEST-ONLY split RenderGuest (GtaRecorder active): separate RenderGuest (Prime) from
+  // GtaRecorder (top_big) so they do not contend on Prime CPU 7. Default GtaBackend / 1-thread
+  // RenderGuest has no GtaRecorder thread and stays on the unchanged kLanes / kLanes2 rules.
+  if (has_gta_recorder && (layout == Layout::kLanes || layout == Layout::kLanes2)) {
+    if (id == kRenderGuest && topo.prime) return topo.prime;
+    if (id == kRecorder && topo.top_big()) return topo.top_big();
+  }
+  return AutoMask(RuleFor(layout, id).kind, topo);
+}
+
 bool Has(const std::string& s, const char* part) { return s.find(part) != std::string::npos; }
 bool Starts(const std::string& s, const char* prefix) { return s.rfind(prefix, 0) == 0; }
 
@@ -724,6 +735,7 @@ void PinningLoop() {
   sdl_primary.what = "SDLThread";
   const auto started = std::chrono::steady_clock::now();
   bool summary_logged = false;
+  bool has_gta_recorder = false;
   uint32_t tick = 0;
 
   while (true) {
@@ -740,7 +752,8 @@ void PinningLoop() {
         if (!state.hold || state.id >= kThreadIdCount) continue;
         const bool manual = placement.manual && placement.mask[state.id] != 0;
         const Rule& rule = RuleFor(layout, state.id);
-        const uint32_t mask = manual ? placement.mask[state.id] : AutoMask(rule.kind, topo);
+        const uint32_t mask = manual ? placement.mask[state.id]
+                                     : AutoMaskFor(layout, state.id, has_gta_recorder, topo);
         const int nice = rule.nice;
         bool changed_outside = false;
         uint32_t outside_mask = 0;
@@ -800,16 +813,23 @@ void PinningLoop() {
     seen.clear();
     recorder_primary.Begin();
     sdl_primary.Begin();
+    bool scan_has_gta_recorder = false;
     while (dirent* entry = readdir(dir)) {
       const pid_t tid = pid_t(std::atoi(entry->d_name));
       if (tid <= 0) continue;
       std::string name = GetThreadName(tid);
       if (name.empty()) continue;
-      if (name == "GtaRecorder" || name == "GtaBackend") recorder_primary.Offer(tid);
+      if (name == "GtaRecorder") {
+        scan_has_gta_recorder = true;
+        recorder_primary.Offer(tid);
+      } else if (name == "GtaBackend") {
+        recorder_primary.Offer(tid);
+      }
       if (name == "SDLThread") sdl_primary.Offer(tid);
       seen.push_back({tid, std::move(name)});
     }
     closedir(dir);
+    has_gta_recorder = scan_has_gta_recorder;
     recorder_primary.Commit();
     sdl_primary.Commit();
     const pid_t primary_recorder = recorder_primary.tid, primary_sdl = sdl_primary.tid;
@@ -833,7 +853,9 @@ void PinningLoop() {
       const Rule& rule = RuleFor(layout, id);
       // off: трогаем только то, что задано вручную (и без nice).
       const uint32_t mask = manual ? placement.mask[id]
-                                   : (layout == Layout::kOff ? 0 : AutoMask(rule.kind, topo));
+                                   : (layout == Layout::kOff
+                                          ? 0
+                                          : AutoMaskFor(layout, id, has_gta_recorder, topo));
       const int nice = layout == Layout::kOff ? kKeepNice : rule.nice;
       if (!mask && state.effective) {
         // Маску ставили мы, а теперь она не нужна (раскладку сменили на лету): снимаем.

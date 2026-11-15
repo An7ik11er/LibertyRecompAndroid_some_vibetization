@@ -1053,6 +1053,7 @@ public class LauncherActivity extends Activity {
     // Experimental speed settings, kept by the launcher and passed to the game
     // as arguments when it starts (LibertyActivity.applyPerformanceTestArguments).
     private static final String PERF_PREFERENCES = "performance_test";
+    private static final String PERF_SPLIT_RENDER_GUEST = "split_render_guest";
     private static final String PERF_SHADOWS_OFF = "sun_shadows_off";
     private static final String PERF_HALF_DRAW_DISTANCE = "half_draw_distance";
     private static final String PERF_GPU_TURBO = "gpu_turbo";
@@ -1069,6 +1070,7 @@ public class LauncherActivity extends Activity {
     private String legacyPerfSummary() {
         android.content.SharedPreferences perf = perfTestPreferences();
         int activeCount = 0;
+        if (perf.getBoolean(PERF_SPLIT_RENDER_GUEST, false)) activeCount++;
         if (perf.getBoolean(PERF_HALF_DRAW_DISTANCE, false)) activeCount++;
         if (perf.getBoolean(PERF_SHADOWS_OFF, false)) activeCount++;
         if (perf.getBoolean(PERF_GPU_TURBO, false)) activeCount++;
@@ -1187,11 +1189,16 @@ public class LauncherActivity extends Activity {
         LinearLayout panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
 
+        android.widget.CheckBox splitRenderGuest = styledCheck(
+                tr("chk_split_rg_title", "Split RenderGuest across threads (experimental)"),
+                tr("chk_split_rg_note", "Test-only toggle: splits RenderGuest command assembly and Vulkan recording onto GtaRenderWork + GtaRecorder threads instead of 1-thread RenderGuest."),
+                perf.getBoolean(PERF_SPLIT_RENDER_GUEST, false));
+        panel.addView(splitRenderGuest, matchWrap(dp(10)));
         android.widget.CheckBox drawDistance = styledCheck(
                 tr("chk_draw_dist_title", "Draw distance 0.5"),
                 tr("chk_draw_dist_note", "Fixed half draw distance; the dynamic draw distance is turned off."),
                 perf.getBoolean(PERF_HALF_DRAW_DISTANCE, false));
-        panel.addView(drawDistance, matchWrap(dp(10)));
+        panel.addView(drawDistance, matchWrap(dp(4)));
         android.widget.CheckBox shadows = styledCheck(
                 tr("chk_shadows_title", "Sun shadows off"),
                 tr("chk_shadows_note", "Nothing casts a sun shadow; the shadow map is not drawn."),
@@ -1248,6 +1255,7 @@ public class LauncherActivity extends Activity {
         cancel.setOnClickListener(v -> dialog.dismiss());
         save.setOnClickListener(v -> {
             perf.edit()
+                    .putBoolean(PERF_SPLIT_RENDER_GUEST, splitRenderGuest.isChecked())
                     .putBoolean(PERF_HALF_DRAW_DISTANCE, drawDistance.isChecked())
                     .putBoolean(PERF_SHADOWS_OFF, shadows.isChecked())
                     .putBoolean(PERF_GPU_TURBO, turbo.isChecked())
@@ -1345,6 +1353,8 @@ public class LauncherActivity extends Activity {
                 Intent intent = new Intent(this, LibertyActivity.class);
                 if (debugLog) intent.putExtra(LibertyActivity.EXTRA_DEBUG_LOG, true);
                 android.content.SharedPreferences perf = perfTestPreferences();
+                intent.putExtra(LibertyActivity.EXTRA_SPLIT_RENDER_GUEST,
+                        perf.getBoolean(PERF_SPLIT_RENDER_GUEST, false));
                 intent.putExtra(LibertyActivity.EXTRA_SHADOWS_OFF, perf.getBoolean(PERF_SHADOWS_OFF, false));
                 intent.putExtra(LibertyActivity.EXTRA_HALF_DRAW_DISTANCE,
                         perf.getBoolean(PERF_HALF_DRAW_DISTANCE, false));
