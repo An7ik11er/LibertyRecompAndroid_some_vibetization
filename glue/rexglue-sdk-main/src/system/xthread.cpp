@@ -442,6 +442,16 @@ X_STATUS XThread::Create() {
     rex::initialize_seh_thread();
     runtime::ThreadState::Bind(thread_state_.get());
 
+#if defined(__aarch64__)
+    // Upstream 66660e55: Match Xbox 360 Xenon hardware behavior (VSCR NJ=1, non-Java mode).
+    // Flush denormals/subnormals to zero on ARM64 Cortex-X1/A78 to avoid floating-point penalty stalls.
+    uint64_t fpcr;
+    asm volatile("mrs %0, fpcr" : "=r"(fpcr));
+    fpcr |= (1ULL << 24);  // FZ: Flush to zero
+    fpcr |= (1ULL << 25);  // DN: Default NaN
+    asm volatile("msr fpcr, %0" : : "r"(fpcr));
+#endif
+
     // Set thread ID override. This is used by logging.
     rex::thread::set_current_thread_id(handle());
 
