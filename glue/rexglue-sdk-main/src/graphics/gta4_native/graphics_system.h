@@ -2621,13 +2621,22 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   // frame being recorded; null if the memo is empty, stale or for another key.
   NativePersistentBufferEntry* UsePersistentMemo(const NativeBufferResource& owner,
                                                  const NativePersistentBufferKey& key);
+  NativePersistentBufferEntry* UsePersistentMemo(const NativeBufferResource& owner,
+                                                 const NativePersistentBufferKey& key,
+                                                 uint64_t current_submission,
+                                                 bool flight_enabled);
   void TouchPersistentEntry(NativePersistentBufferEntry& entry);
+  void TouchPersistentEntryWithSubmission(NativePersistentBufferEntry& entry,
+                                          uint64_t current_submission, bool flight_enabled);
   inline void TouchPersistentEntryIfNeeded(NativePersistentBufferEntry& entry,
                                            uint64_t current_submission) {
+    const bool flight_enabled = IsNativeFlightRecorderEnabled();
     if (entry.last_used_frame != active_texture_frame_ ||
         entry.last_used_submission < current_submission ||
-        IsNativeFlightRecorderEnabled()) [[unlikely]] {
-      TouchPersistentEntry(entry);
+        flight_enabled) [[unlikely]] {
+      TouchPersistentEntryWithSubmission(entry, current_submission, flight_enabled);
+    } else {
+      ++persistent_buffer_hits_;
     }
   }
   bool GetOrCreatePersistentBuffer(VkCommandBuffer command_buffer,
@@ -3126,13 +3135,13 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     const NativeBufferResource* raw = nullptr;
   };
   static_assert(sizeof(BufferL1MruEntry) == 40);
-  // Batch 94: 2-way set-associative L1 (512 sets x 2 ways = 1024 entries, 40 KB <= 64 KB X1 L1D).
-  static constexpr size_t kBufferCaptureL1SetCount = 512;
+  // Batch 99: 2-way set-associative L1 (1024 sets x 2 ways = 2048 entries, 80 KB) for full-frame static buffer residency.
+  static constexpr size_t kBufferCaptureL1SetCount = 1024;
   static constexpr size_t kBufferCaptureL1Ways = 2;
   static constexpr size_t kBufferCaptureL1TableSize =
       kBufferCaptureL1SetCount * kBufferCaptureL1Ways;
   static constexpr uint32_t BufferL1SetBase(uint32_t handle) noexcept {
-    return ((handle * 0x9E3779B1u) >> (32 - 9)) * uint32_t(kBufferCaptureL1Ways);
+    return ((handle * 0x9E3779B1u) >> (32 - 10)) * uint32_t(kBufferCaptureL1Ways);
   }
   struct alignas(64) BufferMruEntry {
     uint32_t handle = 0;
@@ -3180,25 +3189,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   BufferCaptureCacheSlot& BufferCaptureSlot(uint32_t handle) {
     return CaptureCacheWay(buffer_capture_cache_, handle);
   }
-  void ForgetBufferCapture(uint32_t handle) {
-    const uint32_t l1_base = BufferL1SetBase(handle);
-    for (size_t way = 0; way < kBufferCaptureL1Ways; ++way) {
-      auto& l1 = buffer_capture_l1_table_[l1_base + way];
-      if (l1.handle == handle) {
-        l1 = {};
-      }
-    }
-    const uint32_t base = BufferFastSetBase(handle);
-    for (size_t way = 0; way < kBufferCaptureFastWays; ++way) {
-      auto& entry = buffer_capture_fast_table_[base + way];
-      if (entry.handle == handle) {
-        entry.handle = 0;
-        entry.strong_ref.reset();
-        entry.alias_serial = 0;
-      }
-    }
-    ForgetCaptureCache(buffer_capture_cache_, handle);
-  }
+  void ForgetBufferCapture(uint32_t handle);
 
   // Producer-only memo of clean texture captures: same handle and identical
   // image fetch words with no texture-map change since give the same resource, so
@@ -3979,6 +3970,27 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   bool native_descriptor_layouts_update_after_bind_ = false;
   uint32_t native_descriptor_maximum_page_count_ = 0;
   NativeDrawStateCache<2> native_draw_state_cache_;
+  struct RecorderFrameCvarCache {
+    bool upload_memo_first = true;
+    bool persistent_buffers = true;
+    bool partial_constant_upload = true;
+    bool validate_hot_caches = false;
+    bool debug_counters = false;
+    bool worker_constant_ring_validate = false;
+    bool trace_native_renderer = false;
+    bool sampled_stage_biases = true;
+    bool shared_key_memo = true;
+    bool ubo_bind_always = false;
+    uint32_t debug_gpu_attribution = 0;
+    float depth_bias_constant_scale = 1.0f;
+    float depth_bias_slope_scale = 1.0f;
+    bool dedupe_vertex_bindings = true;
+    bool dedupe_index_binding = true;
+    bool vertex_cache_order = true;
+    bool gpu_breadcrumbs = false;
+  };
+  RecorderFrameCvarCache frame_cvar_cache_{};
+  void RefreshRecorderFrameCvars();
   NativeDescriptorSlotHandle native_null_image_descriptor_{};
   NativeDescriptorSlotHandle native_null_sampler_descriptor_{};
   uint32_t active_descriptor_copy_ = 0;
