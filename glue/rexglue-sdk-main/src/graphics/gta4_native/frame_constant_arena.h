@@ -72,17 +72,45 @@ class FrameGenerationMap {
   }
 
   InsertResult Insert(const Key& key, const Value& value) {
-    if (Value* existing = Find(key)) {
-      return {existing, false};
-    }
+    return FindOrInsert(key, value);
+  }
+
+  InsertResult FindOrInsert(const Key& key, const Value& value) {
+    return FindOrTryEmplace(key, [&](Value& out) {
+      out = value;
+      return true;
+    });
+  }
+
+  template <typename TryMakeValue>
+  InsertResult FindOrTryEmplace(const Key& key, TryMakeValue&& try_make_value) {
     if (!EnsureInsertionCapacity()) {
       return {};
     }
-    Bucket* bucket = InsertWithoutGrowth(key, value);
-    if (!bucket) {
-      return {};
+    const size_t hash = hasher_(key);
+    const uint64_t wanted = (generation_ << kTagBits) | Tag(hash);
+    const size_t mask = buckets_.size() - 1;
+    size_t index = hash & mask;
+    for (size_t probe = 0; probe < buckets_.size(); ++probe) {
+      const uint64_t stamp = stamps_[index];
+      if ((stamp >> kTagBits) != generation_) {
+        Value value{};
+        if (!try_make_value(value)) {
+          return {};
+        }
+        Bucket& bucket = buckets_[index];
+        bucket.key = key;
+        bucket.value = std::move(value);
+        stamps_[index] = wanted;
+        ++size_;
+        return {&bucket.value, true};
+      }
+      if (stamp == wanted && equal_(buckets_[index].key, key)) {
+        return {&buckets_[index].value, false};
+      }
+      index = (index + 1) & mask;
     }
-    return {&bucket->value, true};
+    return {};
   }
 
   bool CanResetGeneration() const { return generation_ < kMaximumGeneration; }

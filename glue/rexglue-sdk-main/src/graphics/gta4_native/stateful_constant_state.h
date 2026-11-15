@@ -267,6 +267,13 @@ struct ConstantApplyResult {
   explicit operator bool() const { return status == ConstantApplyStatus::kApplied; }
 };
 
+struct ConstantApplyStatusOnly {
+  ConstantApplyStatus status = ConstantApplyStatus::kApplied;
+  bool changed = false;
+
+  explicit operator bool() const { return status == ConstantApplyStatus::kApplied; }
+};
+
 // One instance is owned by the render worker for each device and shader
 // stage. Published versions retain only copied deltas. A contiguous host view
 // is reconstructed lazily on first consumer use and then memoized.
@@ -388,11 +395,30 @@ class AuthoritativeConstantState {
   template <typename HashCallback>
   ConstantApplyResult Apply(const ConstantPayloadDelta& delta, HashCallback&& hash_callback,
                             bool consume = false) {
+    return ApplyImpl<true>(delta, std::forward<HashCallback>(hash_callback), consume);
+  }
+
+  template <typename HashCallback>
+  ConstantApplyStatusOnly ApplyStatus(const ConstantPayloadDelta& delta,
+                                      HashCallback&& hash_callback, bool consume = false) {
+    return ApplyImpl<false>(delta, std::forward<HashCallback>(hash_callback), consume);
+  }
+
+ private:
+  template <bool ReturnVersion, typename HashCallback>
+  auto ApplyImpl(const ConstantPayloadDelta& delta, HashCallback&& hash_callback, bool consume) {
+    const auto make_ret = [&](ConstantApplyStatus status, bool changed) {
+      if constexpr (ReturnVersion) {
+        return ConstantApplyResult{status, changed, current_};
+      } else {
+        return ConstantApplyStatusOnly{status, changed};
+      }
+    };
     if (!ValidateConstantPayloadDelta(delta, canonical_.size())) {
-      return {ConstantApplyStatus::kInvalidDelta, false, current_};
+      return make_ret(ConstantApplyStatus::kInvalidDelta, false);
     }
     if (!initialized_ && !delta.complete_snapshot) {
-      return {ConstantApplyStatus::kNeedsCompleteSnapshot, false, current_};
+      return make_ret(ConstantApplyStatus::kNeedsCompleteSnapshot, false);
     }
     if (consume) {
       if (!CanIncrementStateVersion(version_)) {
@@ -403,8 +429,9 @@ class AuthoritativeConstantState {
                                                delta.payload.data() + range.payload_offset,
                                                range.byte_count) == 0;
         }
-        return {unchanged ? ConstantApplyStatus::kApplied : ConstantApplyStatus::kVersionSpaceExhausted,
-                false, current_};
+        return make_ret(
+            unchanged ? ConstantApplyStatus::kApplied : ConstantApplyStatus::kVersionSpaceExhausted,
+            false);
       }
       bool changed = !initialized_;
       for (const ConstantDeltaRange& range : delta.ranges) {
@@ -417,7 +444,7 @@ class AuthoritativeConstantState {
         changed = true;
         std::memcpy(destination, source, range.byte_count);
       }
-      if (!changed) return {ConstantApplyStatus::kApplied, false, current_};
+      if (!changed) return make_ret(ConstantApplyStatus::kApplied, false);
       IncrementStateVersion(version_);
       initialized_ = true;
       auto next = MakeConstantStateVersion();
@@ -431,7 +458,7 @@ class AuthoritativeConstantState {
       // canonical bank right away (SnapshotCurrentVersion), while it is current.
       next->delta.complete_snapshot = true;
       current_ = std::move(next);
-      return {ConstantApplyStatus::kApplied, true, current_};
+      return make_ret(ConstantApplyStatus::kApplied, true);
     }
 
     // 29.10: checked before canonical_ is written (as in the consume path above):
@@ -444,8 +471,9 @@ class AuthoritativeConstantState {
                                              delta.payload.data() + range.payload_offset,
                                              range.byte_count) == 0;
       }
-      return {unchanged ? ConstantApplyStatus::kApplied : ConstantApplyStatus::kVersionSpaceExhausted,
-              false, current_};
+      return make_ret(
+          unchanged ? ConstantApplyStatus::kApplied : ConstantApplyStatus::kVersionSpaceExhausted,
+          false);
     }
     ConstantPayloadDelta changed_delta;
     changed_delta.complete_snapshot = !initialized_;
@@ -466,7 +494,7 @@ class AuthoritativeConstantState {
     }
 
     if (initialized_ && changed_delta.empty()) {
-      return {ConstantApplyStatus::kApplied, false, current_};
+      return make_ret(ConstantApplyStatus::kApplied, false);
     }
     IncrementStateVersion(version_);
     initialized_ = true;
@@ -486,7 +514,7 @@ class AuthoritativeConstantState {
       changed_delta.complete_snapshot = true;
     } else if (current_ && current_->deferred_ancestor_count >= kMaximumDeferredAncestors) {
       if (!CaptureCompleteConstantSnapshot(canonical_, changed_delta)) {
-        return {ConstantApplyStatus::kInvalidDelta, false, current_};
+        return make_ret(ConstantApplyStatus::kInvalidDelta, false);
       }
     }
     next->delta = std::move(changed_delta);
@@ -495,8 +523,10 @@ class AuthoritativeConstantState {
       next->deferred_ancestor_count = current_ ? (current_->materialized ? 1 : current_->deferred_ancestor_count + 1) : 0;
     }
     current_ = std::move(next);
-    return {ConstantApplyStatus::kApplied, true, current_};
+    return make_ret(ConstantApplyStatus::kApplied, true);
   }
+
+ public:
 
   // The caller must retain the version for the whole use of this view. Draw
   // commands already do so, and need not retain/release its immutable byte

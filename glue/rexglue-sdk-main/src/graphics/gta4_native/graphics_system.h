@@ -509,6 +509,8 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     // attribution (string searches over both filenames); 0xFFFF: not computed.
     mutable uint16_t translucent_range_memo = 0xFFFF;
     mutable uint16_t shader_category_memo = 0xFFFF;
+    // Recorder-only memo of required vertex stream bits (0xFFFFFFFFu = uncomputed).
+    mutable uint32_t required_streams_mask = 0xFFFFFFFFu;
   };
 
   // 66: a command's pipeline bindings are part of the command. Until 66 the worker made a
@@ -534,6 +536,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     NativePipelineState& Begin(uint64_t serial) {
       present_ = true;
       serial_ = serial;
+      state_.required_streams_mask = 0xFFFFFFFFu;
       return state_;
     }
     // What equality of two commands' snapshot pointers was.
@@ -2007,12 +2010,47 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     };
     std::array<SharedMruEntry, kSharedMruSize> shared_mru{};
     uint32_t shared_mru_cursor = 0;
+    struct LastVbUploadMemo {
+      const NativeBufferResource* resource = nullptr;
+      uint64_t generation = 0;
+      uint64_t declaration_hash = 0;
+      uint64_t shader_hash = 0;
+      uint32_t stream_offset = 0;
+      uint32_t stride = 0;
+      uint32_t frame = UINT32_MAX;
+      uint64_t persistent_epoch = 0;
+      NativePersistentBufferEntry* persistent_entry = nullptr;
+      NativeUploadAllocation allocation{};
+    };
+    struct LastIbUploadMemo {
+      const NativeBufferResource* resource = nullptr;
+      uint64_t generation = 0;
+      bool index32 = false;
+      uint32_t frame = UINT32_MAX;
+      uint64_t persistent_epoch = 0;
+      NativePersistentBufferEntry* persistent_entry = nullptr;
+      NativeUploadAllocation allocation{};
+    };
+    struct RequiredStreamsMemo {
+      const NativeShader* vs = nullptr;
+      const NativeVertexDeclaration* vdecl = nullptr;
+      uint64_t vs_hash = 0;
+      uint64_t vdecl_gen = 0;
+      uint32_t mask = 0;
+      bool valid = false;
+    };
+    std::array<LastVbUploadMemo, kVertexStreamCount> last_vb_uploads{};
+    LastIbUploadMemo last_ib_upload{};
+    std::array<RequiredStreamsMemo, 64> required_streams_memo{};
     bool Reset() {
       has_last_shared_key = false;
       last_shared_key = {};
       last_shared_allocation = {};
       for (auto& entry : shared_mru) entry.valid = false;
       shared_mru_cursor = 0;
+      last_vb_uploads = {};
+      last_ib_upload = {};
+      for (auto& entry : required_streams_memo) entry.valid = false;
       if (!vertex_uploads.CanResetGeneration() || !index16_uploads.CanResetGeneration() ||
           !index32_uploads.CanResetGeneration()) return false;
       return vertex_uploads.ResetGeneration() && index16_uploads.ResetGeneration() &&
@@ -2576,6 +2614,13 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
                            uint32_t logical_width, uint32_t logical_height,
                            VkSampleCountFlagBits samples, NativeFrameResources& resources,
                            const NativeRenderingTarget& target);
+  [[gnu::noinline]] void LogBindCommonDrawStateDiagnostics(
+      const NativeCommand& command, uint64_t bound_vertex_shader_hash,
+      const NativeUploadAllocation& vertex_constants_allocation,
+      const std::vector<uint8_t>* vertex_constants) const;
+  bool GetRequiredVertexStreamsMask(const NativePipelineState& state,
+                                    NativeFrameResources& resources,
+                                    uint32_t& required_streams_mask) const;
   void LogVectorFontDraw(const NativeCommand& command, uint32_t submitted_frame,
                          size_t command_index) const;
   bool IsHoveGantryGeometryCandidate(const NativeCommand& command) const;
@@ -3887,6 +3932,27 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   VkDescriptorSet ubo_bound_set_ = VK_NULL_HANDLE;
   VkCommandBuffer ubo_bound_command_buffer_ = VK_NULL_HANDLE;
   std::array<uint32_t, 3> ubo_bound_offsets_{};
+  // Recorder-thread-only shared-constant memo cache (moved out of function-local TLS).
+  struct FastSharedConstMemo {
+    uint64_t frame = ~0ull;
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    const NativeFixedFunctionState* fixed_state = nullptr;
+    const NativePipelineState* pipe_state = nullptr;
+    const EnvironmentalDataV2* env_data = nullptr;
+    uint32_t descriptor_page = UINT32_MAX, descriptor_copy = UINT32_MAX;
+    uint64_t image_epoch = 0, sampler_epoch = 0, cached_epoch = 0;
+    uint32_t vertex_booleans = 0, pixel_booleans = 0;
+    StateVersionStamp boolean_version{};
+    uint64_t texture_inputs_sig = 0;
+    uint32_t width = 0, height = 0, logical_width = 0, logical_height = 0, samples = 0;
+    uint32_t color_mask = 0;
+    uint32_t color_output_info_0 = 0;
+    uint8_t temporal_mode = 0, split_postfx = 0;
+    bool is_reflection = false;
+    bool temporal_jitter = false;
+    NativeUploadAllocation allocation{};
+  };
+  std::array<FastSharedConstMemo, 32> fast_shared_memo_cache_{};
   uint32_t ubo_rewritten_shaders_ = 0;
   uint64_t ubo_rewritten_loads_ = 0;
   bool BindUboConstantBanks(VkCommandBuffer command_buffer, VkPipelineLayout layout,

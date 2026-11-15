@@ -83,8 +83,11 @@ class NativeDescriptorWorkingSet {
     if (!active_pages_ && !StartPage())
       return std::nullopt;
     auto fits = [&](const Page& page) {
-      return page.image_lookup.size() + Missing(page.image_lookup, images) <= image_capacity_ &&
-             page.sampler_lookup.size() + Missing(page.sampler_lookup, samplers) <= sampler_capacity_;
+      return (page.image_lookup.size() + Stages <= image_capacity_ ||
+              page.image_lookup.size() + Missing(page.image_lookup, images) <= image_capacity_) &&
+             (page.sampler_lookup.size() + Stages <= sampler_capacity_ ||
+              page.sampler_lookup.size() + Missing(page.sampler_lookup, samplers) <=
+                  sampler_capacity_);
     };
     if (!fits(pages_[active_pages_ - 1])) {
       if (!StartPage() || !fits(pages_[active_pages_ - 1]))
@@ -94,10 +97,14 @@ class NativeDescriptorWorkingSet {
     out.page = uint32_t(active_pages_ - 1);
     Page& page = pages_[out.page];
     for (size_t i = 0; i < Stages; ++i) {
-      out.images[i] = Insert(page.image_lookup, page.previous_images, page.images, images[i],
-                             image_capacity_, page.image_free_cursor);
-      out.samplers[i] = Insert(page.sampler_lookup, page.previous_samplers, page.samplers, samplers[i],
-                               sampler_capacity_, page.sampler_free_cursor);
+      out.images[i] =
+          images[i] ? Insert(page.image_lookup, page.previous_images, page.images, images[i],
+                             image_capacity_, page.image_free_cursor)
+                    : 0;
+      out.samplers[i] =
+          samplers[i] ? Insert(page.sampler_lookup, page.previous_samplers, page.samplers,
+                               samplers[i], sampler_capacity_, page.sampler_free_cursor)
+                      : 0;
       if (out.images[i] == UINT32_MAX || out.samplers[i] == UINT32_MAX)
         return std::nullopt;
     }
@@ -118,7 +125,7 @@ class NativeDescriptorWorkingSet {
                         const std::array<uint64_t, Stages>& keys) {
     size_t count = 0;
     for (size_t i = 0; i < Stages; ++i)
-      if (!lookup.Find(keys[i]) &&
+      if (keys[i] && !lookup.Find(keys[i]) &&
           std::find(keys.begin(), keys.begin() + i, keys[i]) == keys.begin() + i)
         ++count;
     return count;
@@ -127,22 +134,24 @@ class NativeDescriptorWorkingSet {
                          const FrameGenerationMap<uint64_t, uint32_t>& previous,
                          std::vector<uint64_t>& values, uint64_t key,
                          uint32_t capacity, size_t& free_cursor) {
-    if (const auto* existing = lookup.Find(key)) return *existing;
-    uint32_t index = UINT32_MAX;
-    if (const auto* old = previous.Find(key); old && *old < values.size() && !values[*old]) {
-      index = *old;
-    } else if (values.size() < capacity) {
-      // Prefer fresh space to displacing an old binding used by a later draw.
-      index = uint32_t(values.size());
-      values.push_back(0);
-    } else {
-      while (free_cursor < values.size() && values[free_cursor]) ++free_cursor;
-      if (free_cursor == values.size()) return UINT32_MAX;
-      index = uint32_t(free_cursor++);
-    }
-    if (!lookup.Insert(key, index)) return UINT32_MAX;
-    values[index] = key;
-    return index;
+    const auto result = lookup.FindOrTryEmplace(key, [&](uint32_t& out) {
+      uint32_t index = UINT32_MAX;
+      if (const auto* old = previous.Find(key); old && *old < values.size() && !values[*old]) {
+        index = *old;
+      } else if (values.size() < capacity) {
+        // Prefer fresh space to displacing an old binding used by a later draw.
+        index = uint32_t(values.size());
+        values.push_back(0);
+      } else {
+        while (free_cursor < values.size() && values[free_cursor]) ++free_cursor;
+        if (free_cursor == values.size()) return false;
+        index = uint32_t(free_cursor++);
+      }
+      values[index] = key;
+      out = index;
+      return true;
+    });
+    return result.value ? *result.value : UINT32_MAX;
   }
   bool StartPage() {
     if (active_pages_ >= maximum_pages_)
