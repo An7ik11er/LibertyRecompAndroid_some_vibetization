@@ -1647,14 +1647,13 @@ bool BaseHeap::QueryBaseAndSize(uint32_t* in_out_address, uint32_t* out_size) {
 
 bool BaseHeap::QueryProtect(uint32_t address, uint32_t* out_protect) {
   uint32_t page_number = (address - heap_base_) >> page_size_shift_;
-  if (page_number > page_table_.size()) {
+  if (page_number >= page_table_.size()) {
     REXSYS_ERROR("BaseHeap::QueryProtect base page out of range");
     *out_protect = 0;
     return false;
   }
-  std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
-  auto page_entry = page_table_[page_number];
-  *out_protect = page_entry.current_protect;
+  // Upstream 5b033656: read page protection without acquiring the recursive heap lock
+  *out_protect = page_table_[page_number].current_protect;
   return true;
 }
 
@@ -1665,19 +1664,20 @@ rex::memory::PageAccess BaseHeap::QueryRangeAccess(uint32_t low_address, uint32_
   }
   uint32_t low_page_number = (low_address - heap_base_) >> page_size_shift_;
   uint32_t high_page_number = (high_address - heap_base_) >> page_size_shift_;
+  if (high_page_number >= page_table_.size()) {
+    return rex::memory::PageAccess::kNoAccess;
+  }
   bool all_readable = true;
   bool all_writable = true;
-  {
-    std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
-    for (uint32_t i = low_page_number; i <= high_page_number; ++i) {
-      uint32_t page_protect = page_table_[i].current_protect;
-      if (!(page_protect & memory::kMemoryProtectRead)) {
-        all_readable = false;
-      }
-      if (!(page_protect & memory::kMemoryProtectWrite) &&
-          !(page_protect & memory::kMemoryProtectWriteCombine)) {
-        all_writable = false;
-      }
+  // Upstream 5b033656: read page table entries without the heap lock
+  for (uint32_t i = low_page_number; i <= high_page_number; ++i) {
+    uint32_t page_protect = page_table_[i].current_protect;
+    if (!(page_protect & memory::kMemoryProtectRead)) {
+      all_readable = false;
+    }
+    if (!(page_protect & memory::kMemoryProtectWrite) &&
+        !(page_protect & memory::kMemoryProtectWriteCombine)) {
+      all_writable = false;
     }
   }
   if (all_readable && all_writable) {
