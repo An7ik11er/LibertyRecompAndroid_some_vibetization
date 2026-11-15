@@ -38,12 +38,16 @@ struct ConstantPayloadDelta {
   // memcmp first. If the shadow was stale (after a rejected command, before the resync)
   // an equal range is just copied again; the result is the same bank.
   bool changed_only = false;
+  mutable bool validated = false;
 
   bool empty() const { return ranges.empty(); }
 };
 
 inline bool ValidateConstantPayloadDelta(const ConstantPayloadDelta& delta, size_t block_size,
                                          bool require_complete_snapshot = false) {
+  if (delta.validated && !require_complete_snapshot) [[likely]] {
+    return true;
+  }
   if (require_complete_snapshot && !delta.complete_snapshot) {
     return false;
   }
@@ -68,6 +72,7 @@ inline bool ValidateConstantPayloadDelta(const ConstantPayloadDelta& delta, size
     previous_end = size_t(range.destination_offset) + range.byte_count;
     first = false;
   }
+  delta.validated = true;
   return true;
 }
 
@@ -144,13 +149,14 @@ inline bool CaptureConstantPayloadDelta(std::span<const uint8_t> source,
 inline bool CaptureChangedConstantPayloadDelta(std::span<const uint8_t> source,
                                                const DirtyRangeSet& dirty_ranges,
                                                uint32_t bytes_per_element,
-                                               std::span<const uint8_t> shadow,
+                                               std::span<uint8_t> shadow,
                                                ConstantPayloadDelta& result,
                                                uint64_t& dirty_bytes) {
   result.ranges.clear();
   result.payload.clear();
   result.complete_snapshot = false;
   result.changed_only = false;
+  result.validated = false;
   if (!bytes_per_element || shadow.size() != source.size()) {
     return false;
   }
@@ -167,6 +173,7 @@ inline bool CaptureChangedConstantPayloadDelta(std::span<const uint8_t> source,
                              static_cast<uint32_t>(run_size)});
     result.payload.insert(result.payload.end(), source.data() + run_begin,
                           source.data() + run_begin + run_size);
+    std::memcpy(shadow.data() + run_begin, source.data() + run_begin, run_size);
     run_size = 0;
   };
   for (const DirtyElementRange& dirty : dirty_ranges.ranges) {
@@ -437,6 +444,7 @@ class AuthoritativeConstantState {
             false);
       }
       bool changed = !initialized_;
+      uint32_t min_dirty_offset = UINT32_MAX;
       for (const ConstantDeltaRange& range : delta.ranges) {
         const uint8_t* source = delta.payload.data() + range.payload_offset;
         uint8_t* destination = canonical_.data() + range.destination_offset;
@@ -445,6 +453,7 @@ class AuthoritativeConstantState {
             std::memcmp(destination, source, range.byte_count) == 0)
           continue;
         changed = true;
+        min_dirty_offset = std::min(min_dirty_offset, range.destination_offset);
         std::memcpy(destination, source, range.byte_count);
       }
       if (!changed) return make_ret(ConstantApplyStatus::kApplied, false);
@@ -460,6 +469,17 @@ class AuthoritativeConstantState {
       // No delta and no parent: the draw snapshots this version from the
       // canonical bank right away (SnapshotCurrentVersion), while it is current.
       next->delta.complete_snapshot = true;
+      if (current_) {
+        if (current_->cached_prefix_bytes > 0 && min_dirty_offset >= current_->cached_prefix_bytes) {
+          next->cached_prefix_bytes = current_->cached_prefix_bytes;
+          next->cached_prefix_hash = current_->cached_prefix_hash;
+        }
+        if (current_->cached_ring_bytes > 0 && min_dirty_offset >= current_->cached_ring_bytes) {
+          next->cached_ring_serial = current_->cached_ring_serial;
+          next->cached_ring_bytes = current_->cached_ring_bytes;
+          next->cached_ring_offset = current_->cached_ring_offset;
+        }
+      }
       current_ = std::move(next);
       return make_ret(ConstantApplyStatus::kApplied, true);
     }

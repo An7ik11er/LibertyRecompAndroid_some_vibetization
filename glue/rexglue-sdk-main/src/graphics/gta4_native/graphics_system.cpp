@@ -4330,8 +4330,10 @@ bool Gta4NativeGraphicsSystem::SubmitDirectDrawIndexed(const DrawIndexedPrimitiv
   std::unique_lock capture_lock(command_capture_mutex_);
   auto native_command_owner = native_command_pool_.Make();
   NativeCommand& native_command = *native_command_owner;
-  PrefetchProducerBuffers(native_command, command.dirty_state.words[0] != 0,
-                          command.dirty_state.words[1] != 0);
+  if (!direct_record_) {
+    PrefetchProducerBuffers(native_command, command.dirty_state.words[0] != 0,
+                            command.dirty_state.words[1] != 0);
+  }
   if (command.batch_vb != 0) [[likely]] {
     __builtin_prefetch(&buffer_capture_l1_table_[BufferL1SetBase(command.batch_vb)], 0, 3);
   }
@@ -4467,7 +4469,7 @@ bool Gta4NativeGraphicsSystem::CaptureTitleCommand(uint32_t abi_version, const v
   }
   auto native_command_owner = native_command_pool_.Make();
   NativeCommand& native_command = *native_command_owner;
-  PrefetchProducerBuffers(native_command);  // 53
+  if (!direct_record_) PrefetchProducerBuffers(native_command);  // 53
   producer_constant_commit_ = false;
   if (!ValidateAndCopyCommand(title_command, title_command_size, native_command, replay)) {
     if (phone_envelope) {
@@ -5674,7 +5676,7 @@ bool Gta4NativeGraphicsSystem::CaptureDrawCommandBody(
       }
       static const bool skip_compare = REXCVAR_GET(gta4_native_skip_changed_constant_compare);
       const auto capture_bank = [&](std::span<const uint8_t> source, const DirtyRangeSet& ranges,
-                                    const std::vector<uint8_t>* bank, ConstantPayloadDelta& delta) {
+                                    std::vector<uint8_t>* bank, ConstantPayloadDelta& delta) {
         if (full_semantic_capture) return CaptureCompleteConstantSnapshot(source, delta);
         if (!bank) return CaptureConstantPayloadDelta(source, ranges, kNativeConstantGroupBytes, delta);
         if (ranges.ranges.empty()) {
@@ -5685,10 +5687,10 @@ bool Gta4NativeGraphicsSystem::CaptureDrawCommandBody(
           return true;
         }
         const bool captured = CaptureChangedConstantPayloadDelta(
-            source, ranges, kNativeConstantGroupBytes, std::span<const uint8_t>(*bank), delta,
+            source, ranges, kNativeConstantGroupBytes, std::span<uint8_t>(*bank), delta,
             producer_constant_dirty_bytes_);
-        // 52: false keeps the backend's compare (the 49 behaviour).
-        if (!skip_compare) delta.changed_only = false;
+        // 52: false keeps the backend's compare (the 49 behaviour). In direct_record_, shadow is fully in sync.
+        if (!skip_compare && !direct_record_) delta.changed_only = false;
         producer_constant_sent_bytes_ += delta.payload.size();
         return captured;
       };
@@ -23217,6 +23219,14 @@ void Gta4NativeGraphicsSystem::ProtectInQueueEpoch(NativeCommand& command) {
 // 49: RenderGuest, after the command was accepted: its constant delta, applied to
 // the shadow exactly as the worker applies it to its banks.
 void Gta4NativeGraphicsSystem::CommitProducerConstantShadow(const NativeCommand& command) {
+  if (!producer_constant_commit_) return;
+  if (direct_record_) {
+    const auto& vs_delta = command.shader_constant_delta.vertex_constants;
+    const auto& ps_delta = command.shader_constant_delta.pixel_constants;
+    if (!vs_delta.complete_snapshot && !ps_delta.complete_snapshot) {
+      return;  // Already committed in-place during CaptureChangedConstantPayloadDelta
+    }
+  }
   ProducerConstantShadow* shadow_ptr = nullptr;
   if (last_producer_constant_shadow_device_ == producer_constant_commit_device_ &&
       last_producer_constant_shadow_ptr_) [[likely]] {
