@@ -2120,6 +2120,10 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   std::shared_ptr<const NativeTextureResource> CreateResolvedTextureResource(
       const ResolveCommand& command);
   std::shared_ptr<const NativeBufferResource> CaptureBufferResource(uint32_t handle);
+  std::shared_ptr<const NativeBufferResource> CaptureBufferResourceSlotSlow(
+      uint32_t handle, uint64_t clear_epoch, uint32_t current_frame, bool use_keepalive,
+      const uint8_t* object, uint32_t raw_flags, uint32_t raw_addr_word, uint32_t raw_size_word,
+      uint32_t flags, uint32_t data_address, uint32_t data_size, bool guest_locked);
   uint64_t SyncBufferCaptureTables();
   bool CaptureBufferResourceIntoEpoch(uint32_t handle, uint64_t clear_epoch, uint32_t current_frame,
                                       NativeCommand& command,
@@ -2605,6 +2609,14 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   NativePersistentBufferEntry* UsePersistentMemo(const NativeBufferResource& owner,
                                                  const NativePersistentBufferKey& key);
   void TouchPersistentEntry(NativePersistentBufferEntry& entry);
+  inline void TouchPersistentEntryIfNeeded(NativePersistentBufferEntry& entry,
+                                           uint64_t current_submission) {
+    if (entry.last_used_frame != active_texture_frame_ ||
+        entry.last_used_submission < current_submission ||
+        IsNativeFlightRecorderEnabled()) [[unlikely]] {
+      TouchPersistentEntry(entry);
+    }
+  }
   bool GetOrCreatePersistentBuffer(VkCommandBuffer command_buffer,
                                    const std::shared_ptr<const NativeBufferResource>& owner,
                                    const NativePersistentBufferKey& key, const uint8_t* source,

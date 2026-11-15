@@ -165,6 +165,8 @@ extern "C" void sub_828C42F0(PPCContext& ctx, uint8_t* base) {
   ctx.r11.u64 = fn;
   if (fn == 0x828E7000u) [[likely]] {
     sub_828E7000(ctx, base);
+  } else if (fn == 0x828BFC00u) {
+    sub_828BFC00(ctx, base);
   } else {
     const auto s_ctr = ctx.ctr;
     ctx.ctr.u64 = fn;
@@ -300,6 +302,10 @@ extern "C" void FastSub828C6620(PPCContext& ctx, uint8_t* base) {
     const uint32_t r27_shader_plus_20 = r29_shader + 20u;
     uint32_t r31_pass_offset = 0u;
     constexpr uint32_t kGlobalBase = 0x831C0000u;  // lis -31972
+    const uint32_t geom_array = REX_LOAD_U32(r25_model + 4u);
+    const uint32_t geom = REX_LOAD_U32(geom_array + ((r24_geom_idx << 2) & 0xFFFFFFFCu));
+    const uint32_t vtable = REX_LOAD_U32(geom);
+    const uint32_t draw_fn = REX_LOAD_U32(vtable + 8u);
 
     do {
       const uint32_t effect_inst = REX_LOAD_U32(kGlobalBase + 15840u);
@@ -319,10 +325,21 @@ extern "C" void FastSub828C6620(PPCContext& ctx, uint8_t* base) {
       ctx.lr = 0x828C6690u;
       sub_828C8F38(ctx, base);
 
-      ctx.r4.u64 = r24_geom_idx;
-      ctx.r3.u64 = r25_model;
+      ctx.r3.u64 = geom;
       ctx.lr = 0x828C669Cu;
-      sub_828C42F0(ctx, base);
+      if (draw_fn == 0x828E7000u) [[likely]] {
+        sub_828E7000(ctx, base);
+      } else if (draw_fn == 0x828BFC00u) {
+        sub_828BFC00(ctx, base);
+      } else {
+        ctx.r4.u64 = r24_geom_idx;
+        ctx.r10.u64 = (r24_geom_idx << 2) & 0xFFFFFFFCu;
+        ctx.r11.u64 = draw_fn;
+        const auto s_ctr = ctx.ctr;
+        ctx.ctr.u64 = draw_fn;
+        REX_CALL_INDIRECT_FUNC(draw_fn);
+        ctx.ctr = s_ctr;
+      }
 
       if (REX_LOAD_U8(kGlobalBase + 15833u) != 0u) [[unlikely]] {
         ctx.r3.u64 = REX_LOAD_U32(kGlobalBase + 15836u);
@@ -498,6 +515,62 @@ extern "C" void FastSub828C4338(PPCContext& ctx, uint8_t* base) {
   }
 
   ctx.r1.s64 = static_cast<int64_t>(sp) + 208;
+}
+
+// -----------------------------------------------------------------------------
+// 5b. FastSub828D41A8: rage::rmcDrawable::DrawModels (gta4_recomp.71.cpp:28224)
+// Eliminates PPC callee-saved spills (r24..r31) around sub_828BD250/sub_828C4338
+// and hoists the LOD visibility bitmask test outside the model loop.
+// -----------------------------------------------------------------------------
+extern "C" void FastSub828D41A8(PPCContext& ctx, uint8_t* base) {
+  REX_FUNC_PROLOGUE();
+  ctx.r12.u64 = ctx.lr;
+  ctx.lr = 0x828D41B0u;
+  const uint32_t old_sp = ctx.r1.u32;
+  const uint32_t sp = old_sp - 160u;
+  REX_STORE_U32(sp, old_sp);
+  ctx.r1.u32 = sp;
+
+  const uint32_t r31_lod = ctx.r7.u32;
+  const uint32_t r27_shader_group = ctx.r4.u32;
+  const uint32_t r26_bucket = ctx.r6.u32;
+  const uint32_t r25_mask_ptr = ctx.r8.u32;
+  const uint32_t lod_offset = ((r31_lod + 12u) << 2) & 0xFFFFFFFCu;
+  const uint32_t r30_model_list = REX_LOAD_U32(ctx.r3.u32 + lod_offset);
+
+  ctx.r4.u64 = ctx.r5.u64;
+  ctx.r3.u64 = REX_LOAD_U32(0x831C2200u);  // -2095316992 + 8704
+  ctx.lr = 0x828D41E4u;
+  sub_828BD250(ctx, base);
+
+  uint32_t count = REX_LOAD_U16(r30_model_list + 4u);
+  if (count > 0u) {
+    bool visible = true;
+    if (r25_mask_ptr != 0u) {
+      const uint32_t mask_words = REX_LOAD_U32(r25_mask_ptr);
+      const uint32_t word_off =
+          (static_cast<uint32_t>(static_cast<int32_t>(r31_lod) >> 5) << 2) & 0xFFFFFFFCu;
+      const uint32_t mask_word = REX_LOAD_U32(mask_words + word_off);
+      visible = ((mask_word >> (r31_lod & 0x1Fu)) & 1u) != 0u;
+    }
+    if (visible) {
+      for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t models_array = REX_LOAD_U32(r30_model_list);
+        const uint32_t model = REX_LOAD_U32(models_array + (i << 2));
+        if (model != 0u) {
+          ctx.r3.u64 = model;
+          ctx.r4.u64 = r27_shader_group;
+          ctx.r5.u64 = r26_bucket;
+          ctx.r6.u64 = r31_lod;
+          ctx.lr = 0x828D4248u;
+          sub_828C4338(ctx, base);
+        }
+        count = REX_LOAD_U16(r30_model_list + 4u);
+      }
+    }
+  }
+
+  ctx.r1.s64 = static_cast<int64_t>(sp) + 160;
 }
 
 // -----------------------------------------------------------------------------

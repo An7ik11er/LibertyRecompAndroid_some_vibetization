@@ -374,6 +374,14 @@ static uint32_t NativeConstantUploadPrefix(const Shader* shader, size_t bank_siz
   if (used == UINT32_MAX) return uint32_t(bank_size);
   return uint32_t(std::min<size_t>(bank_size, std::max<uint32_t>(16u, (used + 255u) & ~255u)));
 }
+template <typename Shader>
+static uint32_t NativeWorkerRingUploadPrefix(const Shader* shader, size_t bank_size) {
+  // Worker constant ring uses dynamic UBOs with 64-byte alignment; 64-byte steps avoid
+  // over-hashing/swapping into the >240 B XXH3_hashLong cliff when shaders read <= 192 B.
+  const uint32_t used = shader ? shader->upload_constant_bytes : 16u;
+  if (used == UINT32_MAX) return uint32_t(bank_size);
+  return uint32_t(std::min<size_t>(bank_size, std::max<uint32_t>(64u, (used + 63u) & ~63u)));
+}
 REXCVAR_DEFINE_BOOL(gta4_native_partial_constant_snapshot, true, "GTA IV/Graphics/Native Renderer",
                     "Snapshot only the part of each constant bank the draw's shaders read "
                     "(extended if a later draw of the same state reads more)");
@@ -6366,6 +6374,11 @@ bool Gta4NativeGraphicsSystem::CaptureBufferResourceIntoSlow(
               std::shared_ptr<const NativeBufferResource>{}, raw);
           return true;
         }
+        // L1 and L2 both missed; skip re-checking them in CaptureBufferResource.
+        out = CaptureBufferResourceSlotSlow(handle, clear_epoch, current_frame, true, object,
+                                            raw_flags, raw_addr_word, raw_size_word, flags,
+                                            data_address, data_size, false);
+        return bool(out);
       }
     }
   }
@@ -6380,6 +6393,18 @@ bool Gta4NativeGraphicsSystem::CaptureBufferResourceInto(
   return CaptureBufferResourceIntoEpoch(
       handle, SyncBufferCaptureTables(),
       g_native_memory_profile_event_frame.load(std::memory_order_relaxed), command, out);
+}
+
+static void LogBufferCaptureRejection(uint32_t handle, const char* reason, uint32_t flags,
+                                      uint32_t data_address, uint32_t data_size) {
+  static std::atomic<uint64_t> rejection_count{0};
+  const uint64_t count = NextNativeTraceDiagnosticCount(rejection_count);
+  if (count <= 64 || !(count % 1024)) {
+    REXLOG_WARN(
+        "gta4-native-diag: buffer capture reject #{} reason={} handle={:08X} "
+        "flags={:08X} address={:08X} size={}",
+        count, reason, handle, flags, data_address, data_size);
+  }
 }
 
 std::shared_ptr<const Gta4NativeGraphicsSystem::NativeBufferResource>
@@ -6430,14 +6455,7 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
 
   auto reject = [handle](const char* reason, uint32_t flags, uint32_t data_address,
                          uint32_t data_size) {
-    static std::atomic<uint64_t> rejection_count{0};
-    const uint64_t count = NextNativeTraceDiagnosticCount(rejection_count);
-    if (count <= 64 || !(count % 1024)) {
-      REXLOG_WARN(
-          "gta4-native-diag: buffer capture reject #{} reason={} handle={:08X} "
-          "flags={:08X} address={:08X} size={}",
-          count, reason, handle, flags, data_address, data_size);
-    }
+    LogBufferCaptureRejection(handle, reason, flags, data_address, data_size);
     return std::shared_ptr<const NativeBufferResource>{};
   };
 
@@ -6502,6 +6520,18 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
     }
   }
 
+  return CaptureBufferResourceSlotSlow(handle, clear_epoch, current_frame, use_keepalive, object,
+                                       raw_flags, raw_addr_word, raw_size_word, flags, data_address,
+                                       data_size, metadata->guest_locked);
+}
+
+std::shared_ptr<const Gta4NativeGraphicsSystem::NativeBufferResource>
+Gta4NativeGraphicsSystem::CaptureBufferResourceSlotSlow(
+    uint32_t handle, uint64_t clear_epoch, uint32_t current_frame, bool use_keepalive,
+    const uint8_t* object, uint32_t raw_flags, uint32_t raw_addr_word, uint32_t raw_size_word,
+    uint32_t flags, uint32_t data_address, uint32_t data_size, bool guest_locked) {
+  const uint32_t set_base = BufferFastSetBase(handle);
+  const uint32_t l1_base = BufferL1SetBase(handle);
   const uint64_t cache_epoch = buffer_resources_epoch_.load(std::memory_order_acquire);
 
   auto record_l2_and_l1 = [&](const std::shared_ptr<const NativeBufferResource>& ref) {
@@ -6558,7 +6588,7 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
   };
   if (cache_slot.handle == handle &&
       cache_slot.flags == flags && cache_slot.address == data_address &&
-      cache_slot.size == data_size && !metadata->guest_locked) {
+      cache_slot.size == data_size && !guest_locked) {
     if (cache_slot.epoch == cache_epoch) {
       if (cache_slot.alias && cache_slot.alias_serial == capture_keepalive_serial_ &&
           capture_keepalive_serial_) {
@@ -6609,7 +6639,7 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
     can_reuse_clean_capture =
         CanReuseNativeBufferCapture(cache_present, dirty_buffer_handles_.contains(handle),
                                      metadata_matches) &&
-        !metadata->guest_locked;
+        !guest_locked;
   }
 
   // Если буфер чистый (не было ResourceUnlock) — сразу запоминаем в слот и отдаём БЕЗ memcmp!
@@ -6625,7 +6655,8 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
 
   const uint8_t* data = memory_->TranslateVirtual<const uint8_t*>(data_address);
   if (!data) {
-    return reject("payload-translation", flags, data_address, data_size);
+    LogBufferCaptureRejection(handle, "payload-translation", flags, data_address, data_size);
+    return {};
   }
 
   // Сюда попадают ТОЛЬКО буферы после ResourceUnlock (реально грязные):
@@ -9921,18 +9952,22 @@ bool Gta4NativeGraphicsSystem::SnapshotDrawConstants(NativeCommand& command,
   const bool partial_upload =
       REXCVAR_GET(gta4_native_partial_constant_upload) && command.pipeline_state;
   if (REXCVAR_GET(gta4_native_worker_constant_hash)) {
+    const bool ring_fast =
+        worker_ring_valid_.load(std::memory_order_relaxed) &&
+        REXCVAR_GET(gta4_native_worker_constant_ring) && worker_constant_ring_.mapping;
     const auto hash_upload = [&](size_t slot,
                                  const std::shared_ptr<const ConstantStateVersion>& version,
                                  std::span<const uint8_t> source, const NativeShader* shader,
                                  size_t bank_size, uint64_t& hash, uint32_t& hashed_bytes) {
       if (version->content_hash) return;  // The recorder uses the whole-bank hash.
-      const uint32_t bytes = partial_upload ? NativeConstantUploadPrefix(shader, bank_size)
-                                            : uint32_t(bank_size);
+      const uint32_t bytes =
+          partial_upload ? (ring_fast ? NativeWorkerRingUploadPrefix(shader, bank_size)
+                                      : NativeConstantUploadPrefix(shader, bank_size))
+                         : uint32_t(bank_size);
       if (source.size() < bytes) return;
       // Batch 91: Skip XXH3_64bits when this version already fits in the active worker constant ring.
       // Any rare ring-full fallback in BindCommonDrawState safely recomputes XXH3 if upload_hash == 0.
-      if (worker_ring_valid_.load(std::memory_order_relaxed) &&
-          REXCVAR_GET(gta4_native_worker_constant_ring) && worker_constant_ring_.mapping &&
+      if (ring_fast &&
           version->cached_ring_serial == worker_ring_serial_ &&
           version->cached_ring_bytes >= bytes && version->cached_ring_offset) [[likely]] {
         return;
@@ -11857,7 +11892,7 @@ void Gta4NativeGraphicsSystem::WriteWorkerRingConstants(NativeCommand& command,
                          std::span<const uint8_t> fallback_source, const NativeShader* shader,
                          size_t bank_size, uint64_t upload_hash) -> uint32_t {
     if (!version) return 0;
-    const uint32_t bytes = partial ? NativeConstantUploadPrefix(shader, bank_size)
+    const uint32_t bytes = partial ? NativeWorkerRingUploadPrefix(shader, bank_size)
                                    : uint32_t(bank_size);
     if (!bytes) return 0;
     if (version->cached_ring_serial == worker_ring_serial_ &&
@@ -25876,7 +25911,9 @@ bool Gta4NativeGraphicsSystem::UploadBufferResource(
   if (memo_first && converted_payload && converted_payload->cached_persistent_entry &&
       converted_payload->cached_vk_generation == resource->generation &&
       converted_payload->cached_vk_epoch == persistent_buffer_epoch_) {
-    TouchPersistentEntry(*converted_payload->cached_persistent_entry);
+    const uint64_t current_submission =
+        submission_tracker_ ? submission_tracker_->GetCurrentSubmission() : 0;
+    TouchPersistentEntryIfNeeded(*converted_payload->cached_persistent_entry, current_submission);
     allocation = {};
     allocation.buffer = converted_payload->cached_persistent_entry->buffer;
     allocation.offset = converted_payload->cached_persistent_entry->offset;
@@ -28360,7 +28397,9 @@ bool Gta4NativeGraphicsSystem::RecordIndexedPrimitive(VkCommandBuffer command_bu
         if (range.persistent_entry && range.persistent_epoch == persistent_buffer_epoch_ &&
             REXCVAR_GET(gta4_native_upload_memo_first)) {
           auto& entry = *static_cast<NativePersistentBufferEntry*>(range.persistent_entry);
-          TouchPersistentEntry(entry);
+          const uint64_t current_submission =
+              submission_tracker_ ? submission_tracker_->GetCurrentSubmission() : 0;
+          TouchPersistentEntryIfNeeded(entry, current_submission);
           reordered_allocation.buffer = entry.buffer;
           reordered_allocation.offset = entry.offset;
           reordered_ready = true;

@@ -4756,6 +4756,7 @@ extern "C" void sub_828C64C8(PPCContext& ctx, uint8_t* base) {
 
 extern "C" void FastSub828C6620(PPCContext& ctx, uint8_t* base);
 extern "C" void FastSub828C4338(PPCContext& ctx, uint8_t* base);
+extern "C" void FastSub828D41A8(PPCContext& ctx, uint8_t* base);
 
 [[gnu::noinline]] void SlowSub828C6620(PPCContext& ctx, uint8_t* base) {
   ScopedFireMaterial fire_scope(ctx, base);
@@ -4823,13 +4824,13 @@ extern "C" void sub_821BE8A0(PPCContext& ctx, uint8_t* base) {
   // This rigid-model entry passes r6 through as the material bucket, not a pose.
   temporal_host::Scope temporal_scope(ctx.r5.u32, ctx.r3.u32, 0);
   TraceKnownOffscreenTransformTransition("offscreen-transition-model-list-caller", ctx, base,
-                                         __imp__sub_828D41A8);
+                                         FastSub828D41A8);
 }
 
 extern "C" void sub_828D41A8(PPCContext& ctx, uint8_t* base) {
   if (!temporal_host::enabled.load(std::memory_order_relaxed) &&
       (!IsNativeMode() || !CachedNativeTraceEnabled())) [[likely]] {
-    __imp__sub_828D41A8(ctx, base);
+    FastSub828D41A8(ctx, base);
     return;
   }
   SlowSub828D41A8(ctx, base);
@@ -5172,9 +5173,58 @@ extern "C" void sub_828C8E80(PPCContext& ctx, uint8_t* base) {
   }
 }
 
+void FastSub828C8F38(PPCContext& ctx, uint8_t* base) {
+  REX_FUNC_PROLOGUE();
+  ctx.r12.u64 = ctx.lr;
+  ctx.lr = 0x828C8F40u;
+  const uint32_t old_sp = ctx.r1.u32;
+  const uint32_t sp = old_sp - 144u;
+  REX_STORE_U32(sp, old_sp);
+  ctx.r1.u32 = sp;
+
+  const uint32_t r31_pass = ctx.r3.u32;
+  const uint32_t r26_vs_table = ctx.r4.u32;
+  const uint32_t r25_ps_table = ctx.r5.u32;
+  const uint32_t r28_params = ctx.r6.u32;
+  const uint32_t r27_shader_inst = ctx.r7.u32;
+
+  const uint16_t state_count = REX_LOAD_U16(r31_pass + 28u);
+  if (state_count > 0u) {
+    uint32_t state_off = 0u;
+    for (uint16_t i = 0; i < state_count; ++i) {
+      const uint32_t states = REX_LOAD_U32(r31_pass + 24u);
+      ctx.r3.u64 = REX_LOAD_U32(states + state_off);
+      ctx.r4.u64 = REX_LOAD_U32(states + state_off + 4u);
+      ctx.lr = 0x828C8F7Cu;
+      sub_828E02E8(ctx, base);
+      state_off += 8u;
+    }
+  }
+
+  const uint32_t vs_idx = REX_LOAD_U32(r31_pass);
+  const uint32_t vs_base = REX_LOAD_U32(r26_vs_table);
+  ctx.r3.u64 = r31_pass;
+  ctx.r4.u64 = vs_base + (((vs_idx * 3u) << 2) & 0xFFFFFFFCu);
+  ctx.r5.u64 = r28_params;
+  ctx.r6.u64 = r27_shader_inst;
+  ctx.lr = 0x828C8FB4u;
+  sub_828C8DB0(ctx, base);
+
+  const uint32_t ps_idx = REX_LOAD_U32(r31_pass + 12u);
+  const uint32_t ps_base = REX_LOAD_U32(r25_ps_table);
+  ctx.r3.u64 = r31_pass + 12u;
+  ctx.r4.u64 = ps_base + (((ps_idx * 3u) << 2) & 0xFFFFFFFCu);
+  ctx.r5.u64 = r28_params;
+  ctx.r6.u64 = r27_shader_inst;
+  ctx.lr = 0x828C8FDCu;
+  sub_828C8E80(ctx, base);
+
+  ctx.r1.s64 = static_cast<int64_t>(sp) + 144;
+}
+
 extern "C" void sub_828C8F38(PPCContext& ctx, uint8_t* base) {
   if (!FireTraceConfig().enabled) [[likely]] {
-    __imp__sub_828C8F38(ctx, base);
+    FastSub828C8F38(ctx, base);
     return;
   }
   SlowSub828C8F38(ctx, base);
