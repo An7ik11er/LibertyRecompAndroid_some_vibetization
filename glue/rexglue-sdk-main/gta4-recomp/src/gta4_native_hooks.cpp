@@ -1327,15 +1327,15 @@ thread_local NativeDeferredSelectorTrace* g_native_deferred_selector_trace = nul
 class ScopedNativeDeferredSelectorTrace {
  public:
   ScopedNativeDeferredSelectorTrace()
-      : previous_(g_native_deferred_selector_trace),
-        active_(IsNativeLightProvenanceTraceEnabled()) {
-    if (active_) {
+      : active_(IsNativeLightProvenanceTraceEnabled()) {
+    if (active_) [[unlikely]] {
+      previous_ = g_native_deferred_selector_trace;
       g_native_deferred_selector_trace = &trace_;
     }
   }
 
   ~ScopedNativeDeferredSelectorTrace() {
-    if (active_) {
+    if (active_) [[unlikely]] {
       g_native_deferred_selector_trace = previous_;
     }
   }
@@ -3453,7 +3453,9 @@ bool CaptureNativeCommand(const Command& command) {
       phone.applied = CapturePhoneGuestState(g_active_native_capture.base, command.device);
     }
   }
-  if (g_fire_context.occurrence) captured.fire_capture = std::make_shared<FireTraceContext>(g_fire_context);
+  if (FireTraceConfig().enabled && g_fire_context.occurrence) [[unlikely]] {
+    captured.fire_capture = std::make_shared<FireTraceContext>(g_fire_context);
+  }
   g_active_native_capture.commands.push_back(std::move(captured));
   return true;
 }
@@ -3643,6 +3645,20 @@ inline bool CachedGuestHooksEnabled() {
   int value = cached.load(std::memory_order_relaxed);
   if (value < 0) [[unlikely]] {
     const bool enabled = rex::diagnostics::IsEnabled(rex::diagnostics::Category::kGuestHooks);
+    if (!rex::diagnostics::IsConfigured()) {
+      return enabled;
+    }
+    value = enabled ? 1 : 0;
+    cached.store(value, std::memory_order_relaxed);
+  }
+  return value != 0;
+}
+
+inline bool CachedNativeTraceEnabled() {
+  static std::atomic<int> cached{-1};
+  int value = cached.load(std::memory_order_relaxed);
+  if (value < 0) [[unlikely]] {
+    const bool enabled = rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeTrace);
     if (!rex::diagnostics::IsConfigured()) {
       return enabled;
     }
@@ -4076,7 +4092,11 @@ bool SubmitCapturedNativeCommand(PPCContext& ctx, uint8_t* base, uint32_t device
     draw.caller = static_cast<uint32_t>(ctx.lr);
     draw.origin_flags = kDrawCommandOriginCachedReplay;
     draw.command_list = command_list;
-    draw.draw_id = g_indexed_draw_invocation_id.fetch_add(1, std::memory_order_relaxed) + 1;
+    draw.draw_id = 0;
+    if (CachedGuestHooksEnabled() || CachedNativeTraceEnabled() || gta4::gpu_pass::Enabled() ||
+        FireTraceConfig().enabled || PhoneCaptureActive()) [[unlikely]] {
+      draw.draw_id = g_indexed_draw_invocation_id.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
     indexed_draw = draw;
     std::memcpy(bytes.data(), &draw, sizeof(draw));
   }
@@ -4103,8 +4123,7 @@ bool SubmitCapturedNativeCommand(PPCContext& ctx, uint8_t* base, uint32_t device
   }
 
   const bool trace_gbuffer_replay =
-      captured.draw_diagnostic_valid &&
-      rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeTrace);
+      captured.draw_diagnostic_valid && CachedNativeTraceEnabled();
   const uint32_t replay_frame =
       trace_gbuffer_replay ? LoadU32(base, device + kSubmittedFrameOffset) : 0;
   auto log_replay_state = [&](std::string_view point, const std::array<uint32_t, 16>& transform,
@@ -4189,7 +4208,7 @@ bool SubmitCapturedNativeCommand(PPCContext& ctx, uint8_t* base, uint32_t device
                        constants_hash, transform_hash, false);
     }
     if(IsDrawCommandType(captured.type))temporal_host::Draw(base,device);
-    accepted = (g_fire_context.occurrence || captured.fire_capture)
+    accepted = trace_fire_replay
         ? SubmitFireTracedCommand(bytes.data(), bytes.size(), device, captured.fire_capture.get(), command_list, replay_command_ordinal, &fire_live, &fire_applied)
         : TvDetailActive() ? SubmitTvTracedCommand(bytes.data(), bytes.size(), device)
         : SubmitPhoneTracedCommand(bytes.data(), bytes.size(), device,
@@ -4590,8 +4609,7 @@ void LogKnownOffscreenTransformTransition(std::string_view point, uint8_t* base,
                                           const std::array<uint32_t, 5>& args,
                                           const std::array<uint32_t, 16>& before,
                                           const std::array<uint32_t, 16>& after) {
-  if (!IsNativeMode() || !rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeTrace) ||
-      !device) {
+  if (!IsNativeMode() || !CachedNativeTraceEnabled() || !device) {
     return;
   }
   const bool before_known = IsKnownOffscreenVertexTransform(before);
@@ -4625,7 +4643,7 @@ void LogKnownOffscreenTransformTransition(std::string_view point, uint8_t* base,
 template <typename Function>
 void TraceKnownOffscreenTransformTransition(std::string_view point, PPCContext& ctx, uint8_t* base,
                                             Function function) {
-  if (!IsNativeMode() || !rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeTrace)) {
+  if (!IsNativeMode() || !CachedNativeTraceEnabled()) [[likely]] {
     function(ctx, base);
     return;
   }
@@ -4643,13 +4661,13 @@ void TraceKnownOffscreenTransformTransition(std::string_view point, PPCContext& 
   LogKnownOffscreenTransformTransition(point, base, device, caller, object, args, before, after);
 }
 
-extern "C" void sub_828C6568(PPCContext& ctx, uint8_t* base) {
+[[gnu::noinline]] void SlowSub828C6568(PPCContext& ctx, uint8_t* base) {
   if (PhoneCaptureActive()) {
     g_phone_context.material = ctx.r3.u32;
     PhoneTraceLog("material-select", fmt::format("run={} occurrence={} material={:08X} selector={} explicit={} caller={:08X}",
         g_phone_run.load(), g_phone_context.occurrence, ctx.r3.u32, ctx.r4.u32, ctx.r6.u32, uint32_t(ctx.lr)));
   }
-  const bool trace = g_native_deferred_selector_trace != nullptr;
+  const bool trace = IsNativeLightProvenanceTraceEnabled() && g_native_deferred_selector_trace != nullptr;
   const uint32_t caller = uint32_t(ctx.lr);
   const uint32_t effect = ctx.r3.u32;
   const uint32_t material_index = ctx.r4.u32;
@@ -4663,8 +4681,17 @@ extern "C" void sub_828C6568(PPCContext& ctx, uint8_t* base) {
   }
 }
 
+extern "C" void sub_828C6568(PPCContext& ctx, uint8_t* base) {
+  if (!PhoneCaptureActive() && !IsNativeLightProvenanceTraceEnabled() &&
+      (!IsNativeMode() || !CachedNativeTraceEnabled())) [[likely]] {
+    __imp__sub_828C6568(ctx, base);
+    return;
+  }
+  SlowSub828C6568(ctx, base);
+}
+
 extern "C" void sub_828C64C8(PPCContext& ctx, uint8_t* base) {
-  if (PhoneCaptureActive()) {
+  if (PhoneCaptureActive()) [[unlikely]] {
     g_phone_context.material = ctx.r3.u32;
     g_phone_context.mode = ctx.r4.u32;
     g_phone_context.technique = LoadU32(base, kActiveDeferredTechniqueGlobal);
@@ -4692,23 +4719,44 @@ extern "C" void sub_828C64C8(PPCContext& ctx, uint8_t* base) {
 extern "C" void FastSub828C6620(PPCContext& ctx, uint8_t* base);
 extern "C" void FastSub828C4338(PPCContext& ctx, uint8_t* base);
 
-extern "C" void sub_828C6620(PPCContext& ctx, uint8_t* base) {
+[[gnu::noinline]] void SlowSub828C6620(PPCContext& ctx, uint8_t* base) {
   ScopedFireMaterial fire_scope(ctx, base);
   TraceKnownOffscreenTransformTransition("offscreen-transition-material-list-render", ctx, base,
                                          FastSub828C6620);
 }
 
-extern "C" void sub_828C4338(PPCContext& ctx, uint8_t* base) {
+extern "C" void sub_828C6620(PPCContext& ctx, uint8_t* base) {
+  if (!FireTraceConfig().enabled && (!IsNativeMode() || !CachedNativeTraceEnabled())) [[likely]] {
+    FastSub828C6620(ctx, base);
+    return;
+  }
+  SlowSub828C6620(ctx, base);
+}
+
+[[gnu::noinline]] void SlowSub828C4338(PPCContext& ctx, uint8_t* base) {
   // The executed model, not its outer model-list, distinguishes rigid submodels
   // that share a vertex stream. r5 is a material bucket in this entry point.
-  temporal_host::Scope temporal_scope(temporal_host::instance.matrix, ctx.r3.u32,
-                                      temporal_host::instance.pose);
+  const bool temporal_active = temporal_host::enabled.load(std::memory_order_relaxed);
+  temporal_host::Scope temporal_scope(
+      temporal_active ? temporal_host::instance.matrix : 0,
+      ctx.r3.u32,
+      temporal_active ? temporal_host::instance.pose : 0);
   FireModelEntry(ctx, base);
   TraceKnownOffscreenTransformTransition("offscreen-transition-model-materials", ctx, base,
                                          FastSub828C4338);
 }
 
-extern "C" void sub_828C4578(PPCContext& ctx, uint8_t* base) {
+extern "C" void sub_828C4338(PPCContext& ctx, uint8_t* base) {
+  if (!temporal_host::enabled.load(std::memory_order_relaxed) &&
+      !FireTraceConfig().enabled &&
+      (!IsNativeMode() || !CachedNativeTraceEnabled())) [[likely]] {
+    FastSub828C4338(ctx, base);
+    return;
+  }
+  SlowSub828C4338(ctx, base);
+}
+
+[[gnu::noinline]] void SlowSub828C4578(PPCContext& ctx, uint8_t* base) {
   // Skinned submodels retain the owning transform/skeleton from D4268 while
   // capturing the model actually being executed in this nested call.
   temporal_host::Scope temporal_scope(temporal_host::instance.matrix, ctx.r3.u32,
@@ -4716,22 +4764,52 @@ extern "C" void sub_828C4578(PPCContext& ctx, uint8_t* base) {
   __imp__sub_828C4578(ctx, base);
 }
 
+extern "C" void sub_828C4578(PPCContext& ctx, uint8_t* base) {
+  if (!temporal_host::enabled.load(std::memory_order_relaxed)) [[likely]] {
+    __imp__sub_828C4578(ctx, base);
+    return;
+  }
+  SlowSub828C4578(ctx, base);
+}
+
 extern "C" void sub_821BE8A0(PPCContext& ctx, uint8_t* base) {
+  if (!IsNativeMode() || !CachedNativeTraceEnabled()) [[likely]] {
+    __imp__sub_821BE8A0(ctx, base);
+    return;
+  }
   TraceKnownOffscreenTransformTransition("offscreen-transition-model-materials-legacy-caller", ctx,
                                          base, __imp__sub_821BE8A0);
 }
 
-extern "C" void sub_828D41A8(PPCContext& ctx, uint8_t* base) {
+[[gnu::noinline]] void SlowSub828D41A8(PPCContext& ctx, uint8_t* base) {
   // This rigid-model entry passes r6 through as the material bucket, not a pose.
   temporal_host::Scope temporal_scope(ctx.r5.u32, ctx.r3.u32, 0);
   TraceKnownOffscreenTransformTransition("offscreen-transition-model-list-caller", ctx, base,
                                          __imp__sub_828D41A8);
 }
 
-extern "C" void sub_828D4268(PPCContext& ctx, uint8_t* base) {
+extern "C" void sub_828D41A8(PPCContext& ctx, uint8_t* base) {
+  if (!temporal_host::enabled.load(std::memory_order_relaxed) &&
+      (!IsNativeMode() || !CachedNativeTraceEnabled())) [[likely]] {
+    __imp__sub_828D41A8(ctx, base);
+    return;
+  }
+  SlowSub828D41A8(ctx, base);
+}
+
+[[gnu::noinline]] void SlowSub828D4268(PPCContext& ctx, uint8_t* base) {
   temporal_host::Scope temporal_scope(ctx.r5.u32?ctx.r5.u32:ctx.r6.u32,ctx.r3.u32,ctx.r6.u32);
   TraceKnownOffscreenTransformTransition("offscreen-transition-model-transform-caller", ctx, base,
                                          __imp__sub_828D4268);
+}
+
+extern "C" void sub_828D4268(PPCContext& ctx, uint8_t* base) {
+  if (!temporal_host::enabled.load(std::memory_order_relaxed) &&
+      (!IsNativeMode() || !CachedNativeTraceEnabled())) [[likely]] {
+    __imp__sub_828D4268(ctx, base);
+    return;
+  }
+  SlowSub828D4268(ctx, base);
 }
 
 extern "C" void sub_828BD250(PPCContext& ctx, uint8_t* base) {
@@ -4980,7 +5058,7 @@ extern "C" void sub_828C8E80(PPCContext& ctx, uint8_t* base) {
   __imp__sub_828C8E80(ctx, base);
 }
 
-extern "C" void sub_828C8F38(PPCContext& ctx, uint8_t* base) {
+[[gnu::noinline]] void SlowSub828C8F38(PPCContext& ctx, uint8_t* base) {
   if (g_fire_context.occurrence) {
     FireMaterialPass(ctx, base, false);
   }
@@ -4988,6 +5066,14 @@ extern "C" void sub_828C8F38(PPCContext& ctx, uint8_t* base) {
   if (g_fire_context.occurrence) {
     FireMaterialPass(ctx, base, true);
   }
+}
+
+extern "C" void sub_828C8F38(PPCContext& ctx, uint8_t* base) {
+  if (!FireTraceConfig().enabled) [[likely]] {
+    __imp__sub_828C8F38(ctx, base);
+    return;
+  }
+  SlowSub828C8F38(ctx, base);
 }
 
 extern "C" void sub_828DFF00(PPCContext& ctx, uint8_t* base) {
@@ -6228,7 +6314,7 @@ extern "C" void sub_82A3DAB0(PPCContext& ctx, uint8_t* base) {
     return;
   }
 
-  const uint64_t call = g_indexed_draw_invocation_id.fetch_add(1, std::memory_order_relaxed) + 1;
+  const uint64_t call = NextNativeHookDiagnosticCall(g_indexed_draw_invocation_id);
   if (ShouldLogNativeHookCall(call)) {
     REXLOG_INFO(
         "gta4-native-hook: DrawPrimitiveUPBegin #{} lr={:08X} device={:08X} primitive={} "
@@ -7874,26 +7960,28 @@ extern "C" void sub_82A467D8(PPCContext& ctx, uint8_t* base) {
                               : ctx.lr == kWorkerPresentCaller ? 2
                                                                : 0;
   command.diagnostic_persisted_texture = device + kPersistedPresentTextureOffset;
-  for (uint32_t index = 0; index < std::size(command.diagnostic_persisted_fetch); ++index) {
-    command.diagnostic_persisted_fetch[index] =
-        LoadU32(base, command.diagnostic_persisted_texture + 28 + index * sizeof(uint32_t));
-  }
-  if (command.frontbuffer_texture) {
-    command.diagnostic_requested_descriptor_hash =
-        XXH3_64bits(GuestPointer(base, command.frontbuffer_texture), kPresentDescriptorSize);
-  }
-  command.diagnostic_persisted_descriptor_hash =
-      XXH3_64bits(GuestPointer(base, command.diagnostic_persisted_texture), kPresentDescriptorSize);
-  command.diagnostic_descriptor_equal =
-      command.frontbuffer_texture != 0 &&
-      std::memcmp(GuestPointer(base, command.frontbuffer_texture),
-                  GuestPointer(base, command.diagnostic_persisted_texture),
-                  kPresentDescriptorSize) == 0;
   command.diagnostic_device_flag_10941 = LoadU8(base, device + kPresentFlag10941Offset);
   command.diagnostic_device_flag_10942 = LoadU8(base, device + kPresentFlag10942Offset);
   command.diagnostic_trace =
       g_tv_watching.load(std::memory_order_relaxed) && ConsumeTvPresentTraceBudget();
   command.diagnostic_force_content_probe = command.diagnostic_trace;
+  if (command.diagnostic_trace) {
+    for (uint32_t index = 0; index < std::size(command.diagnostic_persisted_fetch); ++index) {
+      command.diagnostic_persisted_fetch[index] =
+          LoadU32(base, command.diagnostic_persisted_texture + 28 + index * sizeof(uint32_t));
+    }
+    if (command.frontbuffer_texture) {
+      command.diagnostic_requested_descriptor_hash =
+          XXH3_64bits(GuestPointer(base, command.frontbuffer_texture), kPresentDescriptorSize);
+    }
+    command.diagnostic_persisted_descriptor_hash =
+        XXH3_64bits(GuestPointer(base, command.diagnostic_persisted_texture), kPresentDescriptorSize);
+    command.diagnostic_descriptor_equal =
+        command.frontbuffer_texture != 0 &&
+        std::memcmp(GuestPointer(base, command.frontbuffer_texture),
+                    GuestPointer(base, command.diagnostic_persisted_texture),
+                    kPresentDescriptorSize) == 0;
+  }
   {
     std::lock_guard lock(g_native_resolution_mutex);
     command.width = g_native_resolution.render_width;

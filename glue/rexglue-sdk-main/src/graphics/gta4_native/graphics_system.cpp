@@ -7277,14 +7277,22 @@ void Gta4NativeGraphicsSystem::RenderWorkerMain() { RenderWorkerLoop(WorkerLoopM
 void Gta4NativeGraphicsSystem::PumpDirectRecord() {
   const std::thread::id self = std::this_thread::get_id();
   if (direct_pump_owner_.load(std::memory_order_relaxed) == self) return;  // never re-entered
-  std::unique_lock pump(direct_pump_mutex_, std::try_to_lock);
-  while (!pump.owns_lock()) {
-    // Another thread is pumping (RenderGuest recording a frame while a synchronous texture
-    // lock waits). Polling, so that a shutdown is never blocked by a waiting pump.
-    if (!render_worker_running_.load(std::memory_order_acquire)) return;
-    std::this_thread::sleep_for(std::chrono::microseconds(50));
-    (void)pump.try_lock();
+  if (direct_pump_active_.exchange(true, std::memory_order_acquire)) [[unlikely]] {
+    for (;;) {
+      // Another thread is pumping (RenderGuest recording a frame while a synchronous texture
+      // lock waits). Polling, so that a shutdown is never blocked by a waiting pump.
+      if (!render_worker_running_.load(std::memory_order_acquire)) return;
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+      if (!direct_pump_active_.load(std::memory_order_relaxed) &&
+          !direct_pump_active_.exchange(true, std::memory_order_acquire)) {
+        break;
+      }
+    }
   }
+  struct PumpGuard {
+    std::atomic<bool>& flag;
+    ~PumpGuard() { flag.store(false, std::memory_order_release); }
+  } pump{direct_pump_active_};
   if (!render_worker_running_.load(std::memory_order_acquire)) return;
   direct_pump_owner_.store(self, std::memory_order_relaxed);
   ++direct_pumps_;
@@ -24229,20 +24237,7 @@ VkPipeline Gta4NativeGraphicsSystem::GetOrCreateDrawPipeline(
       ShouldCaptureArtificialLightFrame(diagnostic_submitted_frame_) &&
       (diagnostic_light_trace_id_ || IsArtificialLightRenderPhase(diagnostic_render_phase_));
 const uint64_t memo_signature = command.pipeline_memo_signature;
-  struct LastPipelineLookup {
-    const NativeShader* vs = nullptr;
-    const NativeShader* ps = nullptr;
-    const NativeVertexDeclaration* vdecl = nullptr;
-    uint64_t vs_hash = 0;
-    uint64_t ps_hash = 0;
-    uint64_t vdecl_hash = 0;
-    std::array<uint32_t, kVertexStreamCount> strides{};
-    uint64_t memo_sig = 0;
-    NativePipelineLookupContext<kRenderTargetCount> ctx{};
-    VkPipeline pipeline = VK_NULL_HANDLE;
-  };
-  static thread_local LastPipelineLookup s_last_lookup{};
-  LastPipelineLookup& last_lookup = s_last_lookup;
+  LastPipelineLookup& last_lookup = last_pipeline_lookup_;
   const uint64_t ps_hash_now = state.pixel_shader_resource ? state.pixel_shader_resource->hash : 0;
   if (!trace_pipeline && !target.temporal_shader && memo_signature &&
       context.lifetime && state.vertex_shader_resource && state.vertex_declaration_resource) {
@@ -24328,10 +24323,10 @@ for (uint32_t s = 0; s < kVertexStreamCount; ++s) {
     cache_entry->context = context;
     cache_entry->pipeline = pipeline;
   if (!trace_pipeline && !target.temporal_shader && memo_signature) {
-      s_last_lookup = {state.vertex_shader_resource, state.pixel_shader_resource,
-                       vertex_declaration, state.vertex_shader_resource->hash,
-                       ps_hash_now, vertex_declaration->content_hash,
-                       strides, memo_signature, context, pipeline};
+      last_pipeline_lookup_ = {state.vertex_shader_resource, state.pixel_shader_resource,
+                               vertex_declaration, state.vertex_shader_resource->hash,
+                               ps_hash_now, vertex_declaration->content_hash,
+                               strides, memo_signature, context, pipeline};
     }
   }
   return pipeline;
@@ -42369,8 +42364,15 @@ void Gta4NativeGraphicsSystem::Shutdown() {
       // shutdown tail, but not the capture lock (the tail takes it to destroy shader
       // resources).
       { std::lock_guard capture_lock(command_capture_mutex_); }
-      std::lock_guard pump(direct_pump_mutex_);
+      while (direct_pump_active_.exchange(true, std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      struct PumpGuard {
+        std::atomic<bool>& flag;
+        ~PumpGuard() { flag.store(false, std::memory_order_release); }
+      } pump{direct_pump_active_};
       if (worker_loop_started_) RenderWorkerLoop(WorkerLoopMode::kDirectShutdown);
+      last_pipeline_lookup_ = {};
     }
   }
   ShutdownDeferredDiagnosticWorker();

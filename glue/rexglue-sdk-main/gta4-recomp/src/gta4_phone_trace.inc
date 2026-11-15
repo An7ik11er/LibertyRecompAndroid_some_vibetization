@@ -87,8 +87,18 @@ class ScopedPhoneTrace {
  public:
   ScopedPhoneTrace(PhoneTraceScope scope, uint8_t* base, uint32_t object, uint32_t caller,
                    const PhoneTraceContext* origin = nullptr)
-      : previous_(g_phone_context), active_(PhoneCaptureActive()), base_(base) {
-    if (!active_) return;
+      : active_(PhoneCaptureActive()) {
+    if (!active_) [[likely]] return;
+    EnterSlow(scope, base, object, caller, origin);
+  }
+  ~ScopedPhoneTrace() {
+    if (!active_) [[likely]] return;
+    ExitSlow();
+  }
+ private:
+  [[gnu::noinline]] void EnterSlow(PhoneTraceScope scope, uint8_t* base, uint32_t object,
+                                   uint32_t caller, const PhoneTraceContext* origin) {
+    Saved& s = saved_.emplace(Saved{g_phone_context, base, 0});
     if (origin) g_phone_context = *origin;
     g_phone_context.run = g_phone_run.load(std::memory_order_relaxed);
     g_phone_context.event = NextPhoneEvent();
@@ -97,24 +107,24 @@ class ScopedPhoneTrace {
     g_phone_context.object = object;
     g_phone_context.caller = caller;
     if (scope == PhoneTraceScope::kPhoneModel) g_phone_context.model = object;
-    event_ = g_phone_context.event;
+    s.event = g_phone_context.event;
     PhoneTraceLog("guest-enter", fmt::format("run={} event={} occurrence={} scope={} object={:08X} caller={:08X} dc-event={} dc={:08X} viewport={:08X}",
-        g_phone_context.run, event_, g_phone_context.occurrence, g_phone_context.scope, object,
-        caller, g_phone_context.dc_event, g_phone_context.dc, LoadU32(base_, kCurrentViewportGlobal)));
+        g_phone_context.run, s.event, g_phone_context.occurrence, g_phone_context.scope, object,
+        caller, g_phone_context.dc_event, g_phone_context.dc, LoadU32(s.base, kCurrentViewportGlobal)));
   }
-  ~ScopedPhoneTrace() {
-    if (active_) {
-      PhoneTraceLog("guest-exit", fmt::format("run={} event={} occurrence={} scope={} viewport={:08X}",
-          g_phone_context.run, event_, g_phone_context.occurrence, g_phone_context.scope,
-          LoadU32(base_, kCurrentViewportGlobal)));
-      g_phone_context = previous_;
-    }
+  [[gnu::noinline]] void ExitSlow() {
+    PhoneTraceLog("guest-exit", fmt::format("run={} event={} occurrence={} scope={} viewport={:08X}",
+        g_phone_context.run, saved_->event, g_phone_context.occurrence, g_phone_context.scope,
+        LoadU32(saved_->base, kCurrentViewportGlobal)));
+    g_phone_context = saved_->previous;
   }
- private:
-  PhoneTraceContext previous_{};
+  struct Saved {
+    PhoneTraceContext previous{};
+    uint8_t* base = nullptr;
+    uint64_t event = 0;
+  };
   bool active_ = false;
-  uint8_t* base_ = nullptr;
-  uint64_t event_ = 0;
+  std::optional<Saved> saved_;
 };
 
 PhoneTraceContext ConsumePhoneDcOrigin(uint8_t* base, uint32_t dc) {

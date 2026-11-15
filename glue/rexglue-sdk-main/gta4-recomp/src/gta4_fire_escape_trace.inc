@@ -75,15 +75,27 @@ void FireModelEntry(PPCContext& ctx, uint8_t* base) {
   }
 }
 struct ScopedFireMaterial {
-  FireTraceContext previous = g_fire_context;
-  uint8_t* previous_base = g_fire_base;
-  uint64_t before = g_fire_submissions;
-  bool selected = false, verbose = false;
-  ScopedFireMaterial(PPCContext& ctx, uint8_t* base) {
-    if (!FireTraceConfig().enabled) return;
+  struct Saved {
+    FireTraceContext context;
+    uint8_t* base = nullptr;
+    uint64_t before = 0;
+  };
+  std::optional<Saved> saved_;
+  bool selected = false;
+  bool verbose = false;
+  explicit ScopedFireMaterial(PPCContext& ctx, uint8_t* base) {
+    if (!FireTraceConfig().enabled) [[likely]] return;
+    EnterSlow(ctx, base);
+  }
+  ~ScopedFireMaterial() {
+    if (!selected) [[likely]] return;
+    ExitSlow();
+  }
+  [[gnu::noinline]] void EnterSlow(PPCContext& ctx, uint8_t* base) {
     FireTraceContext c;
     selected = FireMaterial(base, ctx.r3.u32, c);
     if (!selected) return;
+    saved_.emplace(Saved{g_fire_context, g_fire_base, g_fire_submissions});
     c.occurrence = g_fire_next_event.fetch_add(1, std::memory_order_relaxed);
     c.event = c.occurrence; c.model = ctx.r4.u32; c.ordinal = ctx.r5.u32; c.caller = uint32_t(ctx.lr);
     c.guest_frame = FireGuestFrame(base); c.device = LoadU32(base, kDeferredDeviceGlobal);
@@ -99,11 +111,10 @@ struct ScopedFireMaterial {
     if (verbose) FireTraceLog("material-enter", fmt::format("occurrence={} guest-frame={} caller={:08X} model={:08X} geometry={:08X} ordinal={} material={:08X} bucket={} texture-wrapper={:08X} texture={}",
       c.occurrence,c.guest_frame,c.caller,c.model,c.geometry,c.ordinal,c.material,c.bucket,c.texture_wrapper,c.texture_name.data()));
   }
-  ~ScopedFireMaterial() {
-    if (!selected) return;
+  [[gnu::noinline]] void ExitSlow() {
     if (verbose) FireTraceLog("material-exit", fmt::format("occurrence={} guest-frame={} model={:08X} material={:08X} submissions={}",
-      g_fire_context.occurrence,g_fire_context.guest_frame,g_fire_context.model,g_fire_context.material,g_fire_submissions-before));
-    g_fire_context = previous; g_fire_base = previous_base;
+      g_fire_context.occurrence,g_fire_context.guest_frame,g_fire_context.model,g_fire_context.material,g_fire_submissions-saved_->before));
+    g_fire_context = saved_->context; g_fire_base = saved_->base;
   }
 };
 void FireMaterialPass(PPCContext& ctx, uint8_t* base, bool after) {

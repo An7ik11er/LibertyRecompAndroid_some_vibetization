@@ -2725,9 +2725,9 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   // 58: direct record. The worker loop's locals that must outlive one pump.
   bool direct_record_ = false;
   bool worker_loop_started_ = false;
-  // Lock order: command_capture_mutex_ -> direct_pump_mutex_ (the synchronous texture lock
+  // Lock order: command_capture_mutex_ -> direct_pump_active_ (the synchronous texture lock
   // pumps with the capture lock held; a pump never takes the capture lock).
-  std::mutex direct_pump_mutex_;
+  alignas(64) std::atomic<bool> direct_pump_active_{false};
   std::atomic<std::thread::id> direct_pump_owner_{};
   // The thread that submits Presents (RenderGuest): it pumps after every submission. Other
   // submitters (Main's render-phase markers) leave their commands queued for its next pump,
@@ -3170,17 +3170,52 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   // counting happens on one control block that only the producer touches
   // while it captures the frame. A holder that outlives the frame must take
   // an owning reference (OwningTextureResource). command_capture_mutex_.
+  template <typename T, size_t kChunkSize = 64>
+  struct ReusableBlockArena {
+    std::vector<std::unique_ptr<std::array<T, kChunkSize>>> chunks;
+    size_t count = 0;
+
+    template <typename U>
+    T& emplace_back(U&& value) {
+      const size_t index = count++;
+      const size_t chunk = index / kChunkSize;
+      const size_t offset = index % kChunkSize;
+      if (chunk >= chunks.size()) [[unlikely]] {
+        chunks.push_back(std::make_unique<std::array<T, kChunkSize>>());
+      }
+      T& slot = (*chunks[chunk])[offset];
+      slot = std::forward<U>(value);
+      return slot;
+    }
+
+    void clear() noexcept { count = 0; }
+  };
+
   struct CaptureKeepAlive {
     CaptureKeepAlive();
     ~CaptureKeepAlive();
     std::vector<std::shared_ptr<const void>> refs;
     // 48: state blocks of the commands captured into this keep-alive. Appended
-    // by RenderGuest only; deque elements never move, and a block is read-only
+    // by RenderGuest only; chunk elements never move, and a block is read-only
     // once a command pointing at it is queued. Cleared with refs when the
-    // keep-alive is reused (no command holds it then).
-    std::deque<NativeFixedFunctionState> fixed_blocks;
-    std::deque<NativeTargetSnapshot> target_blocks;
+    // keep-alive is reused (no command holds it then) without freeing chunks.
+    ReusableBlockArena<NativeFixedFunctionState, 64> fixed_blocks;
+    ReusableBlockArena<NativeTargetSnapshot, 64> target_blocks;
   };
+
+  struct LastPipelineLookup {
+    const NativeShader* vs = nullptr;
+    const NativeShader* ps = nullptr;
+    const NativeVertexDeclaration* vdecl = nullptr;
+    uint64_t vs_hash = 0;
+    uint64_t ps_hash = 0;
+    uint64_t vdecl_hash = 0;
+    std::array<uint32_t, kVertexStreamCount> strides{};
+    uint64_t memo_sig = 0;
+    NativePipelineLookupContext<kRenderTargetCount> ctx{};
+    VkPipeline pipeline = VK_NULL_HANDLE;
+  };
+  LastPipelineLookup last_pipeline_lookup_{};
   static constexpr size_t kCaptureKeepAliveLimit = 32768;  // roll early beyond this
   std::shared_ptr<CaptureKeepAlive> capture_keepalive_;
   std::deque<std::shared_ptr<CaptureKeepAlive>> retired_capture_keepalives_;

@@ -14,13 +14,24 @@ uint64_t epoch = 1;
 std::mutex scene_mutex;
 class Scope {
  public:
-  Scope(uint64_t matrix, uint64_t drawable, uint64_t pose) : old_(instance) {
-    instance = {matrix, drawable, pose};
+  Scope(uint64_t matrix, uint64_t drawable, uint64_t pose)
+      : active_(enabled.load(std::memory_order_relaxed)) {
+    if (!active_) [[likely]] return;
+    EnterSlow(matrix, drawable, pose);
   }
-  ~Scope() { instance = old_; }
+  ~Scope() {
+    if (!active_) [[likely]] return;
+    ExitSlow();
+  }
 
  private:
-  Instance old_;
+  [[gnu::noinline]] void EnterSlow(uint64_t matrix, uint64_t drawable, uint64_t pose) {
+    old_ = instance;
+    instance = {matrix, drawable, pose};
+  }
+  [[gnu::noinline]] void ExitSlow() { instance = old_; }
+  bool active_ = false;
+  Instance old_{};
 };
 bool Requested() {
   const auto upscaler = rex::cvar::GetFlagByName("gta4_native_upscaler");
@@ -132,9 +143,7 @@ void Event(TemporalEvent event) {
   }
   SubmitNativeCommand(command);
 }
-void Draw(uint8_t* base, uint32_t device) {
-  if (!enabled.load(std::memory_order_relaxed) || !device)
-    return;
+[[gnu::noinline]] void DrawImpl(uint8_t* base, uint32_t device) {
   if (!enabled.load(std::memory_order_acquire))
     return;
   TemporalCommand c;
@@ -212,5 +221,10 @@ void Draw(uint8_t* base, uint32_t device) {
     return;
   if (SubmitNativeCommand(c))
     previous = c;
+}
+inline void Draw(uint8_t* base, uint32_t device) {
+  if (!enabled.load(std::memory_order_relaxed) || !device) [[likely]]
+    return;
+  DrawImpl(base, device);
 }
 }  // namespace temporal_host

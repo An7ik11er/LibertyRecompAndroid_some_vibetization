@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <memory>
 
@@ -43,28 +44,72 @@ class CommandCapture {
  public:
   void Observe(const TemporalCommand& command) {
     if (command.event == TemporalEvent::kInstance) {
-      pending_.owner = identity_;
-      pending_.command = std::make_shared<const TemporalCommand>(command);
+      ObserveInstanceSlow(command);
     } else if (command.event == TemporalEvent::kBeginScene ||
                command.event == TemporalEvent::kEndFrame) {
       Reset();
     }
   }
   std::shared_ptr<const TemporalCommand> Capture(uint32_t device) const {
-    if (pending_.owner.lock() != identity_ || !pending_.command ||
-        pending_.command->device != device) return {};
-    return pending_.command;
+    if (active_pending_threads_.load(std::memory_order_relaxed) == 0) [[likely]] {
+      return {};
+    }
+    return CaptureSlow(device);
   }
-  void Reset() {
-    if (pending_.owner.lock() == identity_) pending_ = {};
+  [[gnu::noinline]] void Reset() {
+    if (active_pending_threads_.load(std::memory_order_relaxed) == 0) [[likely]] {
+      return;
+    }
+    ResetSlow();
   }
 
  private:
   struct Pending {
     std::weak_ptr<const char> owner;
     std::shared_ptr<const TemporalCommand> command;
+    bool active;
+    Pending() noexcept : active(false) {}
+    ~Pending() {
+      if (active) {
+        active_pending_threads_.fetch_sub(1, std::memory_order_relaxed);
+      }
+    }
   };
+  [[gnu::noinline]] void ObserveInstanceSlow(const TemporalCommand& command) {
+    if (!pending_.active) {
+      pending_.active = true;
+      active_pending_threads_.fetch_add(1, std::memory_order_relaxed);
+    }
+    pending_.owner = identity_;
+    pending_.command = std::make_shared<const TemporalCommand>(command);
+  }
+  [[gnu::noinline]] std::shared_ptr<const TemporalCommand> CaptureSlow(uint32_t device) const {
+    if (pending_.owner.lock() != identity_) {
+      if (pending_.active && pending_.owner.expired()) {
+        pending_.owner.reset();
+        pending_.command.reset();
+        pending_.active = false;
+        active_pending_threads_.fetch_sub(1, std::memory_order_relaxed);
+      }
+      return {};
+    }
+    if (!pending_.command || pending_.command->device != device) {
+      return {};
+    }
+    return pending_.command;
+  }
+  [[gnu::noinline]] void ResetSlow() {
+    if (pending_.owner.lock() == identity_) {
+      pending_.owner.reset();
+      pending_.command.reset();
+      if (pending_.active) {
+        pending_.active = false;
+        active_pending_threads_.fetch_sub(1, std::memory_order_relaxed);
+      }
+    }
+  }
   std::shared_ptr<const char> identity_ = std::make_shared<const char>();
+  inline static std::atomic<uint32_t> active_pending_threads_{0};
   inline static thread_local Pending pending_;
 };
 
