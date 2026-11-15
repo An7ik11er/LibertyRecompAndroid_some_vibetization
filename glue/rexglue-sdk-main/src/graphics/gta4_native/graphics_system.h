@@ -2116,6 +2116,13 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   std::shared_ptr<const NativeTextureResource> CreateResolvedTextureResource(
       const ResolveCommand& command);
   std::shared_ptr<const NativeBufferResource> CaptureBufferResource(uint32_t handle);
+  uint64_t SyncBufferCaptureTables();
+  bool CaptureBufferResourceIntoEpoch(uint32_t handle, uint64_t clear_epoch, uint32_t current_frame,
+                                      NativeCommand& command,
+                                      std::shared_ptr<const NativeBufferResource>& out);
+  [[gnu::noinline]] bool CaptureBufferResourceIntoSlow(
+      uint32_t handle, uint64_t clear_epoch, uint32_t current_frame, NativeCommand& command,
+      std::shared_ptr<const NativeBufferResource>& out);
   bool CaptureBufferResourceInto(uint32_t handle, NativeCommand& command,
                                  std::shared_ptr<const NativeBufferResource>& out);
   SurfaceDescriptor CaptureSurfaceDescriptor(uint32_t handle) const;
@@ -2465,7 +2472,10 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
                                      const char* index_name);
   void ClearNativeFrameCommands();
   void TakeProducerPendingState(NativeCommand& command);  // 34
-  void PrefetchProducerBuffers(NativeCommand& command);  // 53, 54
+  void PrefetchProducerBuffers(NativeCommand& command, bool prefetch_vs, bool prefetch_ps);  // 53, 54
+  void PrefetchProducerBuffers(NativeCommand& command) {
+    PrefetchProducerBuffers(command, true, true);
+  }
   static void AddProtectedTextureGenerations(const NativeCommand& command,
                                              std::unordered_set<uint64_t>& generations);
   void CollectProtectedTextureGenerations(
@@ -3079,14 +3089,21 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     uint32_t raw_address_word = 0;
     uint32_t raw_size_word = 0;
     uint32_t last_frame = 0;
+    // Batch 94: Cached host pointer for handle + alias_serial (invariant across fixed
+    // guest heaps; cleared on ForgetBufferCapture / epoch clear / serial roll).
+    const uint8_t* guest_object = nullptr;
     // Batch 89: Non-owning raw pointer valid while capture_keepalive_serial_ == alias_serial
     // and buffer_fast_table_clear_epoch_ == clear_epoch (guaranteed pinned in capture_keepalive_).
     const NativeBufferResource* raw = nullptr;
   };
-  static_assert(sizeof(BufferL1MruEntry) == 32);
-  static constexpr size_t kBufferCaptureL1TableSize = 1024;
-  static constexpr uint32_t BufferL1TableIndex(uint32_t handle) noexcept {
-    return (handle * 0x9E3779B1u) >> (32 - 10);
+  static_assert(sizeof(BufferL1MruEntry) == 40);
+  // Batch 94: 2-way set-associative L1 (512 sets x 2 ways = 1024 entries, 40 KB <= 64 KB X1 L1D).
+  static constexpr size_t kBufferCaptureL1SetCount = 512;
+  static constexpr size_t kBufferCaptureL1Ways = 2;
+  static constexpr size_t kBufferCaptureL1TableSize =
+      kBufferCaptureL1SetCount * kBufferCaptureL1Ways;
+  static constexpr uint32_t BufferL1SetBase(uint32_t handle) noexcept {
+    return ((handle * 0x9E3779B1u) >> (32 - 9)) * uint32_t(kBufferCaptureL1Ways);
   }
   struct alignas(64) BufferMruEntry {
     uint32_t handle = 0;
@@ -3115,8 +3132,19 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   std::atomic<uint64_t> buffer_resources_clear_epoch_{1};
   uint64_t buffer_fast_table_clear_epoch_ = 1;  // command_capture_mutex_
   size_t buffer_fast_sweep_cursor_ = 0;         // command_capture_mutex_
+  uint8_t buffer_l1_replace_rr_ = 0;            // command_capture_mutex_
   uint8_t buffer_fast_replace_rr_ = 0;          // command_capture_mutex_
 
+  BufferL1MruEntry& SelectBufferL1Slot(uint32_t set_base, uint32_t handle,
+                                       uint32_t serial) noexcept {
+    BufferL1MruEntry& e0 = buffer_capture_l1_table_[set_base];
+    BufferL1MruEntry& e1 = buffer_capture_l1_table_[set_base + 1];
+    if (e0.handle == handle) return e0;
+    if (e1.handle == handle) return e1;
+    if (e0.handle == 0 || e0.alias_serial != serial) return e0;
+    if (e1.handle == 0 || e1.alias_serial != serial) return e1;
+    return buffer_capture_l1_table_[set_base + ((++buffer_l1_replace_rr_) & 1u)];
+  }
 
   std::array<BufferCaptureCacheSlot, 8192> buffer_capture_cache_{};  // command_capture_mutex_
   std::atomic<uint64_t> buffer_resources_epoch_{1};
@@ -3124,9 +3152,12 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     return CaptureCacheWay(buffer_capture_cache_, handle);
   }
   void ForgetBufferCapture(uint32_t handle) {
-    auto& l1 = buffer_capture_l1_table_[BufferL1TableIndex(handle)];
-    if (l1.handle == handle) {
-      l1 = {};
+    const uint32_t l1_base = BufferL1SetBase(handle);
+    for (size_t way = 0; way < kBufferCaptureL1Ways; ++way) {
+      auto& l1 = buffer_capture_l1_table_[l1_base + way];
+      if (l1.handle == handle) {
+        l1 = {};
+      }
     }
     const uint32_t base = BufferFastSetBase(handle);
     for (size_t way = 0; way < kBufferCaptureFastWays; ++way) {
@@ -3474,9 +3505,12 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   struct ProducerTargetMemo {
     bool valid = false;
     std::array<uint32_t, kRenderTargetCount + 1> handles{};
+    std::array<const uint8_t*, kRenderTargetCount + 1> host_ptrs{};
     std::array<std::array<uint32_t, 5>, kRenderTargetCount + 1> raw_words{};
   };
   ProducerTargetMemo producer_target_memo_{};
+  uint32_t last_captured_device_handle_ = 0;       // command_capture_mutex_
+  const uint8_t* last_captured_device_ptr_ = nullptr;  // command_capture_mutex_
   // 29.10: texture references of captured commands until they are published
   // (StageTextureProtection / PublishStagedTextureProtectionLocked). The worker
   // never takes this lock; readers take it after render_mutex_.
