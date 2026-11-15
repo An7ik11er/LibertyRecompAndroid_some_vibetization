@@ -97,6 +97,8 @@ void BindRAGEEffectTextureStage(PPCContext& ctx, uint8_t* base, uint32_t stage,
                                 uint32_t overrides);
 void SetPixelShaderConstantFromRAGE(PPCContext& ctx, uint8_t* base, uint32_t reg,
                                     uint32_t param_type, uint32_t src, uint32_t count);
+void SetVertexShaderConstantFromRAGE(PPCContext& ctx, uint8_t* base, uint32_t reg,
+                                     uint32_t param_type, uint32_t src, uint32_t count);
 
 namespace {
 
@@ -5125,12 +5127,19 @@ extern "C" void sub_828C8DB0(PPCContext& ctx, uint8_t* base) {
           sub_828E01B8(ctx, base);
         }
       } else {
-        ctx.r3.u64 = arg1;
-        ctx.r4.u64 = param_idx;
-        ctx.r6.u64 = is_const;
-        ctx.r5.u64 = val;
-        ctx.lr = 0x828C8E64u;
-        sub_828E0348(ctx, base);
+        if (native_mode) [[likely]] {
+          const uint32_t param_entry = arg1_table + (uint32_t(param_idx) << 3);
+          const uint32_t reg_type = LoadU8(base, param_entry);
+          const uint32_t reg = LoadU16(base, param_entry + 2u);
+          SetVertexShaderConstantFromRAGE(ctx, base, reg, reg_type, val, is_const);
+        } else {
+          ctx.r3.u64 = arg1;
+          ctx.r4.u64 = param_idx;
+          ctx.r6.u64 = is_const;
+          ctx.r5.u64 = val;
+          ctx.lr = 0x828C8E64u;
+          sub_828E0348(ctx, base);
+        }
       }
     }
   }
@@ -5210,10 +5219,6 @@ void FastSub828C8F38(PPCContext& ctx, uint8_t* base) {
   REX_FUNC_PROLOGUE();
   ctx.r12.u64 = ctx.lr;
   ctx.lr = 0x828C8F40u;
-  const uint32_t old_sp = ctx.r1.u32;
-  const uint32_t sp = old_sp - 144u;
-  REX_STORE_U32(sp, old_sp);
-  ctx.r1.u32 = sp;
 
   const uint32_t r31_pass = ctx.r3.u32;
   const uint32_t r26_vs_table = ctx.r4.u32;
@@ -5223,9 +5228,9 @@ void FastSub828C8F38(PPCContext& ctx, uint8_t* base) {
 
   const uint16_t state_count = REX_LOAD_U16(r31_pass + 28u);
   if (state_count > 0u) {
+    const uint32_t states = REX_LOAD_U32(r31_pass + 24u);
     uint32_t state_off = 0u;
     for (uint16_t i = 0; i < state_count; ++i) {
-      const uint32_t states = REX_LOAD_U32(r31_pass + 24u);
       ctx.r3.u64 = REX_LOAD_U32(states + state_off);
       ctx.r4.u64 = REX_LOAD_U32(states + state_off + 4u);
       ctx.lr = 0x828C8F7Cu;
@@ -5251,8 +5256,6 @@ void FastSub828C8F38(PPCContext& ctx, uint8_t* base) {
   ctx.r6.u64 = r27_shader_inst;
   ctx.lr = 0x828C8FDCu;
   sub_828C8E80(ctx, base);
-
-  ctx.r1.s64 = static_cast<int64_t>(sp) + 144;
 }
 
 extern "C" void sub_828C8F38(PPCContext& ctx, uint8_t* base) {
@@ -6405,6 +6408,44 @@ void SetPixelShaderConstantFromRAGE(PPCContext& ctx, uint8_t* base, uint32_t reg
   ctx.r6.u64 = uint32_t(effective_count);
   ctx.r7.u64 = dirty_mask;
   sub_82A42250(ctx, base);
+}
+
+void SetVertexShaderConstantFromRAGE(PPCContext& ctx, uint8_t* base, uint32_t reg,
+                                     uint32_t param_type, uint32_t src, uint32_t count) {
+  const uint32_t device = LoadU32(base, 0x831C22A4u);
+  if (param_type == 1u) {
+    ctx.r3.u64 = device;
+    ctx.r4.u64 = reg;
+    ctx.r5.u64 = src;
+    ctx.r6.u64 = 1u;
+    D3DDevice_SetVertexShaderConstantI(ctx, base);
+    return;
+  }
+  if (param_type == 7u) {
+    ctx.r3.u64 = device;
+    ctx.r4.u64 = reg;
+    ctx.r5.u64 = src;
+    ctx.r6.u64 = 1u;
+    sub_82A42338(ctx, base);
+    return;
+  }
+  const int32_t reg_stride = int32_t(LoadU8(base, 0x82B0D32Cu + param_type));
+  const int32_t effective_count = reg_stride * int32_t(count);
+  const uint32_t start_word = reg >> 2;
+  const uint32_t end_word = uint32_t(int32_t(reg) + effective_count - 1);
+  const uint32_t end_block = end_word >> 2;
+  const uint32_t diff = end_block - start_word;
+  const uint32_t shift = std::min<uint32_t>(diff, 63u);
+  const uint64_t mask_raw =
+      static_cast<uint64_t>(std::bit_cast<int64_t>(0x8000000000000000ULL) >> shift);
+  const uint64_t dirty_mask = (start_word & 0x40u) ? 0ULL : (mask_raw >> (start_word & 0x7Fu));
+
+  ctx.r3.u64 = device;
+  ctx.r4.u64 = reg;
+  ctx.r5.u64 = src;
+  ctx.r6.u64 = uint32_t(effective_count);
+  ctx.r7.u64 = dirty_mask;
+  sub_82A42168(ctx, base);
 }
 
 void BindRAGEEffectTextureStage(PPCContext& ctx, uint8_t* base, uint32_t stage,
