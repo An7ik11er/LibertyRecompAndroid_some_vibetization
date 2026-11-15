@@ -451,8 +451,10 @@ void Gta4NativeGraphicsSystem::StreamPump() {
     for (size_t index = first; index < assembly_frame_.size(); ++index) {
       const NativeCommand& command = assembly_frame_[index];
       for (const auto& texture : command.textures) mark(texture);
-      mark(command.postfx_half_scene);
-      mark(command.depth_handoff_source);
+      if (const auto* ex = command.extras.get()) {
+        mark(ex->postfx_half_scene);
+        mark(ex->depth_handoff_source);
+      }
     }
   };
   if (!stream_.open) {

@@ -50,8 +50,8 @@ void CopyNativePreparedTextureBindings(const Command& previous, Command& next) {
   next.failed_texture_mask = 0;
   next.bindings_prepared = true;
   // Never copy diagnostic-owned objects from another draw.
-  if (next.room_light_input_bindings) [[unlikely]] {
-    next.room_light_input_bindings.reset();
+  if (next.extras && next.extras->room_light_input_bindings) [[unlikely]] {
+    next.extras->room_light_input_bindings.reset();
   }
 }
 }  // namespace rex::graphics::gta4_native

@@ -1,7 +1,7 @@
 // Diagnostic-only TV content lineage. Every GPU copy restores its source layout.
 uint32_t Gta4NativeGraphicsSystem::TvCommandRole(const NativeCommand& command) const {
-  if (!command.tv_trace) return 0;
-  const auto& c = *command.tv_trace;
+  if (!command.extras || !command.extras->tv_trace) return 0;
+  const auto& c = *command.extras->tv_trace;
   uint32_t role = 0;
   if (command.pipeline_state) {
     const auto* ps = command.pipeline_state->pixel_shader_resource;
@@ -20,7 +20,7 @@ uint32_t Gta4NativeGraphicsSystem::TvCommandRole(const NativeCommand& command) c
 void Gta4NativeGraphicsSystem::TraceTvNativeCommand(const NativeCommand& command) {
   const auto role = TvCommandRole(command);
   if (!role) return;
-  const auto& c = *command.tv_trace;
+  const auto& c = *command.extras->tv_trace;
   const auto& f = *command.fixed_function_state;
   const auto* state = command.pipeline_state.get();
   const auto* ps = state ? state->pixel_shader_resource : nullptr;
@@ -71,8 +71,8 @@ void Gta4NativeGraphicsSystem::TraceTvNativeCommand(const NativeCommand& command
 void Gta4NativeGraphicsSystem::RecordTvImage(VkCommandBuffer cb,const NativeCommand& command,
     uint32_t checkpoint,uint32_t attachment,NativeSurfaceImage* surface,NativeTextureImage* texture,
     std::string_view role) {
-  if (!command.tv_trace || !TvTraceConfig().readbacks) return;
-  const auto& c = *command.tv_trace;
+  if (!command.extras || !command.extras->tv_trace || !TvTraceConfig().readbacks) return;
+  const auto& c = *command.extras->tv_trace;
   const auto unavailable = [&](std::string_view reason) {
     TvTraceLog("probe-unavailable",fmt::format("run={} event={} frame={} cmd={} checkpoint={} attachment={} role={} reason={}",
         c.run,c.event,diagnostic_submitted_frame_,diagnostic_command_index_,checkpoint,attachment,role,reason));
@@ -139,13 +139,13 @@ void Gta4NativeGraphicsSystem::RecordTvTarget(VkCommandBuffer cb,const NativeCom
 
 void Gta4NativeGraphicsSystem::RecordTvInputs(VkCommandBuffer cb,const NativeCommand& command) {
   if (!TvCommandRole(command)) return;
-  const auto& c=*command.tv_trace;
+  const auto& c=*command.extras->tv_trace;
   for (uint32_t slot=0;slot<command.textures.size();++slot) {
     if (!(command.used_texture_mask & (uint32_t{1}<<slot))) continue;
     const auto& resource=command.textures[slot];
     const NativeRoomLightInputBinding* binding=nullptr;
-    if (command.room_light_input_bindings)
-      for (const auto& b:*command.room_light_input_bindings) if (b.texture_stage==slot) {binding=&b;break;}
+    if (command.extras && command.extras->room_light_input_bindings)
+      for (const auto& b:*command.extras->room_light_input_bindings) if (b.texture_stage==slot) {binding=&b;break;}
     NativeTextureImage* image=nullptr;
     if (resource) {
       auto found=native_texture_images_.find(resource->generation);

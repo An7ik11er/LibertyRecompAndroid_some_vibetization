@@ -39,7 +39,7 @@ void Gta4NativeGraphicsSystem::CaptureBulbSource(NativeCommand& command,
     }
   }
   // Independent observer copies. Never replace the normal dirty-state deltas.
-  command.bulb_trace = std::move(source);
+  command.EnsureExtras().bulb_trace = std::move(source);
 }
 
 void Gta4NativeGraphicsSystem::BeginBulbFrame(uint32_t frame) {
@@ -54,14 +54,14 @@ void Gta4NativeGraphicsSystem::BeginBulbFrame(uint32_t frame) {
   }
   if (bulb_capture_count_ && uint64_t(frame) < uint64_t(bulb_last_frame_) + EmissionTraceConfig().pipeline_interval) return;
   std::array<uint32_t, kBulbFixtures.size()> observed{};
-  for (const auto& command : current_frame_) if (command.bulb_trace) ++observed[command.bulb_trace->fixture];
+  for (const auto& command : current_frame_) if (command.extras && command.extras->bulb_trace) ++observed[command.extras->bulb_trace->fixture];
   if (std::all_of(observed.begin(), observed.end(), [](auto count) { return count == 0; })) return;
   // One visible fixture per sampled frame leaves space for its entire sequence
   // of later writers. Rotate between eligible fixtures, rather than silently
   // exhausting the shared readback buffer on several simultaneous chains.
   for (size_t command_index = 0; command_index < current_frame_.size(); ++command_index) {
     const auto& command = current_frame_[command_index];
-    if (!command.bulb_trace || !command.pipeline_state || !command.shader_state || !command.vertex_buffers[0]) continue;
+    if (!command.extras || !command.extras->bulb_trace || !command.pipeline_state || !command.shader_state || !command.vertex_buffers[0]) continue;
     const auto* vs=command.pipeline_state->vertex_shader_resource;
     const auto* ps=command.pipeline_state->pixel_shader_resource;
     if (!vs || !ps || ((vs->hash!=0x1746F0E888217EADull || ps->hash!=0xF634FCEBA607E8A5ull) &&
@@ -77,13 +77,13 @@ void Gta4NativeGraphicsSystem::BeginBulbFrame(uint32_t frame) {
     if (EmissionTraceConfig().require_full_region &&
         (region.normalized[0] <= 0.01f || region.normalized[1] <= 0.01f ||
          region.normalized[2] >= 0.99f || region.normalized[3] >= 0.99f)) continue;
-    const uint32_t fixture=command.bulb_trace->fixture;
+    const uint32_t fixture=command.extras->bulb_trace->fixture;
     if (bulb_selected_fixture_==UINT32_MAX || bulb_fixture_visits_[fixture]<bulb_fixture_visits_[bulb_selected_fixture_])
     {
       bulb_selected_fixture_=fixture;
       if (EmissionTraceConfig().corona_trace) {
         BulbRoute route;
-        route.source=command.bulb_trace;route.sequence=command.diagnostic_submit_sequence;
+        route.source=command.extras->bulb_trace;route.sequence=command.diagnostic_submit_sequence;
         route.command_index=uint32_t(command_index);route.region=region;
         bulb_prospective_route_=std::move(route);
       }
@@ -108,8 +108,8 @@ void Gta4NativeGraphicsSystem::BeginBulbFrame(uint32_t frame) {
 
 void Gta4NativeGraphicsSystem::TraceBulbCommand(std::string_view point, const NativeCommand& command,
                                               std::string_view reason) {
-  if (!bulb_trace_frame_ || !command.bulb_trace) return;
-  const auto& src = *command.bulb_trace;
+  if (!bulb_trace_frame_ || !command.extras || !command.extras->bulb_trace) return;
+  const auto& src = *command.extras->bulb_trace;
   const auto* vertex = command.shader_state ? AuthoritativeConstantState::MaterializeView(command.shader_state->vertex_constants) : nullptr;
   const auto* pixel = command.shader_state ? AuthoritativeConstantState::MaterializeView(command.shader_state->pixel_constants) : nullptr;
   const auto* vs = command.pipeline_state ? command.pipeline_state->vertex_shader_resource : nullptr;
@@ -130,9 +130,9 @@ void Gta4NativeGraphicsSystem::TraceBulbCommand(std::string_view point, const Na
 }
 
 bool Gta4NativeGraphicsSystem::PrepareBulbDraw(const NativeCommand& command, const NativeRenderingTarget& target) {
-  if (!bulb_trace_frame_ || !command.bulb_trace || !command.pipeline_state ||
+  if (!bulb_trace_frame_ || !command.extras || !command.extras->bulb_trace || !command.pipeline_state ||
       !command.pipeline_state->vertex_shader_resource || !command.pipeline_state->pixel_shader_resource) return false;
-  if (!bulb_routes_.empty() || command.bulb_trace->fixture!=bulb_selected_fixture_) return false;
+  if (!bulb_routes_.empty() || command.extras->bulb_trace->fixture!=bulb_selected_fixture_) return false;
   const auto vs = command.pipeline_state->vertex_shader_resource->hash;
   const auto ps = command.pipeline_state->pixel_shader_resource->hash;
   if ((vs != 0x1746F0E888217EADull || ps != 0xF634FCEBA607E8A5ull) &&
@@ -154,11 +154,11 @@ bool Gta4NativeGraphicsSystem::PrepareBulbDraw(const NativeCommand& command, con
   REXLOG_INFO("gta4-bulb: point=visibility run={} frame={} cmd={} seq={} fixture={} projection-known={} "
               "intersects-view={} region={},{},{},{} viewport-standard={} gpu-visibility=await-query",
               bulb_run_, diagnostic_submitted_frame_, diagnostic_command_index_, command.diagnostic_submit_sequence,
-              kBulbFixtures[command.bulb_trace->fixture].role, region.known, region.visible,
+              kBulbFixtures[command.extras->bulb_trace->fixture].role, region.known, region.visible,
               region.normalized[0], region.normalized[1], region.normalized[2], region.normalized[3], standard_viewport);
   if (!region.known || !region.visible) return false;
   BulbRoute route;
-  route.source = command.bulb_trace; route.sequence = command.diagnostic_submit_sequence;
+  route.source = command.extras->bulb_trace; route.sequence = command.diagnostic_submit_sequence;
   route.command_index = uint32_t(diagnostic_command_index_); route.region = region;
   route.images.emplace(NativeVulkanHandleIdentity(target.color_surfaces[0]->resource.image), target.color_surfaces[0]->lifetime_id);
   ++bulb_fixture_visits_[route.source->fixture];

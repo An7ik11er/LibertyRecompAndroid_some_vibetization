@@ -23,7 +23,7 @@ void Gta4NativeGraphicsSystem::BeginFireFrame(VkCommandBuffer cb, uint32_t frame
     const auto& c = current_frame_[index];
     const bool draw = c.type == CommandType::kDrawIndexedPrimitive || c.type == CommandType::kDrawPrimitive || c.type == CommandType::kDrawPrimitiveUp;
     if (!draw) continue;
-    if (c.fire_trace && FireStrongTextureName(c.fire_trace->texture_name.data())) {
+    if (c.extras && c.extras->fire_trace && FireStrongTextureName(c.extras->fire_trace->texture_name.data())) {
       ++matches; if (fire_first_draw_index_ == SIZE_MAX) fire_first_draw_index_ = index;
     }
     const auto* ps = c.pipeline_state ? c.pipeline_state->pixel_shader_resource : nullptr;
@@ -75,8 +75,9 @@ void Gta4NativeGraphicsSystem::TraceFireCommand(std::string_view point,const Nat
   const auto* ps = p ? p->pixel_shader_resource : nullptr;
   const auto* vs = p ? p->vertex_shader_resource : nullptr;
   const bool draw = c.type == CommandType::kDrawIndexedPrimitive || c.type == CommandType::kDrawPrimitive || c.type == CommandType::kDrawPrimitiveUp;
-  if (!c.fire_trace && draw && (!ps || !FireDownstreamShader(ps->filename))) return;
-  const FireTraceContext empty; const auto& x = c.fire_trace ? *c.fire_trace : empty;
+  const auto* ft = c.extras ? c.extras->fire_trace.get() : nullptr;
+  if (!ft && draw && (!ps || !FireDownstreamShader(ps->filename))) return;
+  const FireTraceContext empty; const auto& x = ft ? *ft : empty;
   const auto& f = *c.fixed_function_state;
   DrawIndexedPrimitiveCommand d{};
   if (c.type == CommandType::kDrawIndexedPrimitive && c.bytes.size() == sizeof(d)) std::memcpy(&d,c.bytes.data(),sizeof(d));
@@ -91,7 +92,7 @@ void Gta4NativeGraphicsSystem::TraceFireCommand(std::string_view point,const Nat
     f.blend_enable,f.source_blend,f.destination_blend,f.blend_operation,f.source_blend_alpha,f.destination_blend_alpha,f.blend_operation_alpha,
     f.color_write_mask,c.used_texture_mask,c.realized_image_mask,c.failed_texture_mask,
     c.shader_state?c.shader_state->pixel_booleans:0,c.shader_state?c.shader_state->vertex_booleans:0));
-  if (c.fire_trace && p && point == "record-begin") {
+  if (ft && p && point == "record-begin") {
     FireTraceLog("raster-state",fmt::format("frame={} seq={} viewport={:08X},{:08X},{:08X},{:08X},{:08X},{:08X} scissor={},{},{},{},{} clip={:08X} depth-clamp={} sample-mask={:08X} blend-controls={:08X},{:08X},{:08X},{:08X}",
       diagnostic_submitted_frame_,c.diagnostic_submit_sequence,f.viewport_bits[0],f.viewport_bits[1],f.viewport_bits[2],f.viewport_bits[3],f.viewport_bits[4],f.viewport_bits[5],f.scissor_enable,f.scissor[0],f.scissor[1],f.scissor[2],f.scissor[3],f.clip_control,f.depth_clamp_enable,f.sample_mask,f.blend_controls[0],f.blend_controls[1],f.blend_controls[2],f.blend_controls[3]));
     for (uint32_t i=0;i<4;++i) {
@@ -108,7 +109,7 @@ bool Gta4NativeGraphicsSystem::SelectFireCheckpoint(const NativeCommand& c, cons
   if (!fire_images_ || !c.pipeline_state || !c.pipeline_state->pixel_shader_resource) return false;
   if (c.type != CommandType::kDrawIndexedPrimitive && c.type != CommandType::kDrawPrimitive && c.type != CommandType::kDrawPrimitiveUp) return false;
   std::string key;
-  if (c.fire_trace) key = target.is_reflection ? "fire-reflection" : "fire-" + std::to_string(c.fire_trace->bucket);
+  if (c.extras && c.extras->fire_trace) key = target.is_reflection ? "fire-reflection" : "fire-" + std::to_string(c.extras->fire_trace->bucket);
   else {
     const std::string_view name=c.pipeline_state->pixel_shader_resource->filename;
     if (fire_first_draw_index_ != SIZE_MAX && diagnostic_command_index_ < fire_first_draw_index_) return false;
@@ -161,7 +162,7 @@ void Gta4NativeGraphicsSystem::FireImage(VkCommandBuffer cb,std::string_view rol
   FireFullProbe probe;auto& p=probe.data;
   p.frame=diagnostic_submitted_frame_;p.command_index=uint32_t(diagnostic_command_index_);p.role=role;
   p.sequence=command?command->diagnostic_submit_sequence:0;
-  if (command && command->fire_trace) {probe.occurrence=command->fire_trace->occurrence;probe.event=command->fire_trace->event;}
+  if (command && command->extras && command->extras->fire_trace) {probe.occurrence=command->extras->fire_trace->occurrence;probe.event=command->extras->fire_trace->event;}
   p.width=width;p.height=height;p.format=uint32_t(format);p.aspect=aspect;p.bytes=bytes;
   p.block_extent=block;p.bytes_per_block=bpt;p.layout=uint32_t(layout);p.image=NativeVulkanHandleIdentity(image);
   probe.mip=mip;probe.samples=uint32_t(samples);
@@ -205,7 +206,7 @@ void Gta4NativeGraphicsSystem::FireTarget(VkCommandBuffer cb,const NativeCommand
   const std::string role=after?"target-after":"target-before";
   for (uint32_t i=0;i<4;++i) if ((target.color_attachment_mask&(1u<<i)) && target.color_surfaces[i])
     FireImage(cb,fmt::format("{}-{}",role,i),&c,target.color_surfaces[i]);
-  if (c.fire_trace && target.depth_surface) {
+  if (c.extras && c.extras->fire_trace && target.depth_surface) {
     FireImage(cb,role+"-depth",&c,target.depth_surface,nullptr,VK_NULL_HANDLE,VK_FORMAT_UNDEFINED,VK_IMAGE_LAYOUT_UNDEFINED,0,0,VK_IMAGE_ASPECT_DEPTH_BIT);
     if (target.depth_surface->aspect&VK_IMAGE_ASPECT_STENCIL_BIT) FireImage(cb,role+"-stencil",&c,target.depth_surface,nullptr,VK_NULL_HANDLE,VK_FORMAT_UNDEFINED,VK_IMAGE_LAYOUT_UNDEFINED,0,0,VK_IMAGE_ASPECT_STENCIL_BIT);
   }
@@ -218,7 +219,7 @@ void Gta4NativeGraphicsSystem::FireInputs(VkCommandBuffer cb,const NativeCommand
     const auto& r=c.textures[i];auto found=r?native_texture_images_.find(r->generation):native_texture_images_.end();
     auto* image=found==native_texture_images_.end()?nullptr:found->second.get();
     const NativeRoomLightInputBinding* binding=nullptr;
-    if(c.room_light_input_bindings) for(const auto& b:*c.room_light_input_bindings) if(b.texture_stage==i){binding=&b;break;}
+    if(c.extras && c.extras->room_light_input_bindings) for(const auto& b:*c.extras->room_light_input_bindings) if(b.texture_stage==i){binding=&b;break;}
     const bool exact=image && binding && binding->image==image->resource.image && binding->view==image->resource.view && binding->image_lifetime==image->descriptor_lifetime;
     FireTraceLog("texture-bind",fmt::format("frame={} cmd={} seq={} slot={} handle={:08X} generation={} payload-hash={:016X} image={} bound-image={} view={} lifetime={} exact={} logical={}x{} host={}x{} format={} mip-count={} reflected={} family={} resolved={} last-frame={} last-writer={} descriptor={} sampler={} filter={},{},{} lod-range={},{} sampler-bias={} guest-bias={} swizzle={} signs={},{},{},{} realization={}",diagnostic_submitted_frame_,diagnostic_command_index_,c.diagnostic_submit_sequence,i,r?r->handle:0,r?r->generation:0,r?r->content_hash:0,image?NativeVulkanHandleIdentity(image->resource.image):0,binding?NativeVulkanHandleIdentity(binding->image):0,binding?NativeVulkanHandleIdentity(binding->view):0,image?image->descriptor_lifetime:0,exact,image?image->logical_width:0,image?image->logical_height:0,image?image->width:0,image?image->height:0,image?uint32_t(image->format):0,image?image->mip_levels:0,image?image->is_reflection:false,image?uint32_t(image->reflection.family):0,image?image->content.resolved:false,image?image->content.last_resolved_frame:0,image?image->content.last_source_write_serial:0,c.texture_descriptor_indices[i],c.sampler_descriptor_indices[i],binding?uint32_t(binding->sampler_info.minFilter):0,binding?uint32_t(binding->sampler_info.magFilter):0,binding?uint32_t(binding->sampler_info.mipmapMode):0,binding?binding->sampler_info.minLod:0,binding?binding->sampler_info.maxLod:0,binding?binding->sampler_info.mipLodBias:0,int32_t(c.texture_fetches[i].lod_bias),uint32_t(c.texture_fetches[i].swizzle),uint32_t(c.texture_fetches[i].sign_x),uint32_t(c.texture_fetches[i].sign_y),uint32_t(c.texture_fetches[i].sign_z),uint32_t(c.texture_fetches[i].sign_w),uint32_t(c.binding_realization[i])));
     if (!cb || !fire_images_ || !image || !exact || !fire_input_images_.insert(image->descriptor_lifetime).second) continue;
@@ -229,9 +230,9 @@ void Gta4NativeGraphicsSystem::FireInputs(VkCommandBuffer cb,const NativeCommand
   }
 }
 uint32_t Gta4NativeGraphicsSystem::BeginFireQuery(VkCommandBuffer cb,const NativeCommand& c,uint32_t existing) {
-  if(!fire_frame_ || !c.fire_trace || existing!=UINT32_MAX || (c.type!=CommandType::kDrawIndexedPrimitive && c.type!=CommandType::kDrawPrimitive && c.type!=CommandType::kDrawPrimitiveUp)) return UINT32_MAX;
+  if(!fire_frame_ || !c.extras || !c.extras->fire_trace || existing!=UINT32_MAX || (c.type!=CommandType::kDrawIndexedPrimitive && c.type!=CommandType::kDrawPrimitive && c.type!=CommandType::kDrawPrimitiveUp)) return UINT32_MAX;
   auto& q=fire_queries_[active_frame_slot_];if(!q.ready || !q.pool || q.rows.size()>=128) return UINT32_MAX;
-  FireQueryRow row;row.frame=diagnostic_submitted_frame_;row.command=uint32_t(diagnostic_command_index_);row.sequence=c.diagnostic_submit_sequence;row.occurrence=c.fire_trace->occurrence;row.event=c.fire_trace->event;
+  FireQueryRow row;row.frame=diagnostic_submitted_frame_;row.command=uint32_t(diagnostic_command_index_);row.sequence=c.diagnostic_submit_sequence;row.occurrence=c.extras->fire_trace->occurrence;row.event=c.extras->fire_trace->event;
   const auto index=uint32_t(q.rows.size());q.rows.push_back(row);
   auto* provider=static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
   provider->vulkan_device()->functions().vkCmdBeginQuery(cb,q.pool,index,0);

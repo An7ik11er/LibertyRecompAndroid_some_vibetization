@@ -1,6 +1,6 @@
 // Included at the end of BindCommonDrawState after all actual allocations exist.
-if (bulb_trace_frame_ && command.bulb_trace) {
-  const auto& source=*command.bulb_trace;
+if (bulb_trace_frame_ && command.extras && command.extras->bulb_trace) {
+  const auto& source=*command.extras->bulb_trace;
   const auto equal_upload=[](const std::vector<uint8_t>* expected,const NativeUploadAllocation& allocation) {
     if(!expected || !allocation.mapping)return false;
     for(size_t i=0;i<expected->size();i+=4) {
@@ -207,7 +207,7 @@ if (NeedsBulbInterference(command, target)) {
                 image?uint32_t(image->view_components.r):0,image?uint32_t(image->view_components.g):0,
                 image?uint32_t(image->view_components.b):0,image?uint32_t(image->view_components.a):0);
   }
-  if (command.room_light_input_bindings) for (const auto& b : *command.room_light_input_bindings) {
+  if (command.extras && command.extras->room_light_input_bindings) for (const auto& b : *command.extras->room_light_input_bindings) {
     const auto& info=b.sampler_info;
     REXLOG_INFO("gta4-bulb-full: point=binding frame={} cmd={} ps={:016X} slot={} image={} view={} lifetime={} sampler={} "
                 "filter={},{},{} address={},{},{} lod={},{},{} anisotropy={},{} compare={},{} unnormalized={}",

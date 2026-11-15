@@ -106,10 +106,12 @@ bool Gta4NativeGraphicsSystem::PrepareTemporalFrame() {
   std::optional<TemporalCommand> scene;
   for (auto& command : current_frame_) {
     if (command.temporal_scene_binding || command.temporal_scene_stage != UINT32_MAX ||
-        command.temporal_prefilter || command.temporal_composite_mode) {
+        (command.extras && command.extras->temporal_prefilter) || command.temporal_composite_mode) {
       command.temporal_scene_binding = nullptr;
       command.temporal_scene_stage = UINT32_MAX;
-      command.temporal_prefilter.reset();
+      if (command.extras && command.extras->temporal_prefilter) {
+        command.extras->temporal_prefilter.reset();
+      }
       command.temporal_composite_mode = 0;
     }
     if (command.type != CommandType::kTemporalUpdate) continue;
@@ -174,7 +176,8 @@ bool Gta4NativeGraphicsSystem::PrepareTemporalFrame() {
     // will decline and the spatial fallback supplies that route for this frame.
   }
   for (auto& command : current_frame_) {
-    const auto& instance = command.temporal_instance;
+    const auto& instance =
+        command.extras ? command.extras->temporal_instance : nullptr;
     if (!instance || instance->sequence != scene->sequence || instance->epoch != scene->epoch ||
         !(instance->flags & kTemporalFinalCompositeExecution) || !command.pipeline_state ||
         !command.pipeline_state->pixel_shader_resource) continue;
@@ -192,7 +195,7 @@ bool Gta4NativeGraphicsSystem::PrepareTemporalFrame() {
       prefilter_fixed.blend_enable = 0;
       prefilter_fixed.blend_controls.fill(0x00010001u);
       prefilter_fixed.color_write_mask = 0xFu;
-      command.temporal_prefilter = std::move(prefilter);
+      command.EnsureExtras().temporal_prefilter = std::move(prefilter);
       command.temporal_composite_mode = 2;
       temporal_fields_set_ = true;
     }
@@ -233,7 +236,8 @@ void Gta4NativeGraphicsSystem::ClassifyTemporalDraw(const NativeCommand& command
   if (!temporal_active_ || temporal_resolved_ || target.is_reflection ||
       target.samples != VK_SAMPLE_COUNT_1_BIT || target.width != temporal_metadata_.width ||
       target.height != temporal_metadata_.height || !command.pipeline_state) return;
-  const auto* instance = command.temporal_instance.get();
+  const auto* instance =
+      command.extras ? command.extras->temporal_instance.get() : nullptr;
   const bool current = instance && instance->sequence == temporal_metadata_.sequence &&
       instance->epoch == temporal_metadata_.epoch;
   const auto flags = current ? instance->flags : 0;
@@ -303,7 +307,8 @@ bool Gta4NativeGraphicsSystem::BindTemporalDraw(VkCommandBuffer cb, const Native
   NativeUploadAllocation prior_vertex = vertex, prior_shared = shared, parameters_upload{};
   if (target.temporal_motion) {
     const auto& state = *command.pipeline_state;
-    const auto* instance = command.temporal_instance.get();
+    const auto* instance =
+        command.extras ? command.extras->temporal_instance.get() : nullptr;
     uint64_t generation = 0;
     temporal::GeometryKey key{};
     key.instance = instance && instance->instance ? instance->instance : XXH3_64bits(vertex.mapping, 64);
@@ -366,7 +371,8 @@ bool Gta4NativeGraphicsSystem::BindTemporalDraw(VkCommandBuffer cb, const Native
 bool Gta4NativeGraphicsSystem::ResolveTemporalScene(VkCommandBuffer cb, const NativeCommand& command,
     const NativeRenderingTarget& target, NativeFrameResources& resources) {
   if (!command.temporal_scene_binding || temporal_resolved_) return true;
-  const auto* instance = command.temporal_instance.get();
+  const auto* instance =
+      command.extras ? command.extras->temporal_instance.get() : nullptr;
   if (!temporal_active_ || !instance || instance->time_ns != temporal_composite_scope_) return false;
   auto* source = GetOrCreateTextureImage(cb, command.textures[command.temporal_scene_stage]);
   if (!source) return false;
@@ -374,8 +380,8 @@ bool Gta4NativeGraphicsSystem::ResolveTemporalScene(VkCommandBuffer cb, const Na
       {source->width, source->height}, source->layout, source->usage, source->aspect};
   auto* provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
   const auto* device = provider->vulkan_device();
-  if (command.temporal_prefilter) {
-    if (!ReplayTemporalDraw(cb, *command.temporal_prefilter, target, resources, temporal_scene_.filtered(), true))
+  if (command.extras && command.extras->temporal_prefilter) {
+    if (!ReplayTemporalDraw(cb, *command.extras->temporal_prefilter, target, resources, temporal_scene_.filtered(), true))
       return false;
     temporal::VulkanScene::Barrier(device, cb, temporal_scene_.filtered(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     color = temporal_scene_.filtered();

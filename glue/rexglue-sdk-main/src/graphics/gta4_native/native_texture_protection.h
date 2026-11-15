@@ -17,9 +17,11 @@ void VisitNativeCommandTextureGenerations(const Command& command, Visitor&& visi
     if (resource->packed_depth_source) visit(resource->packed_depth_source->generation);
   };
   texture(command.resolve_destination);
-  texture(command.depth_handoff_source);
   texture(command.present_source);
-  texture(command.postfx_half_scene);
+  if (const auto* ex = command.extras.get()) {
+    texture(ex->depth_handoff_source);
+    texture(ex->postfx_half_scene);
+  }
   for (const auto& resource : command.textures) texture(resource);
 }
 

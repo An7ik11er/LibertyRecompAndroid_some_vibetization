@@ -19,7 +19,7 @@ bool Gta4NativeGraphicsSystem::NeedsBulbInterference(const NativeCommand& comman
   if (!IsBulbInterferenceFamily(hash, command.pipeline_state->pixel_shader_resource->filename)) return false;
   if (hash == 0xF634FCEBA607E8A5ull || hash == 0x07675BF8EF5E48DCull)
     return command.diagnostic_submit_sequence == route.sequence ||
-           (command.bulb_trace && kBulbFixtures[command.bulb_trace->fixture].role == "ceiling-shade");
+           (command.extras && command.extras->bulb_trace && kBulbFixtures[command.extras->bulb_trace->fixture].role == "ceiling-shade");
   return true;
 }
 
@@ -139,7 +139,7 @@ void Gta4NativeGraphicsSystem::RecordBulbInterferenceBefore(VkCommandBuffer cb, 
                                                            const NativeRenderingTarget& target) {
   if (!NeedsBulbInterference(command, target)) return;
   RecordBulbFullImage(cb, "target-before", &command, target.color_surfaces[0]);
-  if (command.bulb_trace && target.depth_surface && target.depth_surface->samples == VK_SAMPLE_COUNT_1_BIT)
+  if (command.extras && command.extras->bulb_trace && target.depth_surface && target.depth_surface->samples == VK_SAMPLE_COUNT_1_BIT)
     RecordBulbFullImage(cb, "depth-before", &command, target.depth_surface, nullptr, VK_NULL_HANDLE,
                        VK_FORMAT_UNDEFINED, VK_IMAGE_LAYOUT_UNDEFINED, 0, 0, VK_IMAGE_ASPECT_DEPTH_BIT);
   for (uint32_t slot = 0; slot < command.textures.size(); ++slot) {

@@ -47,13 +47,13 @@ if (fire_event_active_ && command.pipeline_state) {
         diagnostic_submitted_frame_, command.diagnostic_submit_sequence, role, size,
         XXH3_64bits(bytes, size), bool(output), path.string()));
   };
-  if (command.fire_trace || (fire_images_ && ps && fire_checkpoints_["constants-" + std::to_string(ps->hash)]++ == 0)) {
+  if ((command.extras && command.extras->fire_trace) || (fire_images_ && ps && fire_checkpoints_["constants-" + std::to_string(ps->hash)]++ == 0)) {
     dump("vs-guest", vertex_constants->data(), vertex_constants->size());
     dump("ps-guest", pixel_constants->data(), pixel_constants->size());
     dump("vs-upload", vertex_constants_allocation.mapping, vertex_constants->size());
     dump("ps-upload", pixel_constants_allocation.mapping, pixel_constants->size());
     dump("shared-upload", shared_constants_allocation.mapping, sizeof(NativeSharedConstants));
-    if (command.fire_trace) {
+    if (command.extras && command.extras->fire_trace) {
       for (uint32_t stream = 0; stream < command.vertex_buffers.size(); ++stream) {
         const auto& r = command.vertex_buffers[stream]; if (!r) continue;
         const auto& b = command.pipeline_state->vertex_streams[stream];

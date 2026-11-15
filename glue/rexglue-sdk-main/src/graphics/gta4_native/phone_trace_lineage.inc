@@ -103,8 +103,8 @@ void Gta4NativeGraphicsSystem::RecordPhoneHandoffProbe(VkCommandBuffer cb,
   }
   RecordPhoneLineageImage(cb,command,frame,cmd,point,40,destination,nullptr,"forward-handoff-destination");
   NativeTextureImage* source=nullptr;
-  if (command.depth_handoff_source) {
-    const auto found=native_texture_images_.find(command.depth_handoff_source->generation);
+  if (command.extras && command.extras->depth_handoff_source) {
+    const auto found=native_texture_images_.find(command.extras->depth_handoff_source->generation);
     if (found!=native_texture_images_.end()) source=found->second.get();
   }
   RecordPhoneLineageImage(cb,command,frame,cmd,point,41,nullptr,source,"resolved-gbuffer-depth-source");
@@ -117,8 +117,8 @@ void Gta4NativeGraphicsSystem::RecordPhoneLineageInputs(VkCommandBuffer cb,
     if (!(command.used_texture_mask & (uint32_t{1}<<stage))) continue;
     // Inspect the actual descriptor realization, not merely the guest handle.
     const NativeRoomLightInputBinding* binding=nullptr;
-    if (command.room_light_input_bindings) {
-      for (const auto& b:*command.room_light_input_bindings)
+    if (command.extras && command.extras->room_light_input_bindings) {
+      for (const auto& b:*command.extras->room_light_input_bindings)
         if (b.texture_stage==stage) { binding=&b;break; }
     }
     NativeTextureImage* image=nullptr;

@@ -323,6 +323,9 @@ std::array<PublishedFusionCycle, 2> g_fusion_cycles{};
 
 
 thread_local PendingDrawPrimitiveUp g_pending_draw_primitive_up;
+constexpr uint32_t kMaxReusableDrawUpGuestBytes = 262144u;
+thread_local uint32_t g_reusable_draw_up_guest_addr = 0;
+thread_local uint32_t g_reusable_draw_up_guest_capacity = 0;
 thread_local uint32_t g_native_deferred_target_width = 0;
 thread_local uint32_t g_native_deferred_target_height = 0;
 struct NativePublishedResolution {
@@ -3529,6 +3532,36 @@ inline bool SubmitNativeDrawIndexed(DrawIndexedPrimitiveCommand& command) {
   return SubmitNativeCommand(command);
 }
 
+template <typename DrawCmd>
+inline bool SubmitNativeDrawDirect(DrawCmd& command) {
+  if (HasActiveNativeLightingContext()) [[unlikely]] {
+    ApplyDrawLightingContext(command, GetNativeLightingContextSlow());
+  }
+  if (g_active_native_capture_count.load(std::memory_order_relaxed) == 0) [[likely]] {
+    if (auto* graphics = GetNativeGraphicsSystem()) [[likely]] {
+      static const bool s_no_static_traces =
+          !FireTraceConfig().enabled && !TvTraceConfig().enabled && !PhoneTraceConfig().enabled;
+      if (s_no_static_traces && !gta4::gpu_pass::Enabled()) [[likely]] {
+        const bool accepted =
+            graphics->SubmitTitleCommand(kTitleId, kTitleCommandAbi, &command, sizeof(command));
+        GTA4_HelpTraceNativeSubmission(uint32_t(command.header.type), command.device, accepted,
+                                       false);
+        if (!accepted && rex::diagnostics::IsEnabled(rex::diagnostics::Category::kGuestHooks))
+            [[unlikely]] {
+          static std::atomic<uint64_t> rejection_count{0};
+          const uint64_t count = NextNativeHookDiagnosticCall(rejection_count);
+          if (ShouldLogNativeHookCall(count)) {
+            REXLOG_WARN("gta4-native-hook: rejected command #{} type={} size={}", count,
+                        uint32_t(command.header.type), sizeof(command));
+          }
+        }
+        return accepted;
+      }
+    }
+  }
+  return SubmitNativeCommand(command);
+}
+
 template <size_t Count>
 bool LoadFiniteGuestFloats(uint8_t* base, uint32_t address, std::array<float, Count>& values) {
   uint32_t cursor = address;
@@ -6584,7 +6617,9 @@ extern "C" void sub_82A3DAB0(PPCContext& ctx, uint8_t* base) {
   }
 
   if (g_pending_draw_primitive_up.vertex_data) {
-    FreeAlignedGuestAllocation(ctx, base, g_pending_draw_primitive_up.vertex_data);
+    if (g_pending_draw_primitive_up.vertex_data != g_reusable_draw_up_guest_addr) {
+      FreeAlignedGuestAllocation(ctx, base, g_pending_draw_primitive_up.vertex_data);
+    }
     g_pending_draw_primitive_up = {};
   }
 
@@ -6598,14 +6633,33 @@ extern "C" void sub_82A3DAB0(PPCContext& ctx, uint8_t* base) {
     return;
   }
   const uint32_t vertex_data_size = uint32_t(vertex_data_size_64);
-  const uint32_t vertex_data =
-      InvokeGuest(ctx, base, D3D_MemAllocAligned, vertex_data_size, 16).r3.u32;
+  uint32_t vertex_data = 0;
+  if (vertex_data_size <= kMaxReusableDrawUpGuestBytes) [[likely]] {
+    if (g_reusable_draw_up_guest_addr && g_reusable_draw_up_guest_capacity >= vertex_data_size)
+        [[likely]] {
+      vertex_data = g_reusable_draw_up_guest_addr;
+    } else {
+      const uint32_t alloc_size = std::max(vertex_data_size, 16384u);
+      const uint32_t grown =
+          InvokeGuest(ctx, base, D3D_MemAllocAligned, alloc_size, 16).r3.u32;
+      if (grown) {
+        if (g_reusable_draw_up_guest_addr) {
+          FreeAlignedGuestAllocation(ctx, base, g_reusable_draw_up_guest_addr);
+        }
+        g_reusable_draw_up_guest_addr = grown;
+        g_reusable_draw_up_guest_capacity = alloc_size;
+        vertex_data = grown;
+      }
+    }
+  } else {
+    vertex_data = InvokeGuest(ctx, base, D3D_MemAllocAligned, vertex_data_size, 16).r3.u32;
+  }
   if (!vertex_data) {
     ctx.r3.u32 = 0;
     return;
   }
 
-  const NativeDirtyState dirty_state = ConsumeNativeDrawDirtyState(base, device);
+  ConsumeNativeDrawDirtyStateInto(base, device, g_pending_draw_primitive_up.dirty_state);
   StoreU32(base, device + kUpCommandWriteOffset, LoadU32(base, device + 48));
   StoreU32(base, device + kUpVertexDataOffset, vertex_data);
   StoreU32(base, device + kUpVertexWordCountOffset, vertex_data_size >> 2);
@@ -6615,7 +6669,6 @@ extern "C" void sub_82A3DAB0(PPCContext& ctx, uint8_t* base) {
   g_pending_draw_primitive_up.stride = stride;
   g_pending_draw_primitive_up.vertex_data = vertex_data;
   g_pending_draw_primitive_up.vertex_data_size = vertex_data_size;
-  g_pending_draw_primitive_up.dirty_state = dirty_state;
   ctx.r3.u32 = vertex_data;
 }
 
@@ -6643,20 +6696,22 @@ extern "C" void sub_82A3DF50(PPCContext& ctx, uint8_t* base) {
 
   DrawPrimitiveUpCommand command{};
   command.device = device;
-  ApplyDrawLightingContext(command, GetNativeLightingContext());
   command.primitive_type = g_pending_draw_primitive_up.primitive_type;
   command.vertex_count = g_pending_draw_primitive_up.vertex_count;
   command.stride = g_pending_draw_primitive_up.stride;
   command.vertex_data = g_pending_draw_primitive_up.vertex_data;
   command.vertex_data_size = g_pending_draw_primitive_up.vertex_data_size;
   command.dirty_state = g_pending_draw_primitive_up.dirty_state;
-  const NativeDirtyState commit_dirty_state = ConsumeNativeDrawDirtyState(base, device);
+  NativeDirtyState commit_dirty_state{};
+  ConsumeNativeDrawDirtyStateInto(base, device, commit_dirty_state);
   for (size_t index = 0; index < command.dirty_state.words.size(); ++index) {
     command.dirty_state.words[index] |= commit_dirty_state.words[index];
   }
-  temporal_host::Draw(base,command.device);
-  SubmitNativeCommand(command);
-  FreeAlignedGuestAllocation(ctx, base, g_pending_draw_primitive_up.vertex_data);
+  temporal_host::Draw(base, command.device);
+  SubmitNativeDrawDirect(command);
+  if (g_pending_draw_primitive_up.vertex_data != g_reusable_draw_up_guest_addr) [[unlikely]] {
+    FreeAlignedGuestAllocation(ctx, base, g_pending_draw_primitive_up.vertex_data);
+  }
   g_pending_draw_primitive_up = {};
 }
 
@@ -6678,13 +6733,12 @@ extern "C" void sub_82A3DF60(PPCContext& ctx, uint8_t* base) {
   const uint32_t device = ctx.r3.u32;
   DrawPrimitiveCommand command{};
   command.device = device;
-  ApplyDrawLightingContext(command, GetNativeLightingContext());
   command.primitive_type = ctx.r4.u32;
   command.start_vertex = ctx.r5.u32;
   command.vertex_count = ctx.r6.u32;
-  command.dirty_state = ConsumeNativeDrawDirtyState(base, device);
-  temporal_host::Draw(base,command.device);
-  SubmitNativeCommand(command);
+  ConsumeNativeDrawDirtyStateInto(base, device, command.dirty_state);
+  temporal_host::Draw(base, command.device);
+  SubmitNativeDrawDirect(command);
 }
 
 void SubmitNativeResolve(uint8_t* base, uint32_t device, uint32_t flags,

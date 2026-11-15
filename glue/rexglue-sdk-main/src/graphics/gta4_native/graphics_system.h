@@ -765,14 +765,13 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
       // 48: line 0 (masks) and the owned-reference zone, contiguous.
       read_line(&used_texture_mask);
       const auto* owned = reinterpret_cast<const uint8_t*>(&shader_state);
-      const auto* owned_end = reinterpret_cast<const uint8_t*>(&extra_capture_keepalives + 1);
+      const auto* owned_end = reinterpret_cast<const uint8_t*>(&extras + 1);
       for (; owned < owned_end; owned += 64) read_line(owned);
       read_line(reinterpret_cast<const uint8_t*>(&bytes) + sizeof(bytes) - 1);
       read_line(&shader_constant_delta);
       read_line(&shader_constant_delta.pixel_constants);
       read_line(&pending_state);
       read_line(&device_snapshot);
-      read_line(&room_light_input_bindings);
     }
     // 48: NativeCommandPool, one allocation ahead: the lines the producer
     // writes for every command, for write: the reset zone (lines 0-4) and the
@@ -847,29 +846,12 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
       clear_keeping_capacity(shader_constant_delta.pixel_constants.payload);
 
       if (device_snapshot.storage) device_snapshot.storage.reset();
-      if (room_light_input_bindings) room_light_input_bindings.reset();
       if (shader_state) shader_state.reset();
       if (pipeline_state) pipeline_state.reset();
       if (index_buffer) index_buffer.reset();
-      if (environmental_data) environmental_data.reset();
-      if (fire_trace) fire_trace.reset();
-      if (bulb_trace) bulb_trace.reset();
       if (phone_trace) phone_trace.reset();
-      if (tv_trace) tv_trace.reset();
-      // 61: for every type again (batch 62 skipped them for draws). postfx_half_scene,
-      // temporal_instance, temporal_prefilter and fixed_owner are draw fields, and the capture
-      // relies on a recycled slot being empty: it assigns postfx_half_scene / temporal_instance
-      // only when it has one ("48: a recycled command's slot is already empty"). Skipped, a
-      // draw inherits the previous occupant's half-scene texture and keeps old resources alive.
-      // This runs on GtaCmdRetirer, off RenderGuest's path; the null tests are all it saves.
       if (resolve_destination) resolve_destination.reset();
-      if (depth_handoff_source) depth_handoff_source.reset();
       if (present_source) present_source.reset();
-      if (postfx_half_scene) postfx_half_scene.reset();
-      if (temporal_instance) temporal_instance.reset();
-      if (temporal_prefilter) temporal_prefilter.reset();
-      if (synchronous) synchronous.reset();
-      if (fixed_owner) fixed_owner.reset();  // 48
 
       for (uint32_t mask = stream_mask; mask; mask &= mask - 1) {
         const uint32_t stream = uint32_t(std::countr_zero(mask));
@@ -883,10 +865,10 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
       for (auto& vb : vertex_buffers) if (vb) vb.reset();
       for (auto& tex : textures) if (tex) tex.reset();
 #endif
+      if (extras) [[unlikely]] extras.reset();
       // Owners are released last, after every non-owning slot above is cleared.
       if (snapshot_keepalive) snapshot_keepalive.reset();
       if (capture_keepalive) capture_keepalive.reset();
-      if (!extra_capture_keepalives.empty()) extra_capture_keepalives.clear();
     }
 
     void HoldCaptureKeepAlive(const std::shared_ptr<CaptureKeepAlive>& keepalive) {
@@ -895,10 +877,11 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
         capture_keepalive = keepalive;
         return;
       }
-      for (const auto& extra : extra_capture_keepalives) {
+      auto& extra_keepalives = EnsureExtras().extra_capture_keepalives;
+      for (const auto& extra : extra_keepalives) {
         if (extra.get() == keepalive.get()) return;
       }
-      extra_capture_keepalives.push_back(keepalive);
+      extra_keepalives.push_back(keepalive);
     }
 
     // Phase 2 (runs on RenderGuest in NativeCommandPool::Make on Big/Prime
@@ -1083,23 +1066,60 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     std::shared_ptr<const NativeBufferResource> index_buffer;
     std::shared_ptr<CaptureKeepAlive> capture_keepalive;
     std::shared_ptr<SnapshotKeepAlive> snapshot_keepalive;
+    static constexpr uint32_t kProtectedGenerationCapacity = 14;
+    struct ColdExtras {
+      std::shared_ptr<const FireTraceContext> fire_trace;
+      std::shared_ptr<const BulbSourceSnapshot> bulb_trace;
+      std::shared_ptr<TvTraceContext> tv_trace;
+      std::shared_ptr<const EnvironmentalDataV2> environmental_data;
+      std::shared_ptr<const NativeTextureResource> depth_handoff_source;
+      std::shared_ptr<const NativeTextureResource> postfx_half_scene;
+      std::shared_ptr<const TemporalCommand> temporal_instance;
+      std::shared_ptr<NativeCommand> temporal_prefilter;
+      std::shared_ptr<SynchronousCommand> synchronous;
+      std::shared_ptr<const NativeFixedFunctionState> fixed_owner;
+      std::shared_ptr<std::vector<NativeRoomLightInputBinding>> room_light_input_bindings;
+      std::vector<std::shared_ptr<CaptureKeepAlive>> extra_capture_keepalives;
+      mutable std::array<uint64_t, kProtectedGenerationCapacity> protected_generations{};
+    };
+    template <typename T>
+    struct CopyablePtr {
+      std::unique_ptr<T> ptr;
+      CopyablePtr() = default;
+      CopyablePtr(CopyablePtr&&) noexcept = default;
+      CopyablePtr& operator=(CopyablePtr&&) noexcept = default;
+      CopyablePtr(const CopyablePtr& other)
+          : ptr(other.ptr ? std::make_unique<T>(*other.ptr) : nullptr) {}
+      CopyablePtr& operator=(const CopyablePtr& other) {
+        if (this != &other) {
+          ptr = other.ptr ? std::make_unique<T>(*other.ptr) : nullptr;
+        }
+        return *this;
+      }
+      explicit operator bool() const noexcept { return bool(ptr); }
+      T* get() const noexcept { return ptr.get(); }
+      T* operator->() const noexcept { return ptr.get(); }
+      T& operator*() const noexcept { return *ptr; }
+      void reset() noexcept { ptr.reset(); }
+    };
+    mutable CopyablePtr<ColdExtras> extras;
     // Checked for every command by the recorder's merge scans.
-    std::shared_ptr<const FireTraceContext> fire_trace;
-    std::shared_ptr<const BulbSourceSnapshot> bulb_trace;
     std::shared_ptr<PhoneTraceContext> phone_trace;
-    std::shared_ptr<TvTraceContext> tv_trace;
-    std::shared_ptr<const EnvironmentalDataV2> environmental_data;
     std::shared_ptr<const NativeTextureResource> resolve_destination;
-    std::shared_ptr<const NativeTextureResource> depth_handoff_source;
     std::shared_ptr<const NativeTextureResource> present_source;
-    std::shared_ptr<const NativeTextureResource> postfx_half_scene;
-    std::shared_ptr<const TemporalCommand> temporal_instance;
-    std::shared_ptr<NativeCommand> temporal_prefilter;
-    std::shared_ptr<SynchronousCommand> synchronous;
-    // 48: owner of a worker-side fixed-state variant (depth clamp, temporal
-    // prefilter); fixed_function_state then points into it.
-    std::shared_ptr<const NativeFixedFunctionState> fixed_owner;
-    std::vector<std::shared_ptr<CaptureKeepAlive>> extra_capture_keepalives;
+
+    ColdExtras& EnsureExtras() {
+      if (!extras.ptr) [[unlikely]] {
+        extras.ptr = std::make_unique<ColdExtras>();
+      }
+      return *extras.ptr;
+    }
+    const ColdExtras& EnsureExtras() const {
+      if (!extras.ptr) [[unlikely]] {
+        extras.ptr = std::make_unique<ColdExtras>();
+      }
+      return *extras.ptr;
+    }
 
     NativeCommandBytes bytes;
     NativeShaderConstantDelta shader_constant_delta;
@@ -1118,15 +1138,6 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     std::array<std::shared_ptr<const NativeTextureResource>, kTextureStageCount> textures{};
     std::array<NativeBindingRealization, kTextureStageCount> binding_realization{};
     std::array<xenos::xe_gpu_texture_fetch_t, kTextureStageCount> texture_fetches{};
-    // Texture generations retained for this command when it was queued, so
-    // the worker's release walks a dense array instead of chasing every
-    // texture slot's resource again (under the queue lock).
-    // 49: 14, not 16: room for queue_epoch without one more cache line (with
-    // epoch protection the array is not used; more generations: overflow path).
-    static constexpr uint32_t kProtectedGenerationCapacity = 14;
-    mutable std::array<uint64_t, kProtectedGenerationCapacity> protected_generations;
-    // Diagnostic-only heap sidecar captured by normal descriptor realization.
-    std::shared_ptr<std::vector<NativeRoomLightInputBinding>> room_light_input_bindings;
 
     // 48: the lighting context is part of the title draw command (bytes); a
     // second 72-byte copy per command is gone. Non-draw commands: default.
@@ -2455,9 +2466,11 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
       if (resource->packed_depth_source) visit(resource->packed_depth_source->generation);
     };
     texture(command.resolve_destination);
-    texture(command.depth_handoff_source);
     texture(command.present_source);
-    texture(command.postfx_half_scene);
+    if (const auto* ex = command.extras.get()) {
+      texture(ex->depth_handoff_source);
+      texture(ex->postfx_half_scene);
+    }
     for (uint32_t mask = command.used_texture_mask; mask; mask &= mask - 1) {
       const uint32_t stage = uint32_t(std::countr_zero(mask));
       if (stage < command.textures.size()) texture(command.textures[stage]);
@@ -3341,7 +3354,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   static NativeFixedFunctionState& MutableOwnedFixedState(NativeCommand& command) {
     auto owned = std::make_shared<NativeFixedFunctionState>(*command.fixed_function_state);
     NativeFixedFunctionState& state = *owned;
-    command.fixed_owner = std::move(owned);
+    command.EnsureExtras().fixed_owner = std::move(owned);
     command.fixed_function_state = NativeStateRef<NativeFixedFunctionState>(&state);
     return state;
   }
@@ -4163,8 +4176,8 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     uint64_t vertex_shader_hash = 0;
     uint64_t pixel_shader_hash = 0;
     uint64_t vertex_declaration_hash = 0;
+    uint64_t memo_sig = 0;
     std::array<uint32_t, kVertexStreamCount> strides{};
-    NativeFixedFunctionState fixed{};
     NativePipelineLookupContext<kRenderTargetCount> context{};
     VkPipeline pipeline = VK_NULL_HANDLE;
   };
