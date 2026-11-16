@@ -22,6 +22,7 @@
 #include "native_spirv_ubo_constants.h"
 #include "native_spirv_ubo_shared.h"
 #include "native_spirv_constant_range.h"
+#include "native_spirv_vertex_compact.h"
 #include "native_fixed_state_hash.h"
 #include "native_cpu_profile_scope.h"
 #include "native_profile_shader_category.h"
@@ -2889,7 +2890,8 @@ VertexPayloadConversionCounts ConvertGuestVertexPayload(uint8_t* destination, co
     }
     const auto shader_input = std::find_if(
         shader.vertex_inputs.begin(), shader.vertex_inputs.end(), [&element](const auto& input) {
-          return input.location == ConvertVertexUsageToLocation(element.usage, element.usage_index);
+          const uint32_t loc = input.original_location ? input.original_location : input.location;
+          return loc == ConvertVertexUsageToLocation(element.usage, element.usage_index);
         });
     if (shader_input == shader.vertex_inputs.end()) {
       continue;
@@ -4336,6 +4338,9 @@ bool Gta4NativeGraphicsSystem::SubmitDirectDrawIndexed(const DrawIndexedPrimitiv
   }
   if (command.batch_vb != 0) [[likely]] {
     __builtin_prefetch(&buffer_capture_l1_table_[BufferL1SetBase(command.batch_vb)], 0, 3);
+  }
+  if (command.batch_vb1 != 0) [[unlikely]] {
+    __builtin_prefetch(&buffer_capture_l1_table_[BufferL1SetBase(command.batch_vb1)], 0, 3);
   }
   producer_constant_commit_ = false;
   {
@@ -5880,10 +5885,51 @@ bool Gta4NativeGraphicsSystem::CaptureDrawCommandBody(
       return reject(header.type, "vertex-state-translation");
     }
     const std::span<const uint8_t> device_state(device_memory, kGuestDeviceSize);
+    const auto capture_device_streams = [&](auto capture_fn) {
+#if defined(__aarch64__)
+      const uint8_t* s_ptr = device_state.data() + kStreamBufferBase + sizeof(uint32_t);
+      const uint32x4_t q0 = vld1q_u32(reinterpret_cast<const uint32_t*>(s_ptr));
+      const uint32x4_t q1 = vld1q_u32(reinterpret_cast<const uint32_t*>(s_ptr + 16));
+      const uint32x4_t q2 = vld1q_u32(reinterpret_cast<const uint32_t*>(s_ptr + 32));
+      const uint32x4_t q3 = vld1q_u32(reinterpret_cast<const uint32_t*>(s_ptr + 48));
+      const uint32x4_t or_all = vorrq_u32(vorrq_u32(q0, q1), vorrq_u32(q2, q3));
+      if (vmaxvq_u32(or_all) != 0) [[unlikely]] {
+        for (uint32_t stream = 1; stream < kVertexStreamCount; ++stream) {
+          if (const uint32_t handle =
+                  LoadGuestWord(device_state, kStreamBufferBase + stream * sizeof(uint32_t))) {
+            if (capture_fn(handle, native_command.vertex_buffers[stream])) {
+              native_command.captured_stream_mask |= uint32_t{1} << stream;
+            }
+          }
+        }
+      }
+#else
+      const uint8_t* s_ptr = device_state.data() + kStreamBufferBase + sizeof(uint32_t);
+      uint64_t any_hi_stream = 0;
+      for (size_t i = 0; i < 8; ++i) {
+        uint64_t pair = 0;
+        std::memcpy(&pair, s_ptr + i * sizeof(uint64_t), sizeof(uint64_t));
+        any_hi_stream |= pair;
+      }
+      if (any_hi_stream != 0) [[unlikely]] {
+        for (uint32_t stream = 1; stream < kVertexStreamCount; ++stream) {
+          if (const uint32_t handle =
+                  LoadGuestWord(device_state, kStreamBufferBase + stream * sizeof(uint32_t))) {
+            if (capture_fn(handle, native_command.vertex_buffers[stream])) {
+              native_command.captured_stream_mask |= uint32_t{1} << stream;
+            }
+          }
+        }
+      }
+#endif
+    };
     if (is_draw_indexed && static_cast<const DrawIndexedPrimitiveCommand*>(command)->batch_vb != 0) [[likely]] {
       const auto& draw_indexed = *static_cast<const DrawIndexedPrimitiveCommand*>(command);
       if (draw_indexed.batch_ib != 0) [[likely]] {
         __builtin_prefetch(&buffer_capture_l1_table_[BufferL1SetBase(draw_indexed.batch_ib)], 0, 3);
+      }
+      if (draw_indexed.batch_vb1 != 0) [[unlikely]] {
+        __builtin_prefetch(&buffer_capture_l1_table_[BufferL1SetBase(draw_indexed.batch_vb1)], 0, 3);
       }
       const uint64_t clear_epoch = SyncBufferCaptureTables();
       const uint32_t current_frame =
@@ -5891,6 +5937,16 @@ bool Gta4NativeGraphicsSystem::CaptureDrawCommandBody(
       if (CaptureBufferResourceIntoEpoch(draw_indexed.batch_vb, clear_epoch, current_frame,
                                          native_command, native_command.vertex_buffers[0])) {
         native_command.captured_stream_mask = 1u;
+      }
+      if (draw_indexed.batch_vb1 != 0) [[unlikely]] {
+        if (CaptureBufferResourceIntoEpoch(draw_indexed.batch_vb1, clear_epoch, current_frame,
+                                           native_command, native_command.vertex_buffers[1])) {
+          native_command.captured_stream_mask |= 2u;
+        }
+      } else {
+        capture_device_streams([&](uint32_t handle, auto& out_res) {
+          return CaptureBufferResourceIntoEpoch(handle, clear_epoch, current_frame, native_command, out_res);
+        });
       }
       if (draw_indexed.batch_ib != 0) {
         CaptureBufferResourceIntoEpoch(draw_indexed.batch_ib, clear_epoch, current_frame,
@@ -5905,27 +5961,9 @@ bool Gta4NativeGraphicsSystem::CaptureDrawCommandBody(
           native_command.captured_stream_mask = 1u;
         }
       }
-      // Fast-check if any stream 1..15 has a non-zero handle in guest memory before looping.
-      const uint8_t* s_ptr = device_state.data() + kStreamBufferBase + sizeof(uint32_t);
-      uint64_t any_hi_stream = 0;
-      for (size_t i = 0; i < 7; ++i) {
-        uint64_t pair = 0;
-        std::memcpy(&pair, s_ptr + i * sizeof(uint64_t), sizeof(uint64_t));
-        any_hi_stream |= pair;
-      }
-      uint32_t last_word = 0;
-      std::memcpy(&last_word, s_ptr + 14 * sizeof(uint32_t), sizeof(uint32_t));
-      if ((any_hi_stream | last_word) != 0) [[unlikely]] {
-        for (uint32_t stream = 1; stream < kVertexStreamCount; ++stream) {
-          if (const uint32_t handle =
-                  LoadGuestWord(device_state, kStreamBufferBase + stream * sizeof(uint32_t))) {
-            if (CaptureBufferResourceInto(handle, native_command,
-                                          native_command.vertex_buffers[stream])) {
-              native_command.captured_stream_mask |= uint32_t{1} << stream;
-            }
-          }
-        }
-      }
+      capture_device_streams([&](uint32_t handle, auto& out_res) {
+        return CaptureBufferResourceInto(handle, native_command, out_res);
+      });
       if (is_draw_indexed) {
         const uint32_t handle = LoadGuestWord(device_state, kIndexBufferOffset);
         if (handle) {
@@ -6324,13 +6362,14 @@ bool Gta4NativeGraphicsSystem::CaptureBufferResourceIntoEpoch(
         bool promoted = (matched->alias_serial == current_serial);
         if (!promoted) [[unlikely]] {
           const uint32_t set_base = BufferFastSetBase(handle);
-          BufferMruEntry& w0 = buffer_capture_fast_table_[set_base];
-          BufferMruEntry& w1 = buffer_capture_fast_table_[set_base + 1];
           BufferMruEntry* hit_entry = nullptr;
-          if (w0.handle == handle && w0.strong_ref && w0.strong_ref.get() == matched->raw) {
-            hit_entry = &w0;
-          } else if (w1.handle == handle && w1.strong_ref && w1.strong_ref.get() == matched->raw) {
-            hit_entry = &w1;
+          for (size_t way = 0; way < kBufferCaptureFastWays; ++way) {
+            auto& candidate = buffer_capture_fast_table_[set_base + way];
+            if (candidate.handle == handle && candidate.strong_ref &&
+                candidate.strong_ref.get() == matched->raw) {
+              hit_entry = &candidate;
+              break;
+            }
           }
           if (hit_entry && hit_entry->epoch == clear_epoch) {
             if (!capture_keepalive_ || capture_keepalive_->refs.size() >= kCaptureKeepAliveLimit) {
@@ -6391,17 +6430,16 @@ bool Gta4NativeGraphicsSystem::CaptureBufferResourceIntoSlow(
         const uint32_t data_address = metadata->guest_address;
         const uint32_t data_size = metadata->guest_size;
 
-        // Tier 2: 2-way associative 512 KB static buffer cache.
+        // Tier 2: 4-way associative 1 MB static buffer cache.
         const uint32_t set_base = BufferFastSetBase(handle);
-        BufferMruEntry& w0 = buffer_capture_fast_table_[set_base];
-        BufferMruEntry& w1 = buffer_capture_fast_table_[set_base + 1];
         BufferMruEntry* hit_entry = nullptr;
-        if (w0.handle == handle && w0.epoch == clear_epoch && w0.strong_ref &&
-            w0.flags == flags && w0.address == data_address && w0.size == data_size) {
-          hit_entry = &w0;
-        } else if (w1.handle == handle && w1.epoch == clear_epoch && w1.strong_ref &&
-                   w1.flags == flags && w1.address == data_address && w1.size == data_size) {
-          hit_entry = &w1;
+        for (size_t way = 0; way < kBufferCaptureFastWays; ++way) {
+          auto& candidate = buffer_capture_fast_table_[set_base + way];
+          if (candidate.handle == handle && candidate.epoch == clear_epoch && candidate.strong_ref &&
+              candidate.flags == flags && candidate.address == data_address && candidate.size == data_size) {
+            hit_entry = &candidate;
+            break;
+          }
         }
         if (hit_entry) [[likely]] {
           const NativeBufferResource* raw = hit_entry->strong_ref.get();
@@ -6499,13 +6537,14 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
         bool promoted = (matched->alias_serial == current_serial);
         if (!promoted) [[unlikely]] {
           const uint32_t set_base = BufferFastSetBase(handle);
-          BufferMruEntry& w0 = buffer_capture_fast_table_[set_base];
-          BufferMruEntry& w1 = buffer_capture_fast_table_[set_base + 1];
           BufferMruEntry* hit_entry = nullptr;
-          if (w0.handle == handle && w0.strong_ref && w0.strong_ref.get() == matched->raw) {
-            hit_entry = &w0;
-          } else if (w1.handle == handle && w1.strong_ref && w1.strong_ref.get() == matched->raw) {
-            hit_entry = &w1;
+          for (size_t way = 0; way < kBufferCaptureFastWays; ++way) {
+            auto& candidate = buffer_capture_fast_table_[set_base + way];
+            if (candidate.handle == handle && candidate.strong_ref &&
+                candidate.strong_ref.get() == matched->raw) {
+              hit_entry = &candidate;
+              break;
+            }
           }
           if (hit_entry && hit_entry->epoch == clear_epoch) {
             if (!capture_keepalive_ || capture_keepalive_->refs.size() >= kCaptureKeepAliveLimit) {
@@ -6568,16 +6607,15 @@ Gta4NativeGraphicsSystem::CaptureBufferResource(uint32_t handle) {
   const uint32_t set_base = BufferFastSetBase(handle);
 
   if (use_keepalive && current_serial && !metadata->guest_locked) [[likely]] {
-    // Tier 2 (Batch 89): 2-way associative 512 KB static buffer cache.
-    BufferMruEntry& w0 = buffer_capture_fast_table_[set_base];
-    BufferMruEntry& w1 = buffer_capture_fast_table_[set_base + 1];
+    // Tier 2 (Batch 106): 4-way associative 1 MB static buffer cache.
     BufferMruEntry* hit_entry = nullptr;
-    if (w0.handle == handle && w0.epoch == clear_epoch && w0.strong_ref &&
-        w0.flags == flags && w0.address == data_address && w0.size == data_size) {
-      hit_entry = &w0;
-    } else if (w1.handle == handle && w1.epoch == clear_epoch && w1.strong_ref &&
-               w1.flags == flags && w1.address == data_address && w1.size == data_size) {
-      hit_entry = &w1;
+    for (size_t way = 0; way < kBufferCaptureFastWays; ++way) {
+      auto& candidate = buffer_capture_fast_table_[set_base + way];
+      if (candidate.handle == handle && candidate.epoch == clear_epoch && candidate.strong_ref &&
+          candidate.flags == flags && candidate.address == data_address && candidate.size == data_size) {
+        hit_entry = &candidate;
+        break;
+      }
     }
     if (hit_entry) [[likely]] {
       const NativeBufferResource* raw = hit_entry->strong_ref.get();
@@ -6614,19 +6652,25 @@ Gta4NativeGraphicsSystem::CaptureBufferResourceSlotSlow(
 
   auto record_l2_and_l1 = [&](const std::shared_ptr<const NativeBufferResource>& ref) {
     if (!ref) return;
-    BufferMruEntry& w0 = buffer_capture_fast_table_[set_base];
-    BufferMruEntry& w1 = buffer_capture_fast_table_[set_base + 1];
     BufferMruEntry* target = nullptr;
-    if (w0.handle == handle || w0.handle == 0 || !w0.strong_ref) {
-      target = &w0;
-    } else if (w1.handle == handle || w1.handle == 0 || !w1.strong_ref) {
-      target = &w1;
-    } else if (w0.alias_serial != capture_keepalive_serial_) {
-      target = &w0;
-    } else if (w1.alias_serial != capture_keepalive_serial_) {
-      target = &w1;
-    } else {
-      target = &buffer_capture_fast_table_[set_base + ((++buffer_fast_replace_rr_) & 1u)];
+    for (size_t way = 0; way < kBufferCaptureFastWays; ++way) {
+      auto& candidate = buffer_capture_fast_table_[set_base + way];
+      if (candidate.handle == handle || candidate.handle == 0 || !candidate.strong_ref) {
+        target = &candidate;
+        break;
+      }
+    }
+    if (!target) {
+      for (size_t way = 0; way < kBufferCaptureFastWays; ++way) {
+        auto& candidate = buffer_capture_fast_table_[set_base + way];
+        if (candidate.alias_serial != capture_keepalive_serial_) {
+          target = &candidate;
+          break;
+        }
+      }
+    }
+    if (!target) {
+      target = &buffer_capture_fast_table_[set_base + ((++buffer_fast_replace_rr_) & (kBufferCaptureFastWays - 1u))];
     }
     const NativeBufferResource* raw = ref.get();
     if (target->handle && target->handle != handle) {
@@ -8917,6 +8961,25 @@ void Gta4NativeGraphicsSystem::RenderWorkerLoop(WorkerLoopMode mode) {
                 s0.stride_words = stride_words;
                 ++pipeline_state_.version;
               }
+              if (draw_indexed.batch_vb1 != 0) {
+                auto& s1 = pipeline_state_.vertex_streams[1];
+                const uint32_t stride_words1 = (draw_indexed.batch_stride1 >> 2) & 0xFF;
+                if (s1.buffer != draw_indexed.batch_vb1 || s1.offset != 0 ||
+                    s1.stride != draw_indexed.batch_stride1 || s1.stride_words != stride_words1) {
+                  s1.buffer = draw_indexed.batch_vb1;
+                  s1.offset = 0;
+                  s1.stride = draw_indexed.batch_stride1;
+                  s1.stride_words = stride_words1;
+                  ++pipeline_state_.version;
+                }
+              } else if (pipeline_state_.vertex_streams[1].buffer != 0) {
+                auto& s1 = pipeline_state_.vertex_streams[1];
+                s1.buffer = 0;
+                s1.offset = 0;
+                s1.stride = 0;
+                s1.stride_words = 0;
+                ++pipeline_state_.version;
+              }
             }
           }
           // 48: the captured state is a shared read-only block; a changed clamp
@@ -10263,8 +10326,9 @@ bool Gta4NativeGraphicsSystem::InitializeShaderCache() {
   return true;
 }
 
-bool Gta4NativeGraphicsSystem::ReflectVertexInputs(const std::vector<uint32_t>& spirv,
-                                                   std::vector<NativeVertexInput>& inputs) {
+bool Gta4NativeGraphicsSystem::ReflectVertexInputs(
+    const std::vector<uint32_t>& spirv, std::vector<NativeVertexInput>& inputs,
+    const std::unordered_map<uint32_t, uint32_t>& new_to_orig) {
   inputs.clear();
   if (spirv.size() < 5 || spirv[0] != kSpirvMagic || !spirv[3]) {
     return false;
@@ -10387,7 +10451,13 @@ bool Gta4NativeGraphicsSystem::ReflectVertexInputs(const std::vector<uint32_t>& 
     if (!component_count || component_count > 4) {
       return false;
     }
-    inputs.push_back({locations[variable.id], numeric_type, component_count});
+    const uint32_t loc = locations[variable.id];
+    uint32_t orig_loc = loc;
+    const auto remap_it = new_to_orig.find(loc);
+    if (remap_it != new_to_orig.end()) {
+      orig_loc = remap_it->second;
+    }
+    inputs.push_back({loc, numeric_type, component_count, orig_loc});
   }
 
   std::sort(inputs.begin(), inputs.end(),
@@ -10722,6 +10792,15 @@ void Gta4NativeGraphicsSystem::RegisterShader(const RegisterShaderCommand& comma
     RemapSpirvDrawDescriptorSets(stock_late_spirv);
     apply_loop_watchdog(stock_early_spirv);
     apply_loop_watchdog(stock_late_spirv);
+    std::unordered_map<uint32_t, uint32_t> vertex_location_remap;
+    if (command.stage == ShaderStage::kVertex) {
+      const auto& vertex_limits = vulkan_device->properties();
+      CompactSpirvVertexInputs(stock_early_spirv, vertex_limits.maxVertexInputAttributes, vertex_location_remap);
+      if (!stock_late_spirv.empty()) {
+        std::unordered_map<uint32_t, uint32_t> unused_map;
+        CompactSpirvVertexInputs(stock_late_spirv, vertex_limits.maxVertexInputAttributes, unused_map);
+      }
+    }
     const uint32_t constant_bank = command.stage == ShaderStage::kVertex ? 0 : 1;
     uint32_t upload_constant_bytes =
         AnalyzeSpirvConstantRange(stock_early_spirv.data(), stock_early_spirv.size()).bytes[constant_bank];
@@ -10800,7 +10879,7 @@ void Gta4NativeGraphicsSystem::RegisterShader(const RegisterShaderCommand& comma
       }
     }
     if (command.stage == ShaderStage::kVertex &&
-        !ReflectVertexInputs(stock_early_spirv, resource->vertex_inputs)) {
+        !ReflectVertexInputs(stock_early_spirv, resource->vertex_inputs, vertex_location_remap)) {
       if (stock_late_module) {
         profile::CpuCall(profile::CpuOp::kDriverDestruction, [&] { return dfn.vkDestroyShaderModule(device, stock_late_module, nullptr); });
       }
@@ -11007,7 +11086,10 @@ void Gta4NativeGraphicsSystem::RegisterShader(const RegisterShaderCommand& comma
     if (command.stage == ShaderStage::kVertex) {
       const auto blend_indices =
           std::find_if(resource->vertex_inputs.begin(), resource->vertex_inputs.end(),
-                       [](const NativeVertexInput& input) { return input.location == 18; });
+                       [](const NativeVertexInput& input) {
+                         const uint32_t loc = input.original_location ? input.original_location : input.location;
+                         return loc == 18;
+                       });
       if (blend_indices != resource->vertex_inputs.end()) {
         static std::atomic<uint64_t> blend_indices_shader_count{0};
         const uint64_t index = NextNativeTraceDiagnosticCount(blend_indices_shader_count);
@@ -25414,9 +25496,10 @@ VkPipeline Gta4NativeGraphicsSystem::GetOrCreatePipeline(
       return reject("vertex-input-location-limit");
     }
     const VertexElement* matching_element = nullptr;
+    const uint32_t match_loc = shader_input.original_location ? shader_input.original_location : shader_input.location;
     for (const VertexElement& element : state.vertex_declaration_resource->elements) {
       if (ConvertVertexUsageToLocation(element.usage, element.usage_index) ==
-          shader_input.location) {
+          match_loc) {
         matching_element = &element;
         break;
       }
@@ -27760,10 +27843,11 @@ bool Gta4NativeGraphicsSystem::GetRequiredVertexStreams(
   uint32_t mask = 0;
   required_streams.fill(false);
   for (const NativeVertexInput& shader_input : vs->vertex_inputs) {
+    const uint32_t match_loc = shader_input.original_location ? shader_input.original_location : shader_input.location;
     const VertexElement* matching_element = nullptr;
     for (const VertexElement& element : vdecl->elements) {
       if (ConvertVertexUsageToLocation(element.usage, element.usage_index) ==
-          shader_input.location) {
+          match_loc) {
         matching_element = &element;
         break;
       }
@@ -27811,10 +27895,11 @@ bool Gta4NativeGraphicsSystem::GetRequiredVertexStreamsMask(
   }
   uint32_t mask = 0;
   for (const NativeVertexInput& shader_input : vs->vertex_inputs) {
+    const uint32_t match_loc = shader_input.original_location ? shader_input.original_location : shader_input.location;
     const VertexElement* matching_element = nullptr;
     for (const VertexElement& element : vdecl->elements) {
       if (ConvertVertexUsageToLocation(element.usage, element.usage_index) ==
-          shader_input.location) {
+          match_loc) {
         matching_element = &element;
         break;
       }
@@ -28411,14 +28496,16 @@ bool Gta4NativeGraphicsSystem::RecordIndexedPrimitive(VkCommandBuffer command_bu
     const auto& stream_state = command.pipeline_state->vertex_streams[stream];
     const auto& resource = command.vertex_buffers[stream];
     if (!stream_state.stride || !resource || stream_state.offset >= resource->payload.size()) {
+      static std::atomic<uint32_t> raw_rejection_count{0};
+      const uint32_t raw_count = raw_rejection_count.fetch_add(1, std::memory_order_relaxed);
       static std::atomic<uint64_t> stream_rejection_count{0};
       const uint64_t count = NextNativeTraceDiagnosticCount(stream_rejection_count);
-      if (count <= 64 || !(count % 1024)) {
+      if (raw_count < 8 || (count <= 64 || !(count % 1024))) {
         REXLOG_WARN(
-            "gta4-native-diag: vertex stream reject #{} indexed=true stream={} "
+            "gta4-native-diag: vertex stream reject #{} (raw #{}) indexed=true stream={} "
             "state-handle={:08X} snapshot-handle={:08X} stride={} offset={} "
             "resource={} resource-size={}",
-            count, stream, stream_state.buffer,
+            count, raw_count, stream, stream_state.buffer,
             LoadGuestWord(command.device_snapshot, kStreamBufferBase + stream * sizeof(uint32_t)),
             stream_state.stride, stream_state.offset, resource ? "yes" : "no",
             resource ? resource->payload.size() : 0);

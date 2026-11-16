@@ -254,6 +254,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     uint32_t location = 0;
     NativeVertexNumericType numeric_type = NativeVertexNumericType::kFloat;
     uint32_t component_count = 0;
+    uint32_t original_location = 0;
 
     bool operator==(const NativeVertexInput&) const = default;
   };
@@ -2202,7 +2203,8 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
                              VkIndexType index_type);
   bool InitializeShaderCache();
   static bool ReflectVertexInputs(const std::vector<uint32_t>& spirv,
-                                  std::vector<NativeVertexInput>& inputs);
+                                  std::vector<NativeVertexInput>& inputs,
+                                  const std::unordered_map<uint32_t, uint32_t>& new_to_orig = {});
   ShaderOverrideSelection ResolvePipelineShaderOverrides(
       const NativeShader* vertex_shader, const NativeShader* pixel_shader,
       VkSampleCountFlagBits rasterization_samples) const;
@@ -3155,10 +3157,10 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     std::shared_ptr<const NativeBufferResource> strong_ref;
   };
   static_assert(sizeof(BufferMruEntry) == 64);
-  // Batch 89: 2-way associative L2 table (4096 sets x 2 ways = 8192 entries, 512 KB)
-  // eliminates 1-way direct-mapped hash ping-pong while halving footprint.
+  // Batch 106: 4-way associative L2 table (4096 sets x 4 ways = 16384 entries, 1024 KB)
+  // eliminates multi-buffer conflict misses on cutscene transitions and streamed meshes.
   static constexpr size_t kBufferCaptureFastSetCount = 4096;
-  static constexpr size_t kBufferCaptureFastWays = 2;
+  static constexpr size_t kBufferCaptureFastWays = 4;
   static constexpr size_t kBufferCaptureFastTableSize =
       kBufferCaptureFastSetCount * kBufferCaptureFastWays;
   static constexpr uint32_t kBufferCaptureFastTableMask = kBufferCaptureFastTableSize - 1;

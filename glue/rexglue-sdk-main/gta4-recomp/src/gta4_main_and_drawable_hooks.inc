@@ -275,6 +275,52 @@ extern "C" void sub_828CC1A0(PPCContext& ctx, uint8_t* base) {
 }
 
 // -----------------------------------------------------------------------------
+// 3c. FastSub828C6568: rage::grmShader::BeginPasses (gta4_recomp.70.cpp:55579-55688)
+// Eliminates 128-byte stack allocation, cr6 condition register emulation,
+// and redundant PPC register copying around the technique lookup.
+// -----------------------------------------------------------------------------
+extern "C" void FastSub828C6568(PPCContext& ctx, uint8_t* base) {
+  REX_FUNC_PROLOGUE();
+  const uint32_t shader = ctx.r3.u32;
+  const uint32_t r30_off = ctx.r4.u32;
+  const uint8_t restore_flag = ctx.r5.u8;
+  const uint32_t r29_override = ctx.r6.u32;
+
+  constexpr uint32_t kGlobalTechnique = 0x82B2A3B0u;  // -2102329344 - 11784
+  constexpr uint32_t kGlobalBase = 0x831C0000u;       // lis -31972
+
+  uint32_t technique = REX_LOAD_U32(kGlobalTechnique);
+  if (static_cast<int32_t>(technique) == -1) [[unlikely]] {
+    ctx.r3.s64 = 1;
+    ctx.lr = 0x828C659Cu;
+    sub_828C20B0(ctx, base);
+    if (ctx.r3.s32 != 0) {
+      technique = REX_LOAD_U32(kGlobalTechnique + 4u);
+    } else {
+      technique = REX_LOAD_U32(kGlobalTechnique + 8u);
+    }
+  }
+
+  uint32_t tech_idx = (r29_override != 0u) ? r29_override : 0u;
+  if (r29_override == 0u) {
+    const uint32_t shader_tech_table = REX_LOAD_U32(shader + 64u);
+    const uint32_t tech_offset = technique * 3u;
+    tech_idx = static_cast<uint32_t>(REX_LOAD_U8(shader_tech_table + tech_offset + r30_off));
+  }
+
+  if (tech_idx != 0u) [[likely]] {
+    REX_STORE_U8(kGlobalBase + 15833u, restore_flag);
+    const uint32_t effect_data = REX_LOAD_U32(shader + 24u);
+    const uint32_t pass_array = REX_LOAD_U32(effect_data);
+    const uint32_t pass_info = pass_array + (tech_idx << 4) - 16u;
+    REX_STORE_U32(kGlobalBase + 15840u, pass_info);
+    ctx.r3.u64 = static_cast<uint64_t>(REX_LOAD_U16(pass_info + 12u));
+  } else {
+    ctx.r3.u64 = 0u;
+  }
+}
+
+// -----------------------------------------------------------------------------
 // 4. FastSub828C6620: rage::grmShader::DrawPass (gta4_recomp.70.cpp:55690-55857)
 // Eliminates 22 register moves around sub_828C8F38 and inlines sub_828C42F0.
 // -----------------------------------------------------------------------------
@@ -295,7 +341,7 @@ extern "C" void FastSub828C6620(PPCContext& ctx, uint8_t* base) {
   ctx.r6.s64 = 0;
   ctx.r4.s64 = 0;
   ctx.lr = 0x828C6648u;
-  sub_828C6568(ctx, base);
+  FastSub828C6568(ctx, base);
 
   int32_t r23_pass_count = ctx.r3.s32;
   if (r23_pass_count > 0) {
@@ -498,7 +544,7 @@ extern "C" void FastSub828C4338(PPCContext& ctx, uint8_t* base) {
             ctx.r5.u64 = static_cast<uint32_t>(r29_geom_idx);
             ctx.r4.u64 = r31_model;
             ctx.lr = 0x828C4554u;
-            sub_828C6620(ctx, base);
+            FastSub828C6620(ctx, base);
           }
           r10_forced_shader = REX_LOAD_U32(kGlobalBase + 12116u);
           ctx.r10.u64 = r10_forced_shader;
@@ -563,7 +609,7 @@ extern "C" void FastSub828D41A8(PPCContext& ctx, uint8_t* base) {
           ctx.r5.u64 = r26_bucket;
           ctx.r6.u64 = r31_lod;
           ctx.lr = 0x828D4248u;
-          sub_828C4338(ctx, base);
+          FastSub828C4338(ctx, base);
         }
         count = REX_LOAD_U16(r30_model_list + 4u);
       }
