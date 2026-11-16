@@ -614,36 +614,92 @@ extern "C" void FastSub828D41A8(PPCContext& ctx, uint8_t* base) {
   ctx.r1.s64 = static_cast<int64_t>(sp) + 160;
 }
 
+// -----------------------------------------------------------------------------
+// Bone (3x4 affine) x object matrix, as in sub_828D4268 (0x828D43E8..0x828D4494) and
+// sub_828CC298 (0x828CC420..0x828CC4E4).
+//
+// sub_828CAF58 writes ONLY x,y,z of the four bone rows (+0..+8, +16..+24, +32..+40,
+// +48..+56). The w words (+12, +28, +44, +60) are never written: they hold whatever the
+// guest stack held before. The PPC code never reads them: it splats elements 0..2 only and
+//   out[i] = M0*B[i].x + M1*B[i].y + M2*B[i].z          (i = 0..2, weight 0 for M3)
+//   out[3] = M0*B[3].x + M1*B[3].y + M2*B[3].z + M3     (weight 1 for M3)
+// The former MultiplyMatrix4x4_BE added M3*B[i].w for every row, i.e. the object's world
+// translation times stale stack data: whole models got sheared or thrown across the
+// screen (Algonquin bridge "wedge", 2026-11-16).
+//
+// Same operation order as the recompiled code (vmulfp128, then vmaddfp, which is fused on
+// Android: REX_FUSED_VMADDFP=1), same flush mode, aligned loads/stores as lvx128/stvx128.
+// -----------------------------------------------------------------------------
+static inline void MultiplyBoneAffine_BE(PPCContext& ctx, uint8_t* base, uint32_t out_ea,
+                                         uint32_t bone_ea, uint32_t m_ea) {
+  ctx.fpscr.enableFlushMode();
+  bone_ea &= ~0xFu;
+  m_ea &= ~0xFu;
+  out_ea &= ~0xFu;
 #if defined(__aarch64__)
-static inline void MultiplyMatrix4x4_BE(uint8_t* base, uint32_t out_ea, uint32_t a_ea, uint32_t b_ea) {
-  const uint8_t* a_ptr = reinterpret_cast<const uint8_t*>(REX_RAW_ADDR(a_ea));
-  const uint8_t* b_ptr = reinterpret_cast<const uint8_t*>(REX_RAW_ADDR(b_ea));
+  const uint8_t* b_ptr = reinterpret_cast<const uint8_t*>(REX_RAW_ADDR(bone_ea));
+  const uint8_t* m_ptr = reinterpret_cast<const uint8_t*>(REX_RAW_ADDR(m_ea));
   uint8_t* out_ptr = reinterpret_cast<uint8_t*>(REX_RAW_ADDR(out_ea));
 
-  float32x4_t a0 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(a_ptr)));
-  float32x4_t a1 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(a_ptr + 16)));
-  float32x4_t a2 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(a_ptr + 32)));
-  float32x4_t a3 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(a_ptr + 48)));
+  const float32x4_t b0 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(b_ptr)));
+  const float32x4_t b1 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(b_ptr + 16)));
+  const float32x4_t b2 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(b_ptr + 32)));
+  const float32x4_t b3 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(b_ptr + 48)));
 
-  float32x4_t b0 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(b_ptr)));
-  float32x4_t b1 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(b_ptr + 16)));
-  float32x4_t b2 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(b_ptr + 32)));
-  float32x4_t b3 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(b_ptr + 48)));
+  const float32x4_t m0 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(m_ptr)));
+  const float32x4_t m1 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(m_ptr + 16)));
+  const float32x4_t m2 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(m_ptr + 32)));
+  const float32x4_t m3 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(m_ptr + 48)));
 
-  auto mul_row = [&](float32x4_t row) {
-    float32x4_t res = vmulq_laneq_f32(b0, row, 0);
-    res = vfmaq_laneq_f32(res, b1, row, 1);
-    res = vfmaq_laneq_f32(res, b2, row, 2);
-    res = vfmaq_laneq_f32(res, b3, row, 3);
-    return res;
+  // v7 = M0*B0.x; v7 = M1*B0.y + v7; v13 = M2*B0.z + v7  (same for rows 1, 2)
+  auto linear_row = [&](float32x4_t b) {
+    float32x4_t r = vmulq_laneq_f32(m0, b, 0);
+    r = vfmaq_laneq_f32(r, m1, b, 1);
+    r = vfmaq_laneq_f32(r, m2, b, 2);
+    return r;
   };
+  // v0 = M0*B3.x + M3; v0 = M1*B3.y + v0; v0 = M2*B3.z + v0
+  float32x4_t r3 = vfmaq_laneq_f32(m3, m0, b3, 0);
+  r3 = vfmaq_laneq_f32(r3, m1, b3, 1);
+  r3 = vfmaq_laneq_f32(r3, m2, b3, 2);
 
-  vst1q_u8(out_ptr, vrev32q_u8(vreinterpretq_u8_f32(mul_row(a0))));
-  vst1q_u8(out_ptr + 16, vrev32q_u8(vreinterpretq_u8_f32(mul_row(a1))));
-  vst1q_u8(out_ptr + 32, vrev32q_u8(vreinterpretq_u8_f32(mul_row(a2))));
-  vst1q_u8(out_ptr + 48, vrev32q_u8(vreinterpretq_u8_f32(mul_row(a3))));
-}
+  const float32x4_t r0 = linear_row(b0);
+  const float32x4_t r1 = linear_row(b1);
+  const float32x4_t r2 = linear_row(b2);
+  vst1q_u8(out_ptr, vrev32q_u8(vreinterpretq_u8_f32(r0)));
+  vst1q_u8(out_ptr + 16, vrev32q_u8(vreinterpretq_u8_f32(r1)));
+  vst1q_u8(out_ptr + 32, vrev32q_u8(vreinterpretq_u8_f32(r2)));
+  vst1q_u8(out_ptr + 48, vrev32q_u8(vreinterpretq_u8_f32(r3)));
+#else
+  float b[4][4], m[4][4];
+  for (int r = 0; r < 4; ++r) {
+    for (int c = 0; c < 4; ++c) {
+      const uint32_t ub = REX_LOAD_U32(bone_ea + uint32_t((r * 4 + c) << 2));
+      const uint32_t um = REX_LOAD_U32(m_ea + uint32_t((r * 4 + c) << 2));
+      std::memcpy(&b[r][c], &ub, 4);
+      std::memcpy(&m[r][c], &um, 4);
+    }
+  }
+  float out[4][4];
+  for (int c = 0; c < 4; ++c) {
+    for (int r = 0; r < 3; ++r) {
+      float t = m[0][c] * b[r][0];
+      t = std::fma(m[1][c], b[r][1], t);
+      out[r][c] = std::fma(m[2][c], b[r][2], t);
+    }
+    float t = std::fma(m[0][c], b[3][0], m[3][c]);
+    t = std::fma(m[1][c], b[3][1], t);
+    out[3][c] = std::fma(m[2][c], b[3][2], t);
+  }
+  for (int r = 0; r < 4; ++r) {
+    for (int c = 0; c < 4; ++c) {
+      uint32_t uo;
+      std::memcpy(&uo, &out[r][c], 4);
+      REX_STORE_U32(out_ea + uint32_t((r * 4 + c) << 2), uo);
+    }
+  }
 #endif
+}
 
 // -----------------------------------------------------------------------------
 // 5c. FastSub828D4268: rage::rmcDrawable::DrawModelsSkinned (gta4_recomp.71.cpp:28389)
@@ -748,27 +804,7 @@ extern "C" void FastSub828D4268(PPCContext& ctx, uint8_t* base) {
               sub_828CAF58(ctx, base);
 
               if (r31_mtx != 0u) {
-#if defined(__aarch64__)
-                MultiplyMatrix4x4_BE(base, sp + 144u, sp + 144u, r31_mtx);
-#else
-                float a[4][4], b[4][4], out[4][4];
-                for (int r = 0; r < 4; ++r) {
-                  for (int c = 0; c < 4; ++c) {
-                    uint32_t ua = REX_LOAD_U32(sp + 144u + ((r * 4 + c) << 2));
-                    uint32_t ub = REX_LOAD_U32(r31_mtx + ((r * 4 + c) << 2));
-                    std::memcpy(&a[r][c], &ua, 4);
-                    std::memcpy(&b[r][c], &ub, 4);
-                  }
-                }
-                for (int r = 0; r < 4; ++r) {
-                  for (int c = 0; c < 4; ++c) {
-                    out[r][c] = a[r][0] * b[0][c] + a[r][1] * b[1][c] + a[r][2] * b[2][c] + a[r][3] * b[3][c];
-                    uint32_t uo;
-                    std::memcpy(&uo, &out[r][c], 4);
-                    REX_STORE_U32(sp + 144u + ((r * 4 + c) << 2), uo);
-                  }
-                }
-#endif
+                MultiplyBoneAffine_BE(ctx, base, sp + 144u, sp + 144u, r31_mtx);
               }
               ctx.r4.u64 = sp + 144u;
               ctx.r3.u64 = REX_LOAD_U32(kGlobalVpAddr);
@@ -917,7 +953,7 @@ extern "C" void sub_828CC298(PPCContext& ctx, uint8_t* base) {
                   sub_828CAF58(ctx, base);
 
                   if (r30_mtx != 0u) {
-                    MultiplyMatrix4x4_BE(base, sp + 144u, sp + 144u, r30_mtx);
+                    MultiplyBoneAffine_BE(ctx, base, sp + 144u, sp + 144u, r30_mtx);
                   }
                   ctx.r4.u64 = sp + 144u;
                   ctx.r3.u64 = REX_LOAD_U32(kGlobalVpAddr);
