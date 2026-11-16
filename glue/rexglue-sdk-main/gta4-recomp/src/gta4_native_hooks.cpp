@@ -4759,10 +4759,12 @@ void TraceKnownOffscreenTransformTransition(std::string_view point, PPCContext& 
   }
 }
 
+extern "C" void FastSub828C6568(PPCContext& ctx, uint8_t* base);
+
 extern "C" void sub_828C6568(PPCContext& ctx, uint8_t* base) {
   if (!PhoneCaptureActive() && !IsNativeLightProvenanceTraceEnabled() &&
       (!IsNativeMode() || !CachedNativeTraceEnabled())) [[likely]] {
-    __imp__sub_828C6568(ctx, base);
+    FastSub828C6568(ctx, base);
     return;
   }
   SlowSub828C6568(ctx, base);

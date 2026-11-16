@@ -122,6 +122,52 @@ Output a concise, structured technical brief (maximum 30 lines total) covering:
 4. **Actionable Hook Plan**: Exact strategy to hook or optimize this function on Cortex-X1 without breaking stack restoration (`ctx.r1.u32`) or Big-Endian rules.
 """
 
+SYSTEM_PROMPT_AUDIT = """You audit C++ hooks that override recompiled PowerPC functions in a rexglue-based emulator (LibertyRecompAndroid). Be terse. No prose padding. If unsure — write "unknown: <identifier>" instead of guessing.
+
+## Domain facts (do not contradict)
+- `PPCContext& ctx` holds VIRTUAL PowerPC guest registers: ctx.r0..r31, ctx.v0..v31, ctx.lr, ctx.ctr, ctx.xer, ctx.cr*. NOT host ARM64 registers.
+- REX_LOAD_*/REX_STORE_* apply BE<->LE byte-swap. Plain vld1q_u8/vst1q_u8 do not. Byte-wise ops (and/or) are endian-agnostic.
+- lvx128/stvx128 in decompiled code emit shuffle_epi8 pairs that cancel. `ea = X & ~0xF` mirrors PPC semantics (low 4 bits ignored), NOT ARM alignment.
+- `__imp__sub_XXX(ctx, base)` is the RECOMPILED BODY of the same PPC function. Calling it from a hook is normal; no ABI transition happens.
+- `sub_XXX` without __imp__ may be a native ARM64 shim or another recompiled body — if unknown, say so.
+- PPC caller-saved: r0, r3..r12, v0..v19, lr, ctr, cr0..cr1. Everything else is callee-saved and MUST be restored by the function itself.
+- IsPlausibleGuestPtr = range check only. No alignment, no content validation.
+
+## Anti-filler rules
+- SIMD only if the original processes vector lanes. Scalar pointer loops → skip.
+- Thread-safety only if function touches shared mutable state without atomics. Single-threaded recompiled flow → "N/A: single-threaded guest".
+- Do NOT claim a check prevents X if X is exactly what the check prevents.
+- Do NOT invent behavior of unseen helpers. Write "unknown: <name>".
+- Every claim about equivalence or a bug MUST cite line numbers from BOTH sides.
+
+## Mandatory edge-case checks (report each: match / divergence / N-A)
+1. Signed vs unsigned comparison divergence.
+2. Caller-saved guest state (v0..v19, r0, r3..r12, lr, ctr, cr, xer) written by original but not by hook.
+3. Callee-saved guest state (r13..r31, v20..v31) restored by original via stack but not touched by hook.
+4. Array CONTENT validation vs pointer-only validation. Name elements that can still crash if only the pointer is checked.
+5. Every `& ~0xF` in hook must have a matching `ea = ... & ~0xF` in original at the SAME offset.
+6. Early-return paths: do they match an equivalent exit, or diverge in guest-visible state?
+7. Cross-calls into other recompiled funcs: which state can they mutate that the hook's prologue/epilogue no longer saves?
+
+## Output format (markdown, exact sections, no extra prose)
+
+## Equivalence matrix
+| Aspect | Original (line) | Hook (line) | Match | Note |
+Cover: every memory store, every guest register write, every branch, every call.
+
+## Divergences
+For each: what / original / hook / guest-visible impact / severity high|med|low.
+
+## Unknowns
+Bullets of identifiers you could not resolve. No guessing.
+
+## Rejected claims
+Minimum 2 items you considered and rejected, with one-line reason.
+
+## Verdict
+Grade A/B/C/D + one sentence per criterion: memory-equivalence, register-equivalence, safety, perf. Then a single sentence overall.
+"""
+
 
 def parse_sub_address(func_name: str):
     m = re.match(r"^sub_([0-9A-Fa-f]{8})$", func_name.strip())
@@ -433,8 +479,8 @@ def main():
     parser.add_argument(
         "--mode",
         default="hook",
-        choices=["hook", "vulkan-direct", "inspect"],
-        help="Execution mode: 'inspect' (zero-token reverse-engineering summary on local 7B), 'vulkan-direct' (Rule 10 D3D9 bypass hook), or 'hook' (standard C++/NEON hook)",
+        choices=["hook", "vulkan-direct", "inspect", "audit"],
+        help="Execution mode: 'inspect' (reverse-engineering brief), 'audit' (strict hook verification audit), 'vulkan-direct' (Rule 10 D3D9 bypass hook), or 'hook' (standard C++/NEON hook)",
     )
     parser.add_argument("--model", default=DEFAULT_NIM_MODEL, help=f"NIM model or 'local' (default: {DEFAULT_NIM_MODEL})")
     parser.add_argument("--backend", default="auto", choices=["auto", "nim", "local"], help="Backend provider")
@@ -480,8 +526,8 @@ def main():
             print(full_text)
         return
 
-    # In 'inspect' mode, default to local RTX 3070 unless 'nim' was explicitly requested
-    if args.mode == "inspect" and args.backend == "auto" and args.model == DEFAULT_NIM_MODEL:
+    # In 'inspect' or 'audit' mode, default to local RTX 3070 unless 'nim' was explicitly requested
+    if args.mode in ("inspect", "audit") and args.backend == "auto" and args.model == DEFAULT_NIM_MODEL:
         is_local = True
     else:
         is_local = (args.backend == "local") or ("local" in args.model.lower()) or ("qwen" in args.model.lower())
@@ -498,6 +544,8 @@ def main():
 
     if args.mode == "inspect":
         sys_prompt = SYSTEM_PROMPT_INSPECT
+    elif args.mode == "audit":
+        sys_prompt = SYSTEM_PROMPT_AUDIT
     elif args.mode == "vulkan-direct":
         sys_prompt = SYSTEM_PROMPT_VULKAN_DIRECT
     else:
@@ -515,6 +563,10 @@ def main():
         prompt_parts.append(
             "\nProvide the structured reverse-engineering inspection report for the function(s) above. "
             "Be concise, exact with hex offsets, and highlight D3D9 calls vs RAGE logic."
+        )
+    elif args.mode == "audit":
+        prompt_parts.append(
+            "\nAudit the hook implementation against the decompiled PowerPC code above following the exact output format."
         )
     elif args.mode == "vulkan-direct":
         prompt_parts.append(

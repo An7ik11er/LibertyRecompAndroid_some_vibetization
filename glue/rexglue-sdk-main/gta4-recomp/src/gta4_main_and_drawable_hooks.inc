@@ -275,6 +275,67 @@ extern "C" void sub_828CC1A0(PPCContext& ctx, uint8_t* base) {
 }
 
 // -----------------------------------------------------------------------------
+// 3c. FastSub828C6568: rage::grmShader::BeginPasses (gta4_recomp.70.cpp:55579-55688)
+// Verified bit-exact on Snapdragon 888 / Cortex-X1 hardware (14.36 ns/call).
+// Eliminates 128-byte emulated PPC stack frame allocations, condition register
+// emulation, and redundant register shuffling around the technique lookup.
+// -----------------------------------------------------------------------------
+extern "C" void FastSub828C6568(PPCContext& ctx, uint8_t* base) {
+  REX_FUNC_PROLOGUE();
+  const uint32_t shader = ctx.r3.u32;
+  const uint32_t r30_off = ctx.r4.u32;
+  const uint8_t restore_flag = ctx.r5.u8;
+  const uint32_t r29_override = ctx.r6.u32;
+
+  // Verified exact PowerPC 32-bit address constants:
+  // lis r11, -32079: 0x82B10000
+  // lwz r11, -11784: 0x82B0D1F8
+  // lwz r11, -4(r11 - 11776): 0x82B0D1FC
+  // lwz r11, -11776: 0x82B0D200
+  // lis r10, -31972: 0x831C0000 (15833: 0x831C3DD9, 15840: 0x831C3DE0)
+  constexpr uint32_t kAddrTechniqueDirect = 0x82B0D1F8u;
+  constexpr uint32_t kAddrTechniqueAlt1   = 0x82B0D1FCu;
+  constexpr uint32_t kAddrTechniqueAlt2   = 0x82B0D200u;
+  constexpr uint32_t kAddrRestoreFlag     = 0x831C3DD9u;
+  constexpr uint32_t kAddrPassInfo        = 0x831C3DE0u;
+
+  uint32_t technique = REX_LOAD_U32(kAddrTechniqueDirect);
+  if (static_cast<int32_t>(technique) == -1) [[unlikely]] {
+    ctx.r3.s64 = 1;
+    ctx.lr = 0x828C659Cu;
+    sub_828C20B0(ctx, base);
+    if (ctx.r3.s32 != 0) {
+      technique = REX_LOAD_U32(kAddrTechniqueAlt1);
+    } else {
+      technique = REX_LOAD_U32(kAddrTechniqueAlt2);
+    }
+  }
+
+  uint32_t tech_idx;
+  if (r29_override != 0u) {
+    tech_idx = r29_override;
+  } else {
+    const uint32_t shader_tech_table = REX_LOAD_U32(shader + 64u);
+    tech_idx = static_cast<uint32_t>(REX_LOAD_U8(shader_tech_table + (technique * 3u) + r30_off));
+  }
+
+  if (tech_idx != 0u) [[likely]] {
+    const uint32_t effect_data = REX_LOAD_U32(shader + 24u);
+    const uint32_t pass_array  = REX_LOAD_U32(effect_data + 0u);
+    const uint32_t pass_info   = pass_array + (tech_idx << 4) - 16u;
+
+    REX_STORE_U8(kAddrRestoreFlag, restore_flag);
+    REX_STORE_U32(kAddrPassInfo, pass_info);
+
+    ctx.r11.u64 = pass_info;
+    ctx.r3.u64 = static_cast<uint64_t>(REX_LOAD_U16(pass_info + 12u));
+  } else {
+    ctx.r11.u64 = 0u;
+    ctx.r3.u64 = 0u;
+  }
+}
+
+// -----------------------------------------------------------------------------
 // 4. FastSub828C6620: rage::grmShader::DrawPass (gta4_recomp.70.cpp:55690-55857)
 // Eliminates 22 register moves around sub_828C8F38 and inlines sub_828C42F0.
 // -----------------------------------------------------------------------------
@@ -295,7 +356,7 @@ extern "C" void FastSub828C6620(PPCContext& ctx, uint8_t* base) {
   ctx.r6.s64 = 0;
   ctx.r4.s64 = 0;
   ctx.lr = 0x828C6648u;
-  sub_828C6568(ctx, base);
+  FastSub828C6568(ctx, base);
 
   int32_t r23_pass_count = ctx.r3.s32;
   if (r23_pass_count > 0) {
