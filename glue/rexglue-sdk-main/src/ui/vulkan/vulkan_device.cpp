@@ -525,7 +525,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   if (with_native_shader_support &&
       (!features_1_2.supported.runtimeDescriptorArray ||
-       !features_1_2.supported.descriptorBindingPartiallyBound ||
        !features_1_2.supported.bufferDeviceAddress)) {
     REXLOG_WARN(
         "Vulkan device '{}' lacks native shader features: runtimeDescriptorArray={}, "

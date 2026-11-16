@@ -291,6 +291,7 @@ extern PPCFuncMapping PPCFuncMappings[];
   do {                                                                                     \
     REX_PROFILE_INDIRECT_DISPATCH();                                                       \
     uint32_t rex_indirect_target_ = (uint32_t)(x);                                         \
+    if (!rex_indirect_target_ || rex_indirect_target_ == 0xCDCDCDCDu || rex_indirect_target_ == 0xDDDDDDDDu) [[unlikely]] { break; } \
     PPCFunc* rex_indirect_func_;                                                           \
     if ((uint32_t)(rex_indirect_target_ - REX_CODE_BASE) <                                 \
         REX_CODE_SIZE + REX_THUNK_RESERVE_SIZE) [[likely]] {                               \
@@ -302,7 +303,9 @@ extern PPCFuncMapping PPCFuncMappings[];
       ctx.last_indirect_target = rex_indirect_target_;                                     \
       rex_indirect_func_ = rex::runtime::ResolveIndirectFunction(rex_indirect_target_);    \
     }                                                                                      \
-    rex_indirect_func_(ctx, base);                                                         \
+    if (rex_indirect_func_) [[likely]] {                                                   \
+      rex_indirect_func_(ctx, base);                                                       \
+    }                                                                                      \
   } while (0)
 
 

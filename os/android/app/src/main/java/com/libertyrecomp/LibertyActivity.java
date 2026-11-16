@@ -85,6 +85,15 @@ public class LibertyActivity extends SDLActivity {
     /** Launcher "Performance test settings": reflection intervals in frames. */
     static final String EXTRA_WATER_REFLECTION_INTERVAL = "perf_water_reflection_interval";
     static final String EXTRA_OTHER_REFLECTION_INTERVAL = "perf_other_reflection_interval";
+    /** Launcher cache location override passed as --cache_root=PATH. */
+    static final String EXTRA_CACHE_ROOT = "perf_cache_root";
+    static final String PERF_PREFS_NAME = "performance_test";
+    static final String CACHE_PREF_MODE = "cache_root_mode";
+    static final String CACHE_PREF_CUSTOM_PATH = "cache_root_custom_path";
+    static final String CACHE_MODE_AUTO = "auto";
+    static final String CACHE_MODE_INTERNAL = "internal";
+    static final String CACHE_MODE_SD = "sd";
+    static final String CACHE_MODE_CUSTOM = "custom";
     private boolean mDebugLog;
     private File mDebugLogFile;
     /**
@@ -280,6 +289,65 @@ public class LibertyActivity extends SDLActivity {
         arguments.add("--gta4_native_environment_reflection_interval=" + environment);
     }
 
+    static File findInternalCacheDir(Context context) {
+        File ext = context.getExternalFilesDir(null);
+        File root = ext != null ? ext : context.getFilesDir();
+        return new File(new File(root, "LibertyRecomp"), "shader_cache");
+    }
+
+    static File findSdCacheDir(Context context) {
+        File[] externals = context.getExternalFilesDirs(null);
+        if (externals != null && externals.length > 1 && externals[1] != null) {
+            return new File(new File(externals[1], "LibertyRecomp"), "shader_cache");
+        }
+        return null;
+    }
+
+    static String resolveConfiguredCacheRootOverride(Context context) {
+        android.content.SharedPreferences prefs =
+                context.getSharedPreferences(PERF_PREFS_NAME, Context.MODE_PRIVATE);
+        String mode = prefs.getString(CACHE_PREF_MODE, CACHE_MODE_AUTO);
+        if (CACHE_MODE_INTERNAL.equals(mode)) {
+            return findInternalCacheDir(context).getAbsolutePath();
+        }
+        if (CACHE_MODE_SD.equals(mode)) {
+            File sd = findSdCacheDir(context);
+            if (sd != null) return sd.getAbsolutePath();
+        }
+        if (CACHE_MODE_CUSTOM.equals(mode)) {
+            String custom = prefs.getString(CACHE_PREF_CUSTOM_PATH, "");
+            if (custom != null && !custom.trim().isEmpty()) {
+                return custom.trim();
+            }
+        }
+        return "";
+    }
+
+    private void applyCacheRootArgument(List<String> arguments, Intent launch) {
+        String overrideRoot = null;
+        if (launch != null && launch.hasExtra(EXTRA_CACHE_ROOT)) {
+            overrideRoot = launch.getStringExtra(EXTRA_CACHE_ROOT);
+        }
+        if (overrideRoot == null) {
+            overrideRoot = resolveConfiguredCacheRootOverride(this);
+        }
+        if (overrideRoot == null || overrideRoot.trim().isEmpty()) {
+            return;
+        }
+        File dir = new File(overrideRoot.trim());
+        if (!dir.isDirectory() && !dir.mkdirs()) {
+            Log.w(TAG, "cache_root directory could not be created: " + dir + "; using default");
+            return;
+        }
+        if (!dir.canWrite()) {
+            Log.w(TAG, "cache_root directory is not writable: " + dir + "; using default");
+            return;
+        }
+        arguments.removeIf(a -> a.startsWith("--cache_root"));
+        arguments.add("--cache_root=" + dir.getAbsolutePath());
+        Log.i(TAG, "cache_root override=" + dir.getAbsolutePath());
+    }
+
     private void prepareEnvironment() {
         File external = getExternalFilesDir(null);
         File dataRoot = external != null ? external : getFilesDir();
@@ -352,6 +420,7 @@ public class LibertyActivity extends SDLActivity {
                 Log.w(TAG, "bad " + argument);
             }
         }
+        applyCacheRootArgument(arguments, launch);
         mArguments = arguments.toArray(new String[0]);
         String driver = readFirstLine(new File(dataRoot, "driver.txt"));
         mDriverText = driver;

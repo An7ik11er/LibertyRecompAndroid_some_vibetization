@@ -242,6 +242,26 @@ final class LauncherI18n {
         RU.put("aff_layout_lanes2", "Авто-раскладка: lanes2 (Main на Big, RenderGuest nice -10, Jobs nice -6). Задаётся через ");
         RU.put("args_toast_saved", "Параметры args.txt сохранены");
 
+        // --- Cache Card ---
+        RU.put("cache_card_title", "Кеш шейдеров и ресурсов");
+        RU.put("cache_card_subtitle", "Место хранения pipeline-кеша Vulkan и button_prompts.");
+        RU.put("cache_mode_auto", "По умолчанию (папка данных / XDG)");
+        RU.put("cache_mode_internal", "Внутренняя память (быстрая)");
+        RU.put("cache_mode_sd", "SD-карта");
+        RU.put("cache_mode_custom", "Своя папка");
+        RU.put("cache_btn_choose", "Выбрать место...");
+        RU.put("cache_btn_rebuild", "Перезаписать кеш");
+        RU.put("cache_dialog_title", "Куда сохранять кеш");
+        RU.put("cache_pick_custom", "Выбрать папку на устройстве...");
+        RU.put("cache_perm_message", "Для записи кеша в произвольную папку памяти устройства или SD-карты Liberty Recompiled необходим доступ ко всем файлам.");
+        RU.put("cache_custom_invalid", "Не удалось определить путь к папке. Выберите папку во внутренней памяти или на SD-карте.");
+        RU.put("cache_custom_unwritable", "Нет прав на запись в выбранную папку: ");
+        RU.put("cache_saved_toast", "Путь кеша сохранён: ");
+        RU.put("cache_rebuild_confirm_title", "Перезаписать кеш?");
+        RU.put("cache_rebuild_confirm_msg", "Удалить текущий кеш из %s?\n\nПри следующем запуске игры он будет создан заново.");
+        RU.put("cache_rebuilt_toast", "Кеш очищен — будет перезаписан при запуске.");
+        RU.put("cache_size_fmt", "Размер: %.1f МБ");
+
     }
 
     public static synchronized String getLang(Context context) {

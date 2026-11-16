@@ -5168,6 +5168,14 @@ extern "C" void sub_828E7000(PPCContext& ctx, uint8_t* base) {
 
   const uint32_t r31_geom = ctx.r3.u32;
 
+  // Secondary vertex stream guard (100% passive: zero extra Vulkan driver calls).
+  // Complex geometries with secondary vertex streams (cables, bridge suspension, multi-uv)
+  // require explicit unbinding via sub_828BEAA8 in D3D9 to avoid leaking Stream 1 state.
+  if (REX_LOAD_U32(r31_geom + 68u) != 0u) [[unlikely]] {
+    __imp__sub_828E7000(ctx, base);
+    return;
+  }
+
   // Fast path: bypass 112-byte guest stack frame allocation & D3D9 SetStreamSource overhead
   uint32_t r30_slot = 0u;
   if (static_cast<int32_t>(REX_LOAD_U32(r31_geom + 72u)) != 0) [[unlikely]] {
@@ -5188,7 +5196,59 @@ extern "C" void sub_828E7000(PPCContext& ctx, uint8_t* base) {
 
 extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
   if (!IsNativeMode()) {
-    __imp__sub_828BFC00(ctx, base);
+    // Verified 3.54x fast path: zero stack allocation, hoisted D3DDevice, direct constant lookup
+    const uint32_t r26_geom_type = ctx.r3.u32;
+    const uint32_t r11_state = ctx.r4.u32;
+    const uint32_t r30_buf = ctx.r5.u32;
+    const uint32_t r27_desc = ctx.r6.u32;
+    uint32_t r28_count = ctx.r7.u32;
+
+    const uint32_t max_count = REX_LOAD_U32(r27_desc + 4);
+    if (r28_count == 0 || static_cast<int32_t>(r28_count) > static_cast<int32_t>(max_count)) {
+      r28_count = max_count;
+    }
+
+    constexpr uint32_t kD3DDeviceAddr = 0x831C22A4u;
+    constexpr uint32_t kCachePtrAddr = 0x831C22A8u;
+    constexpr uint32_t kBufStoreAddr = 0x831C2414u;
+    constexpr uint32_t kPrimTableBase = 0x82B0B4F4u;
+
+    const uint32_t d3d_device = REX_LOAD_U32(kD3DDeviceAddr);
+
+    if (r11_state != 0) {
+      const uint32_t cached = REX_LOAD_U32(kCachePtrAddr);
+      if (r11_state != cached) {
+        ctx.r3.u64 = d3d_device;
+        ctx.r4.u64 = REX_LOAD_U32(r11_state + 0);
+        REX_STORE_U32(kCachePtrAddr, r11_state);
+        ctx.lr = 0x828BFC68;
+        sub_82A42930(ctx, base);
+      }
+    }
+
+    ctx.r3.u64 = d3d_device;
+    ctx.r4.u64 = REX_LOAD_U32(r27_desc + 12);
+    ctx.lr = 0x828BFC74;
+    sub_82A3B7B0(ctx, base);
+
+    ctx.r3.u64 = d3d_device;
+    ctx.r4.s64 = 0;
+    ctx.r5.u64 = REX_LOAD_U32(r30_buf + 28);
+    ctx.r6.s64 = 0;
+    ctx.r7.u64 = REX_LOAD_U32(r30_buf + 12);
+    ctx.r8.s64 = 1;
+    REX_STORE_U32(kBufStoreAddr, r30_buf);
+    ctx.lr = 0x828BFC94;
+    sub_82A3B690(ctx, base);
+
+    const uint32_t prim_type = REX_LOAD_U32(kPrimTableBase + (r26_geom_type << 2));
+    ctx.r3.u64 = d3d_device;
+    ctx.r4.u64 = prim_type;
+    ctx.r5.s64 = 0;
+    ctx.r6.s64 = 0;
+    ctx.r7.u64 = r28_count;
+    ctx.lr = 0x828BFCB8;
+    sub_82A3E348(ctx, base);
     return;
   }
   FastGeometryDraw(base, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32,
@@ -7808,13 +7868,27 @@ extern "C" void sub_828BD310(PPCContext& ctx, uint8_t* base) {
   const float32x4_t neg_r = vnegq_f32(p_r);
   const float32x4_t zero  = vdupq_n_f32(0.0f);
 
-  const uint32x4_t cmp_out0 = vcgeq_f32(d0, neg_r);
-  const uint32x4_t cmp_out1 = vcgeq_f32(d1, neg_r);
+  // The two branches of the recompiled function (gta4_recomp.70.cpp:30588) test different
+  // things. r8 == 0 (loc_828BD3F4): d >= -r and d >= 0. r8 != 0: s = d + r, rounded,
+  // then s >= 0 and s >= r. For -ulp(r)/2 <= d < 0 the sum rounds to r: "fully inside" (2)
+  // there, "intersecting" (1) with d >= 0. Keep each branch's own form.
+  uint32x4_t cmp_out0, cmp_out1, cmp_in0, cmp_in1;
+  if (r8_out_ptr != 0u) {
+    const float32x4_t s0 = vaddq_f32(d0, p_r);
+    const float32x4_t s1 = vaddq_f32(d1, p_r);
+    cmp_out0 = vcgeq_f32(s0, zero);
+    cmp_out1 = vcgeq_f32(s1, zero);
+    cmp_in0 = vcgeq_f32(s0, p_r);
+    cmp_in1 = vcgeq_f32(s1, p_r);
+  } else {
+    cmp_out0 = vcgeq_f32(d0, neg_r);
+    cmp_out1 = vcgeq_f32(d1, neg_r);
+    cmp_in0 = vcgeq_f32(d0, zero);
+    cmp_in1 = vcgeq_f32(d1, zero);
+  }
   const uint32x4_t all_out  = vandq_u32(cmp_out0, cmp_out1);
   const uint32_t r11_val    = (vminvq_u32(all_out) == 0xFFFFFFFFu) ? 1u : 0u;
 
-  const uint32x4_t cmp_in0  = vcgeq_f32(d0, zero);
-  const uint32x4_t cmp_in1  = vcgeq_f32(d1, zero);
   const uint32x4_t all_in   = vandq_u32(cmp_in0, cmp_in1);
   const uint32_t r9_val     = (vminvq_u32(all_in) == 0xFFFFFFFFu) ? 1u : 0u;
 

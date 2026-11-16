@@ -353,6 +353,8 @@ struct DrawIndexedPrimitiveCommand {
   uint32_t batch_ib = 0;
   uint32_t batch_vb = 0;
   uint32_t batch_stride = 0;
+  uint32_t batch_vb1 = 0;
+  uint32_t batch_stride1 = 0;
 };
 
 template <typename DrawCommand>

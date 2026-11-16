@@ -75,6 +75,7 @@ public class LauncherActivity extends Activity {
 
     private static final String TAG = "LibertyLauncher";
     private static final int REQUEST_DRIVER_ZIP = 1;
+    private static final int REQUEST_CACHE_DIR = 20;
     private static final String GAME_PROCESS_SUFFIX = ":game";
     /** Largest driver package accepted, unpacked. */
     private static final long MAX_DRIVER_BYTES = 256L * 1024 * 1024;
@@ -92,6 +93,7 @@ public class LauncherActivity extends Activity {
     private File mDataRoot;
     private RadioGroup mDrivers;
     private TextView mDriverNote;
+    private TextView mCacheNote;
     private android.widget.ImageButton mPlay;
     private Button mRemove;
     private final List<String> mDriverModes = new ArrayList<>();
@@ -113,6 +115,22 @@ public class LauncherActivity extends Activity {
         }
         File external = getExternalFilesDir(null);
         mDataRoot = external != null ? external : getFilesDir();
+        File[] externals = getExternalFilesDirs(null);
+        if (externals != null && externals.length > 1 && externals[1] != null) {
+            File sdGame = new File(Installer.installRoot(externals[1]), "game");
+            if (new File(sdGame, "default.xex").exists()) {
+                mDataRoot = externals[1];
+            }
+        }
+        new Thread(() -> {
+            try {
+                File gameDir = new File(Installer.installRoot(mDataRoot), "game");
+                if (gameDir.exists()) {
+                    Runtime.getRuntime().exec(new String[]{"chmod", "-R", "777", gameDir.getAbsolutePath()}).waitFor();
+                }
+            } catch (Throwable ignored) {
+            }
+        }, "GameChmod").start();
         setContentView(buildLayout());
         hideSystemBars();
         mPlay.requestFocus();
@@ -132,6 +150,7 @@ public class LauncherActivity extends Activity {
     protected void onResume() {
         super.onResume();
         refreshDrivers();
+        refreshCacheCard();
         refreshStatus();
         if (mInstallerReady) refreshInstall();
         refreshCrash();
@@ -332,6 +351,7 @@ public class LauncherActivity extends Activity {
         column.setOrientation(LinearLayout.VERTICAL);
         column.addView(buildInstallCard());
         column.addView(right, matchWrap(dp(14)));
+        column.addView(buildCacheCard(), matchWrap(dp(14)));
         ScrollView rightScroll = new ScrollView(this);
         mRightScroll = rightScroll;
         rightScroll.addView(column);
@@ -914,6 +934,12 @@ public class LauncherActivity extends Activity {
     @SuppressWarnings("deprecation")
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_CACHE_DIR) {
+            if (resultCode == RESULT_OK && data != null) {
+                onCacheDirPicked(data.getData());
+            }
+            return;
+        }
         if (requestCode >= REQUEST_SOURCE && requestCode < REQUEST_SOURCE + SOURCE_LABELS.length) {
             if (resultCode == RESULT_OK && data != null) {
                 onSourcePicked(requestCode - REQUEST_SOURCE, data.getData());
@@ -1046,6 +1072,197 @@ public class LauncherActivity extends Activity {
         } catch (Exception e) {
             return null;
         }
+    }
+
+    // -------------------------------------------------------------- shader cache
+
+    private View buildCacheCard() {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(16), dp(12), dp(16), dp(12));
+        card.setBackground(rounded(color(R.color.picker_card), dp(10)));
+
+        TextView title = text(tr("cache_card_title", "Shader & Resource Cache"), 18, R.color.picker_text);
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        card.addView(title);
+        card.addView(text(tr("cache_card_subtitle", "Location for Vulkan pipeline cache and button_prompts."),
+                12, R.color.picker_muted), matchWrap(dp(2)));
+
+        mCacheNote = text("", 12, R.color.picker_text);
+        card.addView(mCacheNote, matchWrap(dp(8)));
+
+        LinearLayout actions = new LinearLayout(this);
+        actions.setOrientation(LinearLayout.HORIZONTAL);
+        Button choose = button(tr("cache_btn_choose", "Choose location..."), false);
+        choose.setOnClickListener(v -> showCacheLocationDialog());
+        actions.addView(choose, new LinearLayout.LayoutParams(0, dp(44), 1f));
+        Button rebuild = button(tr("cache_btn_rebuild", "Rebuild cache"), false);
+        rebuild.setOnClickListener(v -> confirmRebuildCache());
+        LinearLayout.LayoutParams rebuildParams = new LinearLayout.LayoutParams(0, dp(44), 1f);
+        rebuildParams.leftMargin = dp(10);
+        actions.addView(rebuild, rebuildParams);
+        card.addView(actions, matchWrap(dp(10)));
+
+        refreshCacheCard();
+        return card;
+    }
+
+    private File resolveEffectiveCacheDir() {
+        String override = LibertyActivity.resolveConfiguredCacheRootOverride(this);
+        if (!override.isEmpty()) {
+            return new File(override);
+        }
+        File ext = getExternalFilesDir(null);
+        File envRoot = ext != null ? ext : mDataRoot;
+        String xdg = readEnvValue(new File(envRoot, "env.txt"), "XDG_DATA_HOME");
+        if (xdg != null && !xdg.isEmpty()) {
+            return new File(new File(xdg, "LibertyRecomp"), "shader_cache");
+        }
+        return new File(new File(mDataRoot, "LibertyRecomp"), "shader_cache");
+    }
+
+    private static String readEnvValue(File envFile, String key) {
+        if (!envFile.isFile()) return null;
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+                new FileInputStream(envFile), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                line = line.replace("\uFEFF", "").trim();
+                if (line.isEmpty() || line.startsWith("#")) continue;
+                int eq = line.indexOf('=');
+                if (eq > 0 && line.substring(0, eq).trim().equals(key)) {
+                    return line.substring(eq + 1).trim();
+                }
+            }
+        } catch (IOException ignored) {
+        }
+        return null;
+    }
+
+    private void refreshCacheCard() {
+        if (mCacheNote == null) return;
+        android.content.SharedPreferences perf = perfTestPreferences();
+        String mode = perf.getString(LibertyActivity.CACHE_PREF_MODE, LibertyActivity.CACHE_MODE_AUTO);
+        String modeLabel;
+        if (LibertyActivity.CACHE_MODE_INTERNAL.equals(mode)) {
+            modeLabel = tr("cache_mode_internal", "Internal storage (fast)");
+        } else if (LibertyActivity.CACHE_MODE_SD.equals(mode) && LibertyActivity.findSdCacheDir(this) != null) {
+            modeLabel = tr("cache_mode_sd", "SD card");
+        } else if (LibertyActivity.CACHE_MODE_CUSTOM.equals(mode) && !LibertyActivity.resolveConfiguredCacheRootOverride(this).isEmpty()) {
+            modeLabel = tr("cache_mode_custom", "Custom folder");
+        } else {
+            modeLabel = tr("cache_mode_auto", "Auto (data folder / XDG)");
+        }
+        File dir = resolveEffectiveCacheDir();
+        double mb = dirSizeBytes(dir) / (1024.0 * 1024.0);
+        mCacheNote.setText(modeLabel + "\n" + dir.getAbsolutePath() + "\n"
+                + String.format(Locale.getDefault(), tr("cache_size_fmt", "Size: %.1f MB"), mb));
+    }
+
+    private static long dirSizeBytes(File f) {
+        if (f == null || !f.exists()) return 0;
+        if (f.isFile()) return f.length();
+        File[] children = f.listFiles();
+        if (children == null) return 0;
+        long total = 0;
+        for (File child : children) total += dirSizeBytes(child);
+        return total;
+    }
+
+    private void showCacheLocationDialog() {
+        final List<String> labels = new ArrayList<>();
+        final List<String> modes = new ArrayList<>();
+        labels.add(tr("cache_mode_auto", "Auto (data folder / XDG)"));
+        modes.add(LibertyActivity.CACHE_MODE_AUTO);
+        labels.add(tr("cache_mode_internal", "Internal storage (fast)") + "\n  "
+                + LibertyActivity.findInternalCacheDir(this).getAbsolutePath());
+        modes.add(LibertyActivity.CACHE_MODE_INTERNAL);
+        File sdDir = LibertyActivity.findSdCacheDir(this);
+        if (sdDir != null) {
+            labels.add(tr("cache_mode_sd", "SD card") + "\n  " + sdDir.getAbsolutePath());
+            modes.add(LibertyActivity.CACHE_MODE_SD);
+        }
+        labels.add(tr("cache_pick_custom", "Browse custom folder..."));
+        modes.add(LibertyActivity.CACHE_MODE_CUSTOM);
+
+        new AlertDialog.Builder(this)
+                .setTitle(tr("cache_dialog_title", "Shader cache location"))
+                .setItems(labels.toArray(new String[0]), (d, which) -> {
+                    String chosen = modes.get(which);
+                    if (LibertyActivity.CACHE_MODE_CUSTOM.equals(chosen)) {
+                        pickCustomCacheFolder();
+                        return;
+                    }
+                    perfTestPreferences().edit()
+                            .putString(LibertyActivity.CACHE_PREF_MODE, chosen)
+                            .apply();
+                    refreshCacheCard();
+                    toast(tr("cache_saved_toast", "Cache location saved: ") + resolveEffectiveCacheDir().getAbsolutePath());
+                })
+                .setNegativeButton(tr("btn_cancel", "Cancel"), null)
+                .show();
+    }
+
+    @SuppressWarnings("deprecation")
+    private void pickCustomCacheFolder() {
+        if (!Installer.hasFileAccess(this)) {
+            new AlertDialog.Builder(this)
+                    .setTitle(tr("install_perm_title", "Allow file access"))
+                    .setMessage(tr("cache_perm_message",
+                            "To write cache files into a custom folder on internal storage or SD card, Liberty Recompiled needs access to all files."))
+                    .setPositiveButton(tr("install_perm_open", "Open setting"), (d, w) -> Installer.requestFileAccess(this, 2))
+                    .setNegativeButton(tr("btn_cancel", "Cancel"), null)
+                    .show();
+            return;
+        }
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        try {
+            startActivityForResult(intent, REQUEST_CACHE_DIR);
+        } catch (Exception e) {
+            toast(tr("toast_no_picker", "No file picker is available on this device."));
+        }
+    }
+
+    private void onCacheDirPicked(Uri uri) {
+        String path = Installer.pathFromUri(this, uri);
+        if (path == null || path.trim().isEmpty()) {
+            toast(tr("cache_custom_invalid", "Could not resolve folder path. Pick a folder on device storage or SD card."));
+            return;
+        }
+        File dir = new File(path.trim());
+        if (!dir.isDirectory() && !dir.mkdirs()) {
+            toast(tr("cache_custom_unwritable", "Cannot write to folder: ") + dir.getAbsolutePath());
+            return;
+        }
+        if (!dir.canWrite()) {
+            toast(tr("cache_custom_unwritable", "Cannot write to folder: ") + dir.getAbsolutePath());
+            return;
+        }
+        perfTestPreferences().edit()
+                .putString(LibertyActivity.CACHE_PREF_MODE, LibertyActivity.CACHE_MODE_CUSTOM)
+                .putString(LibertyActivity.CACHE_PREF_CUSTOM_PATH, dir.getAbsolutePath())
+                .apply();
+        refreshCacheCard();
+        toast(tr("cache_saved_toast", "Cache location saved: ") + dir.getAbsolutePath());
+    }
+
+    private void confirmRebuildCache() {
+        final File target = resolveEffectiveCacheDir();
+        new AlertDialog.Builder(this)
+                .setTitle(tr("cache_rebuild_confirm_title", "Rebuild cache?"))
+                .setMessage(String.format(tr("cache_rebuild_confirm_msg",
+                        "Delete current cache in %s?\n\nIt will be rebuilt automatically on next launch."),
+                        target.getAbsolutePath()))
+                .setPositiveButton(tr("btn_ok", "OK"), (d, w) -> {
+                    stopGameProcess();
+                    deleteRecursively(target);
+                    //noinspection ResultOfMethodCallIgnored
+                    target.mkdirs();
+                    refreshCacheCard();
+                    toast(tr("cache_rebuilt_toast", "Cache cleared — it will be rebuilt on launch."));
+                })
+                .setNegativeButton(tr("btn_cancel", "Cancel"), null)
+                .show();
     }
 
     // ------------------------------------------------------------------- play
@@ -1367,6 +1584,8 @@ public class LauncherActivity extends Activity {
                         perf.getInt(PERF_WATER_REFLECTIONS, 1));
                 intent.putExtra(LibertyActivity.EXTRA_OTHER_REFLECTION_INTERVAL,
                         perf.getInt(PERF_OTHER_REFLECTIONS, 1));
+                intent.putExtra(LibertyActivity.EXTRA_CACHE_ROOT,
+                        LibertyActivity.resolveConfiguredCacheRootOverride(this));
                 String affinitySpec = ThreadAffinityDialog.buildLaunchSpec(this);
                 Log.i(TAG, "affinity spec=" + affinitySpec);
                 intent.putExtra(ThreadAffinityDialog.EXTRA_SPEC, affinitySpec);
