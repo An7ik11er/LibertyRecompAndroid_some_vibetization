@@ -4908,6 +4908,7 @@ extern "C" void sub_828C64C8(PPCContext& ctx, uint8_t* base) {
 extern "C" void FastSub828C6620(PPCContext& ctx, uint8_t* base);
 extern "C" void FastSub828C4338(PPCContext& ctx, uint8_t* base);
 extern "C" void FastSub828D41A8(PPCContext& ctx, uint8_t* base);
+extern "C" void FastSub828D4268(PPCContext& ctx, uint8_t* base);
 
 [[gnu::noinline]] void SlowSub828C6620(PPCContext& ctx, uint8_t* base) {
   ScopedFireMaterial fire_scope(ctx, base);
@@ -4996,7 +4997,7 @@ extern "C" void sub_828D41A8(PPCContext& ctx, uint8_t* base) {
 extern "C" void sub_828D4268(PPCContext& ctx, uint8_t* base) {
   if (!temporal_host::enabled.load(std::memory_order_relaxed) &&
       (!IsNativeMode() || !CachedNativeTraceEnabled())) [[likely]] {
-    __imp__sub_828D4268(ctx, base);
+    FastSub828D4268(ctx, base);
     return;
   }
   SlowSub828D4268(ctx, base);

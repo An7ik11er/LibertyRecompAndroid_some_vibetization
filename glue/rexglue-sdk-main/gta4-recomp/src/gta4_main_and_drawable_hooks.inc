@@ -482,12 +482,14 @@ extern "C" void FastSub828C4338(PPCContext& ctx, uint8_t* base) {
     r20_forced_bucket = static_cast<int32_t>(REX_LOAD_U8(r10_forced_shader + 9u));
   }
 
-  int32_t geom_count = static_cast<int32_t>(static_cast<uint16_t>(REX_LOAD_U16(r31_model + 26u)));
+  const int32_t geom_count = static_cast<int32_t>(static_cast<uint16_t>(REX_LOAD_U16(r31_model + 26u)));
   ctx.r11.u64 = static_cast<uint32_t>(geom_count);
   if (geom_count > 0) {
     int32_t r29_geom_idx = 0;
     uint32_t r28_short_off = 0u;
     uint32_t r26_aabb_off = 32u;
+    const uint32_t shader_idx_array = REX_LOAD_U32(r31_model + 16u);
+    const uint32_t shader_array = REX_LOAD_U32(r23_shader_group + 8u);
 
     do {
       const uint32_t r30_cur_culled = r25_next_culled;
@@ -509,8 +511,6 @@ extern "C" void FastSub828C4338(PPCContext& ctx, uint8_t* base) {
       }
 
       {
-        const uint32_t shader_idx_array = REX_LOAD_U32(r31_model + 16u);
-        const uint32_t shader_array = REX_LOAD_U32(r23_shader_group + 8u);
         const uint16_t shader_idx = REX_LOAD_U16(shader_idx_array + r28_short_off);
         const uint32_t model_shader =
             REX_LOAD_U32(shader_array + (static_cast<uint32_t>(shader_idx) << 2));
@@ -567,8 +567,6 @@ extern "C" void FastSub828C4338(PPCContext& ctx, uint8_t* base) {
       }
 
     next_geom:
-      geom_count = static_cast<int32_t>(static_cast<uint16_t>(REX_LOAD_U16(r31_model + 26u)));
-      ctx.r11.u64 = static_cast<uint32_t>(geom_count);
       ++r29_geom_idx;
       r26_aabb_off += 16u;
       r28_short_off += 2u;
@@ -580,8 +578,8 @@ extern "C" void FastSub828C4338(PPCContext& ctx, uint8_t* base) {
 
 // -----------------------------------------------------------------------------
 // 5b. FastSub828D41A8: rage::rmcDrawable::DrawModels (gta4_recomp.71.cpp:28224)
-// Eliminates PPC callee-saved spills (r24..r31) around sub_828BD250/sub_828C4338
-// and hoists the LOD visibility bitmask test outside the model loop.
+// Eliminates PPC callee-saved spills (r24..r31) around sub_828BD250/sub_828C4338,
+// hoists the LOD visibility bitmask test, models array, and count outside the model loop.
 // -----------------------------------------------------------------------------
 extern "C" void FastSub828D41A8(PPCContext& ctx, uint8_t* base) {
   REX_FUNC_PROLOGUE();
@@ -604,34 +602,213 @@ extern "C" void FastSub828D41A8(PPCContext& ctx, uint8_t* base) {
   ctx.lr = 0x828D41E4u;
   sub_828BD250(ctx, base);
 
-  uint32_t count = REX_LOAD_U16(r30_model_list + 4u);
-  if (count > 0u) {
-    bool visible = true;
-    if (r25_mask_ptr != 0u) {
-      const uint32_t mask_words = REX_LOAD_U32(r25_mask_ptr);
-      const uint32_t word_off =
-          (static_cast<uint32_t>(static_cast<int32_t>(r31_lod) >> 5) << 2) & 0xFFFFFFFCu;
-      const uint32_t mask_word = REX_LOAD_U32(mask_words + word_off);
-      visible = ((mask_word >> (r31_lod & 0x1Fu)) & 1u) != 0u;
-    }
-    if (visible) {
-      for (uint32_t i = 0; i < count; ++i) {
+  if (r30_model_list != 0u) {
+    const uint32_t count = REX_LOAD_U16(r30_model_list + 4u);
+    if (count > 0u) {
+      bool visible = true;
+      if (r25_mask_ptr != 0u) {
+        const uint32_t mask_words = REX_LOAD_U32(r25_mask_ptr);
+        const uint32_t word_off =
+            (static_cast<uint32_t>(static_cast<int32_t>(r31_lod) >> 5) << 2) & 0xFFFFFFFCu;
+        const uint32_t mask_word = REX_LOAD_U32(mask_words + word_off);
+        visible = ((mask_word >> (r31_lod & 0x1Fu)) & 1u) != 0u;
+      }
+      if (visible) {
         const uint32_t models_array = REX_LOAD_U32(r30_model_list);
-        const uint32_t model = REX_LOAD_U32(models_array + (i << 2));
-        if (model != 0u) {
-          ctx.r3.u64 = model;
-          ctx.r4.u64 = r27_shader_group;
-          ctx.r5.u64 = r26_bucket;
-          ctx.r6.u64 = r31_lod;
-          ctx.lr = 0x828D4248u;
-          FastSub828C4338(ctx, base);
+        if (models_array != 0u) {
+          for (uint32_t i = 0; i < count; ++i) {
+            const uint32_t model = REX_LOAD_U32(models_array + (i << 2));
+            if (model != 0u) {
+              ctx.r3.u64 = model;
+              ctx.r4.u64 = r27_shader_group;
+              ctx.r5.u64 = r26_bucket;
+              ctx.r6.u64 = r31_lod;
+              ctx.lr = 0x828D4248u;
+              FastSub828C4338(ctx, base);
+            }
+          }
         }
-        count = REX_LOAD_U16(r30_model_list + 4u);
       }
     }
   }
 
   ctx.r1.s64 = static_cast<int64_t>(sp) + 160;
+}
+
+#if defined(__aarch64__)
+static inline void MultiplyMatrix4x4_BE(uint8_t* base, uint32_t out_ea, uint32_t a_ea, uint32_t b_ea) {
+  const uint8_t* a_ptr = reinterpret_cast<const uint8_t*>(REX_RAW_ADDR(a_ea));
+  const uint8_t* b_ptr = reinterpret_cast<const uint8_t*>(REX_RAW_ADDR(b_ea));
+  uint8_t* out_ptr = reinterpret_cast<uint8_t*>(REX_RAW_ADDR(out_ea));
+
+  float32x4_t a0 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(a_ptr)));
+  float32x4_t a1 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(a_ptr + 16)));
+  float32x4_t a2 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(a_ptr + 32)));
+  float32x4_t a3 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(a_ptr + 48)));
+
+  float32x4_t b0 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(b_ptr)));
+  float32x4_t b1 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(b_ptr + 16)));
+  float32x4_t b2 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(b_ptr + 32)));
+  float32x4_t b3 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(b_ptr + 48)));
+
+  auto mul_row = [&](float32x4_t row) {
+    float32x4_t res = vmulq_laneq_f32(b0, row, 0);
+    res = vfmaq_laneq_f32(res, b1, row, 1);
+    res = vfmaq_laneq_f32(res, b2, row, 2);
+    res = vfmaq_laneq_f32(res, b3, row, 3);
+    return res;
+  };
+
+  vst1q_u8(out_ptr, vrev32q_u8(vreinterpretq_u8_f32(mul_row(a0))));
+  vst1q_u8(out_ptr + 16, vrev32q_u8(vreinterpretq_u8_f32(mul_row(a1))));
+  vst1q_u8(out_ptr + 32, vrev32q_u8(vreinterpretq_u8_f32(mul_row(a2))));
+  vst1q_u8(out_ptr + 48, vrev32q_u8(vreinterpretq_u8_f32(mul_row(a3))));
+}
+#endif
+
+// -----------------------------------------------------------------------------
+// 5c. FastSub828D4268: rage::rmcDrawable::DrawModelsSkinned (gta4_recomp.71.cpp:28389)
+// Eliminates 16 PPC callee-saved spills (r16..r31) around sub_828BD250/sub_828C4578/sub_828C4338,
+// hoists models array and count outside the model loop, and accelerates matrix math with NEON.
+// -----------------------------------------------------------------------------
+extern "C" void FastSub828D4268(PPCContext& ctx, uint8_t* base) {
+  REX_FUNC_PROLOGUE();
+  ctx.r12.u64 = ctx.lr;
+  ctx.lr = 0x828D4270u;
+  const uint32_t old_sp = ctx.r1.u32;
+  const uint32_t sp = old_sp - 352u;
+  REX_STORE_U32(sp, old_sp);
+  ctx.r1.u32 = sp;
+
+  const uint32_t r27_lod = ctx.r8.u32;
+  const uint32_t r31_mtx = ctx.r5.u32;
+  const uint32_t r24_shader_group = ctx.r4.u32;
+  const uint32_t r26_bone_mtx = ctx.r6.u32;
+  const uint32_t r23_bucket = ctx.r7.u32;
+  const uint32_t r20_mask_ptr = ctx.r9.u32;
+
+  const uint32_t lod_offset = ((r27_lod + 12u) << 2) & 0xFFFFFFFCu;
+  const uint32_t r21_model_list = REX_LOAD_U32(ctx.r3.u32 + lod_offset);
+
+  if (r31_mtx != 0u) {
+#if defined(__aarch64__)
+    const uint8x16_t m0 = vld1q_u8(reinterpret_cast<const uint8_t*>(REX_RAW_ADDR(r31_mtx)));
+    const uint8x16_t m1 = vld1q_u8(reinterpret_cast<const uint8_t*>(REX_RAW_ADDR(r31_mtx + 16u)));
+    const uint8x16_t m2 = vld1q_u8(reinterpret_cast<const uint8_t*>(REX_RAW_ADDR(r31_mtx + 32u)));
+    const uint8x16_t m3 = vld1q_u8(reinterpret_cast<const uint8_t*>(REX_RAW_ADDR(r31_mtx + 48u)));
+    vst1q_u8(reinterpret_cast<uint8_t*>(REX_RAW_ADDR(sp + 80u)), m0);
+    vst1q_u8(reinterpret_cast<uint8_t*>(REX_RAW_ADDR(sp + 96u)), m1);
+    vst1q_u8(reinterpret_cast<uint8_t*>(REX_RAW_ADDR(sp + 112u)), m2);
+    vst1q_u8(reinterpret_cast<uint8_t*>(REX_RAW_ADDR(sp + 128u)), m3);
+#else
+    std::memcpy(REX_RAW_ADDR(sp + 80u), REX_RAW_ADDR(r31_mtx), 64);
+#endif
+  } else {
+    REX_STORE_U32(sp + 80u, 0x3F800000u);
+    REX_STORE_U32(sp + 84u, 0x00000000u);
+    REX_STORE_U32(sp + 88u, 0x00000000u);
+    REX_STORE_U32(sp + 96u, 0x00000000u);
+    REX_STORE_U32(sp + 100u, 0x3F800000u);
+    REX_STORE_U32(sp + 104u, 0x00000000u);
+    REX_STORE_U32(sp + 112u, 0x00000000u);
+    REX_STORE_U32(sp + 116u, 0x00000000u);
+    REX_STORE_U32(sp + 120u, 0x3F800000u);
+#if defined(__aarch64__)
+    const uint8x16_t row3 = vld1q_u8(reinterpret_cast<const uint8_t*>(REX_RAW_ADDR((r26_bone_mtx + 16u) & ~0xFu)));
+    vst1q_u8(reinterpret_cast<uint8_t*>(REX_RAW_ADDR(sp + 128u)), row3);
+#else
+    std::memcpy(REX_RAW_ADDR(sp + 128u), REX_RAW_ADDR((r26_bone_mtx + 16u) & ~0xFu), 16);
+#endif
+  }
+
+  if (r21_model_list != 0u) {
+    const uint32_t count = REX_LOAD_U16(r21_model_list + 4u);
+    if (count > 0u) {
+      const uint32_t models_array = REX_LOAD_U32(r21_model_list + 0u);
+      if (models_array != 0u) {
+        int32_t r29_cached_bone = -2;
+        constexpr uint32_t kGlobalVpAddr = 0x831C2200u;  // -2095316992 + 8704
+
+        for (uint32_t i = 0; i < count; ++i) {
+          const uint32_t model = REX_LOAD_U32(models_array + (i << 2));
+          if (model == 0u) continue;
+
+          if (r20_mask_ptr != 0u) {
+            const uint32_t mask_words = REX_LOAD_U32(r20_mask_ptr);
+            const uint32_t word_off = ((i >> 5) << 2) & 0xFFFFFFFCu;
+            const uint32_t mask_word = REX_LOAD_U32(mask_words + word_off);
+            if (((mask_word >> (i & 0x1Fu)) & 1u) == 0u) {
+              continue;
+            }
+          }
+
+          const uint8_t is_skinned = REX_LOAD_U8(model + 25u);
+          if (is_skinned != 0u) {
+            if (r29_cached_bone != -1) {
+              ctx.r4.u64 = sp + 80u;
+              ctx.r3.u64 = REX_LOAD_U32(kGlobalVpAddr);
+              ctx.lr = 0x828D43A0u;
+              sub_828BD250(ctx, base);
+              r29_cached_bone = -1;
+            }
+            ctx.r7.u64 = r27_lod;
+            ctx.r6.u64 = r23_bucket;
+            ctx.r5.u64 = r26_bone_mtx;
+            ctx.r4.u64 = r24_shader_group;
+            ctx.r3.u64 = model;
+            ctx.lr = 0x828D43BCu;
+            sub_828C4578(ctx, base);
+          } else {
+            const int32_t bone_idx = static_cast<int32_t>(REX_LOAD_U8(model + 23u));
+            if (bone_idx != r29_cached_bone) {
+              ctx.r4.u64 = sp + 144u;
+              ctx.r3.u64 = r26_bone_mtx;
+              ctx.r5.u64 = static_cast<uint32_t>(bone_idx);
+              r29_cached_bone = bone_idx;
+              ctx.lr = 0x828D43D8u;
+              sub_828CAF58(ctx, base);
+
+              if (r31_mtx != 0u) {
+#if defined(__aarch64__)
+                MultiplyMatrix4x4_BE(base, sp + 144u, sp + 144u, r31_mtx);
+#else
+                float a[4][4], b[4][4], out[4][4];
+                for (int r = 0; r < 4; ++r) {
+                  for (int c = 0; c < 4; ++c) {
+                    uint32_t ua = REX_LOAD_U32(sp + 144u + ((r * 4 + c) << 2));
+                    uint32_t ub = REX_LOAD_U32(r31_mtx + ((r * 4 + c) << 2));
+                    std::memcpy(&a[r][c], &ua, 4);
+                    std::memcpy(&b[r][c], &ub, 4);
+                  }
+                }
+                for (int r = 0; r < 4; ++r) {
+                  for (int c = 0; c < 4; ++c) {
+                    out[r][c] = a[r][0] * b[0][c] + a[r][1] * b[1][c] + a[r][2] * b[2][c] + a[r][3] * b[3][c];
+                    uint32_t uo;
+                    std::memcpy(&uo, &out[r][c], 4);
+                    REX_STORE_U32(sp + 144u + ((r * 4 + c) << 2), uo);
+                  }
+                }
+#endif
+              }
+              ctx.r4.u64 = sp + 144u;
+              ctx.r3.u64 = REX_LOAD_U32(kGlobalVpAddr);
+              ctx.lr = 0x828D449Cu;
+              sub_828BD250(ctx, base);
+            }
+            ctx.r6.u64 = r27_lod;
+            ctx.r5.u64 = r23_bucket;
+            ctx.r4.u64 = r24_shader_group;
+            ctx.r3.u64 = model;
+            ctx.lr = 0x828D44B0u;
+            FastSub828C4338(ctx, base);
+          }
+        }
+      }
+    }
+  }
+
+  ctx.r1.s64 = static_cast<int64_t>(sp) + 352;
 }
 
 // -----------------------------------------------------------------------------
