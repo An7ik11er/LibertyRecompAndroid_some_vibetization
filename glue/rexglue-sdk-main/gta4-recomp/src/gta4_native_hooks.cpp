@@ -25,6 +25,10 @@
 #include <arm_neon.h>
 #endif
 
+#if defined(__ANDROID__) || defined(__linux__)
+#include <unistd.h>
+#endif
+
 #include <fmt/format.h>
 #include <xxhash.h>
 
@@ -964,6 +968,7 @@ constexpr uint32_t kNativeLocalLightCandidateLimit = 2048;
 
 // Verified by sub_828C6568/sub_828C64C8 in generated/gta4_recomp.65.cpp.
 constexpr uint32_t kActiveDeferredTechniqueGlobal = 0x831C3DE0;
+constexpr uint32_t kActiveDeferredPassGlobal = 0x831C3DDC;
 constexpr uint32_t kDeferredTechniquePassTableOffset = 8;
 constexpr uint32_t kDeferredTechniquePassStride = 32;
 constexpr uint32_t kRetailNullClearColorGlobal = 0x82000A34;
@@ -4763,7 +4768,116 @@ extern "C" void sub_828C6568(PPCContext& ctx, uint8_t* base) {
   SlowSub828C6568(ctx, base);
 }
 
+namespace {
+
+inline bool IsPlausibleGuestPtr(uint32_t ea) {
+  if (ea < 0x00100000u || ea >= 0xF0000000u) {
+    return false;
+  }
+  const uint32_t hi = ea & 0xFFFF0000u;
+  return hi != 0xCDCD0000u && hi != 0xDDDD0000u && hi != 0xFEEE0000u;
+}
+
+}  // namespace
+
+// -----------------------------------------------------------------------------
+// [Mali-Guard] Dynamic GPU detection & crash safety filters for ARM Mali.
+// Protects against unpopulated technique pass tables, null pointer dereferences,
+// and uninitialized state callbacks caused by slow asynchronous streaming /
+// lack of Turnip-style blocking shader compilation stalls on Mali GPUs.
+// Active strictly when running on ARM Mali (/dev/mali0). On Snapdragon / PC,
+// these hooks immediately pass through to the original compiled functions.
+// -----------------------------------------------------------------------------
+static bool IsMaliDevice() {
+  static int s_is_mali = -1;
+  if (s_is_mali != -1) [[likely]] {
+    return s_is_mali == 1;
+  }
+#if defined(__ANDROID__)
+  if (access("/dev/mali0", F_OK) == 0) {
+    s_is_mali = 1;
+    REXLOG_INFO("[Mali-Guard] Active: ARM Mali GPU detected via /dev/mali0");
+    return true;
+  }
+#endif
+  s_is_mali = 0;
+  return false;
+}
+
 extern "C" void sub_828C64C8(PPCContext& ctx, uint8_t* base) {
+  if (IsMaliDevice()) {
+    const uint32_t r3_obj = ctx.r3.u32;
+    if (!IsPlausibleGuestPtr(r3_obj)) {
+      static std::atomic<uint32_t> s_drop_cnt{0};
+      if (s_drop_cnt.fetch_add(1, std::memory_order_relaxed) < 8u) {
+        REXLOG_WARN("[Mali-Guard] sub_828C64C8: dropped invalid r3={:08X} r4={} lr={:08X}",
+                    r3_obj, ctx.r4.u32, static_cast<uint32_t>(ctx.lr));
+      }
+      StoreU32(base, kActiveDeferredPassGlobal, 0u);
+      return;
+    }
+    const uint32_t r11_shader = REX_LOAD_U32(r3_obj + 24u);
+    if (!IsPlausibleGuestPtr(r11_shader)) {
+      static std::atomic<uint32_t> s_drop_cnt2{0};
+      if (s_drop_cnt2.fetch_add(1, std::memory_order_relaxed) < 8u) {
+        REXLOG_WARN("[Mali-Guard] sub_828C64C8: dropped invalid r11={:08X} r3={:08X} lr={:08X}",
+                    r11_shader, r3_obj, static_cast<uint32_t>(ctx.lr));
+      }
+      StoreU32(base, kActiveDeferredPassGlobal, 0u);
+      return;
+    }
+    const uint32_t tech = LoadU32(base, kActiveDeferredTechniqueGlobal);
+    if (!IsPlausibleGuestPtr(tech)) {
+      static std::atomic<uint32_t> s_drop_cnt3{0};
+      if (s_drop_cnt3.fetch_add(1, std::memory_order_relaxed) < 8u) {
+        REXLOG_WARN("[Mali-Guard] sub_828C64C8: dropped uninitialized technique={:08X} r3={:08X} lr={:08X}",
+                    tech, r3_obj, static_cast<uint32_t>(ctx.lr));
+      }
+      StoreU32(base, kActiveDeferredPassGlobal, 0u);
+      return;
+    }
+    const uint32_t pass_table = REX_LOAD_U32(tech + kDeferredTechniquePassTableOffset);
+    if (!IsPlausibleGuestPtr(pass_table)) {
+      static std::atomic<uint32_t> s_drop_cnt4{0};
+      if (s_drop_cnt4.fetch_add(1, std::memory_order_relaxed) < 8u) {
+        REXLOG_WARN("[Mali-Guard] sub_828C64C8: dropped uninitialized pass_table={:08X} tech={:08X} lr={:08X}",
+                    pass_table, tech, static_cast<uint32_t>(ctx.lr));
+      }
+      StoreU32(base, kActiveDeferredPassGlobal, 0u);
+      return;
+    }
+    const uint32_t pass_idx = ctx.r4.u32;
+    if (pass_idx >= 64u) {
+      static std::atomic<uint32_t> s_drop_cnt5{0};
+      if (s_drop_cnt5.fetch_add(1, std::memory_order_relaxed) < 8u) {
+        REXLOG_WARN("[Mali-Guard] sub_828C64C8: dropped out-of-range pass_idx={} tech={:08X}",
+                    pass_idx, tech);
+      }
+      StoreU32(base, kActiveDeferredPassGlobal, 0u);
+      return;
+    }
+    const uint32_t target_pass = pass_table + (pass_idx * kDeferredTechniquePassStride);
+    if (!IsPlausibleGuestPtr(target_pass)) {
+      static std::atomic<uint32_t> s_drop_cnt6{0};
+      if (s_drop_cnt6.fetch_add(1, std::memory_order_relaxed) < 8u) {
+        REXLOG_WARN("[Mali-Guard] sub_828C64C8: dropped invalid target_pass={:08X} tech={:08X}",
+                    target_pass, tech);
+      }
+      StoreU32(base, kActiveDeferredPassGlobal, 0u);
+      return;
+    }
+    const uint16_t state_count = REX_LOAD_U16(target_pass + 28u);
+    if (state_count > 128u) {
+      static std::atomic<uint32_t> s_drop_cnt7{0};
+      if (s_drop_cnt7.fetch_add(1, std::memory_order_relaxed) < 8u) {
+        REXLOG_WARN("[Mali-Guard] sub_828C64C8: dropped uninitialized pass={:08X} cnt={}",
+                    target_pass, state_count);
+      }
+      StoreU32(base, kActiveDeferredPassGlobal, 0u);
+      return;
+    }
+  }
+
   if (PhoneCaptureActive()) [[unlikely]] {
     g_phone_context.material = ctx.r3.u32;
     g_phone_context.mode = ctx.r4.u32;
@@ -4937,7 +5051,8 @@ uint32_t EncodeNativeFetchAddress(uint32_t address);
 
 inline void FastGeometryDraw(uint8_t* base, uint32_t prim_type_idx,
                              uint32_t vdecl, uint32_t stream_buf, uint32_t index_buf,
-                             uint32_t primitive_count, uint32_t caller) {
+                             uint32_t primitive_count, uint32_t caller,
+                             uint32_t stream1_buf = 0) {
   const uint32_t index_buf_prims = LoadU32(base, index_buf + 4);
   if (primitive_count == 0 || primitive_count > index_buf_prims) {
     primitive_count = index_buf_prims;
@@ -5032,6 +5147,10 @@ inline void FastGeometryDraw(uint8_t* base, uint32_t prim_type_idx,
   command.batch_ib = ib_buf;
   command.batch_vb = vb_buf;
   command.batch_stride = vb_stride;
+  if (stream1_buf != 0) [[unlikely]] {
+    command.batch_vb1 = LoadU32(base, stream1_buf + 28);
+    command.batch_stride1 = LoadU32(base, stream1_buf + 12);
+  }
 
   ConsumeNativeDrawDirtyStateInto(base, device, command.dirty_state);
   temporal_host::Draw(base, command.device);
@@ -5046,13 +5165,7 @@ extern "C" void sub_828E7000(PPCContext& ctx, uint8_t* base) {
 
   const uint32_t r31_geom = ctx.r3.u32;
 
-  // Secondary stream / skinning (offset +68) - fallback to full recomp if active
-  if (REX_LOAD_U32(r31_geom + 68u) != 0u) [[unlikely]] {
-    __imp__sub_828E7000(ctx, base);
-    return;
-  }
-
-  // Fast path (loc_828E7080): bypass 112-byte guest stack frame allocation
+  // Fast path: bypass 112-byte guest stack frame allocation & D3D9 SetStreamSource overhead
   uint32_t r30_slot = 0u;
   if (static_cast<int32_t>(REX_LOAD_U32(r31_geom + 72u)) != 0) [[unlikely]] {
     r30_slot = REX_LOAD_U32(0x831C6214u);
@@ -5061,9 +5174,13 @@ extern "C" void sub_828E7000(PPCContext& ctx, uint8_t* base) {
   const uint32_t r11_ib_off = ((r30_slot + 7u) << 2) & 0xFFFFFFFCu;
   const uint32_t r10_vb_off = ((r30_slot + 3u) << 2) & 0xFFFFFFFCu;
 
-  FastGeometryDraw(base, REX_LOAD_U16(r31_geom + 54u), REX_LOAD_U32(r31_geom + 4u),
+  const uint32_t stream1_buf = REX_LOAD_U32(r31_geom + 68u);
+  const uint32_t vdecl = stream1_buf ? REX_LOAD_U32(r31_geom + 64u) : REX_LOAD_U32(r31_geom + 4u);
+  const uint32_t caller = stream1_buf ? 0x828E7074u : 0x828E70A8u;
+
+  FastGeometryDraw(base, REX_LOAD_U16(r31_geom + 54u), vdecl,
                    REX_LOAD_U32(r31_geom + r10_vb_off), REX_LOAD_U32(r31_geom + r11_ib_off),
-                   REX_LOAD_U32(r31_geom + 44u), 0x828E70A8u);
+                   REX_LOAD_U32(r31_geom + 44u), caller, stream1_buf);
 }
 
 extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
@@ -5075,6 +5192,53 @@ extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
                    static_cast<uint32_t>(ctx.lr));
 }
 
+namespace {
+
+inline bool ValidateEffectPassTables(const char* fn, uint8_t* base, uint64_t saved_lr,
+                                     uint32_t pass, uint32_t arg1, uint32_t shader_data,
+                                     uint32_t effect_ptr, uint16_t& out_count,
+                                     uint32_t& out_pair_table, uint32_t& out_type_table,
+                                     uint32_t& out_val_table, uint32_t& out_effect_base,
+                                     uint32_t& out_arg1_table) {
+  static std::atomic<uint32_t> s_diag_count{0};
+  auto log_bad = [&](const char* reason, uint16_t count_val, uint32_t ebase, uint32_t ptable) {
+    if (s_diag_count.fetch_add(1, std::memory_order_relaxed) < 16u) {
+      REXLOG_WARN(
+          "diag-effect-pass({}): {} lr={:08X} pass={:08X} arg1={:08X} sdata={:08X} eptr={:08X} "
+          "cnt={} ebase={:08X} ptab={:08X} tech={:08X} g82CBBE18={:08X}",
+          fn, reason, static_cast<uint32_t>(saved_lr), pass, arg1, shader_data, effect_ptr,
+          count_val, ebase, ptable, LoadU32(base, 0x831C3DE0u), LoadU32(base, 0x82CBBE18u));
+    }
+  };
+  if (!IsPlausibleGuestPtr(pass) || !IsPlausibleGuestPtr(arg1) ||
+      !IsPlausibleGuestPtr(shader_data) || !IsPlausibleGuestPtr(effect_ptr)) {
+    log_bad("bad-arg-ptr", 0u, 0u, 0u);
+    return false;
+  }
+  out_count = LoadU16(base, pass + 8u);
+  if (out_count == 0u) {
+    return true;
+  }
+  if (out_count > 256u) {
+    log_bad("bad-count", out_count, 0u, 0u);
+    return false;
+  }
+  out_pair_table = LoadU32(base, pass + 4u);
+  out_type_table = LoadU32(base, shader_data + 16u);
+  out_val_table = LoadU32(base, shader_data);
+  out_effect_base = LoadU32(base, effect_ptr);
+  out_arg1_table = LoadU32(base, arg1 + 4u);
+  if (!IsPlausibleGuestPtr(out_pair_table) || !IsPlausibleGuestPtr(out_type_table) ||
+      !IsPlausibleGuestPtr(out_val_table) || !IsPlausibleGuestPtr(out_effect_base) ||
+      !IsPlausibleGuestPtr(out_arg1_table)) {
+    log_bad("bad-table-ptr", out_count, out_effect_base, out_pair_table);
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
 extern "C" void sub_828C8DB0(PPCContext& ctx, uint8_t* base) {
   const uint64_t saved_lr = ctx.lr;
   const uint32_t pass = ctx.r3.u32;
@@ -5082,24 +5246,28 @@ extern "C" void sub_828C8DB0(PPCContext& ctx, uint8_t* base) {
   const uint32_t shader_data = ctx.r5.u32;
   const uint32_t effect_ptr = ctx.r6.u32;
 
-  // Inlined sub_828DFF00: only emit SetVertexShader when bound handle changes.
-  constexpr uint32_t kBoundVertexShaderGlobal = 0x831C5DD8u;
-  const uint32_t vs = LoadU32(base, arg1 + 8u);
-  if (LoadU32(base, kBoundVertexShaderGlobal) != vs) {
-    StoreU32(base, kBoundVertexShaderGlobal, vs);
-    ctx.r3.u64 = LoadU32(base, 0x831C22A4u);
-    ctx.r4.u64 = vs;
-    ctx.lr = 0x828C8DD4u;
-    sub_82A42760(ctx, base);
+  if (IsPlausibleGuestPtr(arg1)) {
+    // Inlined sub_828DFF00: only emit SetVertexShader when bound handle changes.
+    constexpr uint32_t kBoundVertexShaderGlobal = 0x831C5DD8u;
+    const uint32_t vs = LoadU32(base, arg1 + 8u);
+    if (LoadU32(base, kBoundVertexShaderGlobal) != vs) {
+      StoreU32(base, kBoundVertexShaderGlobal, vs);
+      ctx.r3.u64 = LoadU32(base, 0x831C22A4u);
+      ctx.r4.u64 = vs;
+      ctx.lr = 0x828C8DD4u;
+      sub_82A42760(ctx, base);
+    }
   }
 
-  const uint16_t count = LoadU16(base, pass + 8u);
+  uint16_t count = 0u;
+  uint32_t pair_table = 0u, type_table = 0u, val_table = 0u, effect_base = 0u, arg1_table = 0u;
+  if (!ValidateEffectPassTables("828C8DB0", base, saved_lr, pass, arg1, shader_data, effect_ptr,
+                                count, pair_table, type_table, val_table, effect_base, arg1_table)) {
+    ctx.r12.u64 = saved_lr;
+    ctx.lr = saved_lr;
+    return;
+  }
   if (count > 0u) {
-    const uint32_t pair_table = LoadU32(base, pass + 4u);
-    const uint32_t type_table = LoadU32(base, shader_data + 16u);
-    const uint32_t val_table = LoadU32(base, shader_data);
-    const uint32_t effect_base = LoadU32(base, effect_ptr);
-    const uint32_t arg1_table = LoadU32(base, arg1 + 4u);
     const bool native_mode = IsNativeMode();
 
     for (uint32_t i = 0; i < count; ++i) {
@@ -5159,24 +5327,28 @@ extern "C" void sub_828C8E80(PPCContext& ctx, uint8_t* base) {
   const uint32_t shader_data = ctx.r5.u32;
   const uint32_t effect_ptr = ctx.r6.u32;
 
-  // Inlined sub_828DFF28: only emit SetPixelShader when bound handle changes.
-  constexpr uint32_t kBoundPixelShaderGlobal = 0x82B0D8BCu;
-  const uint32_t ps = LoadU32(base, arg1 + 8u);
-  if (LoadU32(base, kBoundPixelShaderGlobal) != ps) {
-    StoreU32(base, kBoundPixelShaderGlobal, ps);
-    ctx.r3.u64 = LoadU32(base, 0x831C22A4u);
-    ctx.r4.u64 = ps;
-    ctx.lr = 0x828C8EA8u;
-    sub_82A424A8(ctx, base);
+  if (IsPlausibleGuestPtr(arg1)) {
+    // Inlined sub_828DFF28: only emit SetPixelShader when bound handle changes.
+    constexpr uint32_t kBoundPixelShaderGlobal = 0x82B0D8BCu;
+    const uint32_t ps = LoadU32(base, arg1 + 8u);
+    if (LoadU32(base, kBoundPixelShaderGlobal) != ps) {
+      StoreU32(base, kBoundPixelShaderGlobal, ps);
+      ctx.r3.u64 = LoadU32(base, 0x831C22A4u);
+      ctx.r4.u64 = ps;
+      ctx.lr = 0x828C8EA8u;
+      sub_82A424A8(ctx, base);
+    }
   }
 
-  const uint16_t count = LoadU16(base, pass + 8u);
+  uint16_t count = 0u;
+  uint32_t pair_table = 0u, type_table = 0u, val_table = 0u, effect_base = 0u, arg1_table = 0u;
+  if (!ValidateEffectPassTables("828C8E80", base, saved_lr, pass, arg1, shader_data, effect_ptr,
+                                count, pair_table, type_table, val_table, effect_base, arg1_table)) {
+    ctx.r12.u64 = saved_lr;
+    ctx.lr = saved_lr;
+    return;
+  }
   if (count > 0u) {
-    const uint32_t pair_table = LoadU32(base, pass + 4u);
-    const uint32_t type_table = LoadU32(base, shader_data + 16u);
-    const uint32_t val_table = LoadU32(base, shader_data);
-    const uint32_t effect_base = LoadU32(base, effect_ptr);
-    const uint32_t arg1_table = LoadU32(base, arg1 + 4u);
 
     for (uint32_t i = 0; i < count; ++i) {
       const uint32_t entry = pair_table + (i << 1);
@@ -5217,7 +5389,8 @@ extern "C" void sub_828C8E80(PPCContext& ctx, uint8_t* base) {
 
 void FastSub828C8F38(PPCContext& ctx, uint8_t* base) {
   REX_FUNC_PROLOGUE();
-  ctx.r12.u64 = ctx.lr;
+  const uint64_t saved_lr = ctx.lr;
+  ctx.r12.u64 = saved_lr;
   ctx.lr = 0x828C8F40u;
 
   const uint32_t r31_pass = ctx.r3.u32;
@@ -5226,36 +5399,88 @@ void FastSub828C8F38(PPCContext& ctx, uint8_t* base) {
   const uint32_t r28_params = ctx.r6.u32;
   const uint32_t r27_shader_inst = ctx.r7.u32;
 
+  static std::atomic<uint32_t> s_pass_diag_count{0};
+  if (!IsPlausibleGuestPtr(r31_pass)) {
+    if (s_pass_diag_count.fetch_add(1, std::memory_order_relaxed) < 16u) {
+      REXLOG_WARN("diag-828C8F38: bad-pass pass={:08X} lr={:08X} tech={:08X} g82CBBE18={:08X}",
+                  r31_pass, static_cast<uint32_t>(saved_lr), LoadU32(base, 0x831C3DE0u),
+                  LoadU32(base, 0x82CBBE18u));
+    }
+    ctx.lr = saved_lr;
+    return;
+  }
+
   const uint16_t state_count = REX_LOAD_U16(r31_pass + 28u);
   if (state_count > 0u) {
     const uint32_t states = REX_LOAD_U32(r31_pass + 24u);
-    uint32_t state_off = 0u;
-    for (uint16_t i = 0; i < state_count; ++i) {
-      ctx.r3.u64 = REX_LOAD_U32(states + state_off);
-      ctx.r4.u64 = REX_LOAD_U32(states + state_off + 4u);
-      ctx.lr = 0x828C8F7Cu;
-      sub_828E02E8(ctx, base);
-      state_off += 8u;
+    if (state_count > 128u || !IsPlausibleGuestPtr(states)) {
+      if (s_pass_diag_count.fetch_add(1, std::memory_order_relaxed) < 16u) {
+        REXLOG_WARN("diag-828E02E8: bad-states pass={:08X} cnt={} states={:08X} lr={:08X} tech={:08X}",
+                    r31_pass, state_count, states, static_cast<uint32_t>(saved_lr),
+                    LoadU32(base, 0x831C3DE0u));
+      }
+    } else {
+      const uint32_t grc_dev = LoadU32(base, 0x831C22A4u);
+      uint32_t state_off = 0u;
+      for (uint16_t i = 0; i < state_count; ++i) {
+        const uint32_t state_id = REX_LOAD_U32(states + state_off);
+        const uint32_t state_val = REX_LOAD_U32(states + state_off + 4u);
+        uint32_t offset = 0xFFFFFFFFu;
+        uint32_t target = 0u;
+        if (state_id < 512u && IsPlausibleGuestPtr(grc_dev)) {
+          offset = LoadU32(base, 0x82B0D8F8u + (state_id << 2));
+          if (offset < 0x10000u) {
+            target = LoadU32(base, grc_dev + offset + 64u);
+          }
+        }
+        if (!IsPlausibleGuestPtr(target)) {
+          if (s_pass_diag_count.fetch_add(1, std::memory_order_relaxed) < 16u) {
+            REXLOG_WARN(
+                "diag-828E02E8: bad-target pass={:08X} i={}/{} id={} val={:08X} grc={:08X} off={:08X} "
+                "target={:08X} tech={:08X} g82CBBE18={:08X} lr={:08X}",
+                r31_pass, i, state_count, state_id, state_val, grc_dev, offset, target,
+                LoadU32(base, 0x831C3DE0u), LoadU32(base, 0x82CBBE18u),
+                static_cast<uint32_t>(saved_lr));
+          }
+        } else {
+          ctx.r3.u64 = state_id;
+          ctx.r4.u64 = state_val;
+          ctx.lr = 0x828C8F7Cu;
+          sub_828E02E8(ctx, base);
+        }
+        state_off += 8u;
+      }
     }
   }
 
   const uint32_t vs_idx = REX_LOAD_U32(r31_pass);
-  const uint32_t vs_base = REX_LOAD_U32(r26_vs_table);
-  ctx.r3.u64 = r31_pass;
-  ctx.r4.u64 = vs_base + (((vs_idx * 3u) << 2) & 0xFFFFFFFCu);
-  ctx.r5.u64 = r28_params;
-  ctx.r6.u64 = r27_shader_inst;
-  ctx.lr = 0x828C8FB4u;
-  sub_828C8DB0(ctx, base);
+  const uint32_t vs_base = IsPlausibleGuestPtr(r26_vs_table) ? REX_LOAD_U32(r26_vs_table) : 0u;
+  if (vs_idx < 1024u && IsPlausibleGuestPtr(vs_base)) {
+    ctx.r3.u64 = r31_pass;
+    ctx.r4.u64 = vs_base + (((vs_idx * 3u) << 2) & 0xFFFFFFFCu);
+    ctx.r5.u64 = r28_params;
+    ctx.r6.u64 = r27_shader_inst;
+    ctx.lr = 0x828C8FB4u;
+    sub_828C8DB0(ctx, base);
+  } else if (s_pass_diag_count.fetch_add(1, std::memory_order_relaxed) < 16u) {
+    REXLOG_WARN("diag-828C8F38: bad-vs pass={:08X} vs_idx={} vs_tab={:08X} vs_base={:08X}",
+                r31_pass, vs_idx, r26_vs_table, vs_base);
+  }
 
   const uint32_t ps_idx = REX_LOAD_U32(r31_pass + 12u);
-  const uint32_t ps_base = REX_LOAD_U32(r25_ps_table);
-  ctx.r3.u64 = r31_pass + 12u;
-  ctx.r4.u64 = ps_base + (((ps_idx * 3u) << 2) & 0xFFFFFFFCu);
-  ctx.r5.u64 = r28_params;
-  ctx.r6.u64 = r27_shader_inst;
-  ctx.lr = 0x828C8FDCu;
-  sub_828C8E80(ctx, base);
+  const uint32_t ps_base = IsPlausibleGuestPtr(r25_ps_table) ? REX_LOAD_U32(r25_ps_table) : 0u;
+  if (ps_idx < 1024u && IsPlausibleGuestPtr(ps_base)) {
+    ctx.r3.u64 = r31_pass + 12u;
+    ctx.r4.u64 = ps_base + (((ps_idx * 3u) << 2) & 0xFFFFFFFCu);
+    ctx.r5.u64 = r28_params;
+    ctx.r6.u64 = r27_shader_inst;
+    ctx.lr = 0x828C8FDCu;
+    sub_828C8E80(ctx, base);
+  } else if (s_pass_diag_count.fetch_add(1, std::memory_order_relaxed) < 16u) {
+    REXLOG_WARN("diag-828C8F38: bad-ps pass={:08X} ps_idx={} ps_tab={:08X} ps_base={:08X}",
+                r31_pass, ps_idx, r25_ps_table, ps_base);
+  }
+  ctx.lr = saved_lr;
 }
 
 extern "C" void sub_828C8F38(PPCContext& ctx, uint8_t* base) {
@@ -5268,6 +5493,73 @@ extern "C" void sub_828C8F38(PPCContext& ctx, uint8_t* base) {
 
 extern "C" void sub_828DFF00(PPCContext& ctx, uint8_t* base) {
   __imp__sub_828DFF00(ctx, base);
+}
+
+// -----------------------------------------------------------------------------
+// Mali-specific safety guards:
+// Protect against uninitialized RAGE technique passes (cnt=52685 / states=CDCDCDCD)
+// and uninitialized state callbacks caused by slow asynchronous streaming /
+// lack of Turnip-style blocking shader compilation stalls on Mali GPUs.
+// Active strictly when running on ARM Mali (/dev/mali0). On Snapdragon / PC,
+// these hooks immediately pass through to the original compiled functions.
+// -----------------------------------------------------------------------------
+extern "C" void __imp__sub_827BAEE0(PPCContext& __restrict, uint8_t*);
+extern "C" void __imp__sub_828E02E8(PPCContext& __restrict, uint8_t*);
+
+extern "C" void sub_827BAEE0(PPCContext& ctx, uint8_t* base) {
+  if (IsMaliDevice()) {
+    const uint32_t pass = ctx.r3.u32;
+    if (!IsPlausibleGuestPtr(pass)) {
+      return;
+    }
+    const uint16_t state_count = REX_LOAD_U16(pass + 28u);
+    if (state_count == 0u) {
+      return;
+    }
+    // RAGE passes never exceed 128 states; 52685 (0xCDCD) is uninitialized memory
+    if (state_count > 128u) {
+      static std::atomic<uint32_t> s_diag_drop{0};
+      if (s_diag_drop.fetch_add(1, std::memory_order_relaxed) < 8u) {
+        REXLOG_WARN("[Mali-Guard] sub_827BAEE0: dropped uninitialized pass={:08X} cnt={}", pass, state_count);
+      }
+      return;
+    }
+    const uint32_t states = REX_LOAD_U32(pass + 24u);
+    if (!IsPlausibleGuestPtr(states)) {
+      static std::atomic<uint32_t> s_diag_drop2{0};
+      if (s_diag_drop2.fetch_add(1, std::memory_order_relaxed) < 8u) {
+        REXLOG_WARN("[Mali-Guard] sub_827BAEE0: dropped bad states ptr={:08X} pass={:08X}", states, pass);
+      }
+      return;
+    }
+  }
+  __imp__sub_827BAEE0(ctx, base);
+}
+
+extern "C" void sub_828E02E8(PPCContext& ctx, uint8_t* base) {
+  if (IsMaliDevice()) {
+    const uint32_t state_id = ctx.r3.u32;
+    if (state_id >= 512u) {
+      return;
+    }
+    const uint32_t grc_dev = LoadU32(base, 0x831C22A4u);
+    if (!IsPlausibleGuestPtr(grc_dev)) {
+      return;
+    }
+    const uint32_t offset = LoadU32(base, 0x82B0D8F8u + (state_id << 2));
+    if (offset >= 0x10000u) {
+      return;
+    }
+    const uint32_t target = LoadU32(base, grc_dev + offset + 64u);
+    if (!IsPlausibleGuestPtr(target)) {
+      static std::atomic<uint32_t> s_diag_target{0};
+      if (s_diag_target.fetch_add(1, std::memory_order_relaxed) < 8u) {
+        REXLOG_WARN("[Mali-Guard] sub_828E02E8: dropped invalid target={:08X} id={}", target, state_id);
+      }
+      return;
+    }
+  }
+  __imp__sub_828E02E8(ctx, base);
 }
 
 SurfaceDescriptor CaptureSurfaceDescriptor(uint8_t* base, uint32_t surface) {
@@ -7470,11 +7762,101 @@ extern "C" void sub_827A9A20(PPCContext& ctx, uint8_t* base) {
 extern "C" void sub_828BD310(PPCContext& ctx, uint8_t* base) {
   const bool trace = IsNativeMode() && IsNativeLightLoopTraceEnabled();
   const uint32_t caller = uint32_t(ctx.lr);
+#if defined(__aarch64__)
+  const uint32_t vp = ctx.r3.u32;
+  const float x = static_cast<float>(ctx.f1.f64);
+  const float y = static_cast<float>(ctx.f2.f64);
+  const float z = static_cast<float>(ctx.f3.f64);
+  const float radius = static_cast<float>(ctx.f4.f64);
+  const uint32_t r8_out_ptr = ctx.r8.u32;
+
+  const uint8_t* vp_ptr = reinterpret_cast<const uint8_t*>(REX_RAW_ADDR(vp));
+
+  const float32x4_t p_x = vdupq_n_f32(x);
+  const float32x4_t p_y = vdupq_n_f32(y);
+  const float32x4_t p_z = vdupq_n_f32(z);
+  const float32x4_t p_r = vdupq_n_f32(radius);
+
+  // Planes 0..3 (SoA, big-endian)
+  const float32x4_t pl0_x = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(vp_ptr + 864)));
+  const float32x4_t pl0_y = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(vp_ptr + 880)));
+  const float32x4_t pl0_z = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(vp_ptr + 896)));
+  const float32x4_t pl0_w = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(vp_ptr + 912)));
+
+  // Planes 4..7 (SoA, big-endian)
+  const float32x4_t pl1_x = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(vp_ptr + 928)));
+  const float32x4_t pl1_y = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(vp_ptr + 944)));
+  const float32x4_t pl1_z = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(vp_ptr + 960)));
+  const float32x4_t pl1_w = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(vp_ptr + 976)));
+
+  float32x4_t d0 = vfmaq_f32(pl0_w, p_z, pl0_z);
+  d0 = vfmaq_f32(d0, p_y, pl0_y);
+  d0 = vfmaq_f32(d0, p_x, pl0_x);
+
+  float32x4_t d1 = vfmaq_f32(pl1_w, p_z, pl1_z);
+  d1 = vfmaq_f32(d1, p_y, pl1_y);
+  d1 = vfmaq_f32(d1, p_x, pl1_x);
+
+  if (r8_out_ptr != 0u) {
+    const float d0_first = vgetq_lane_f32(d0, 0) + radius;
+    StoreU32(base, r8_out_ptr, std::bit_cast<uint32_t>(d0_first));
+  }
+
+  const float32x4_t neg_r = vnegq_f32(p_r);
+  const float32x4_t zero  = vdupq_n_f32(0.0f);
+
+  const uint32x4_t cmp_out0 = vcgeq_f32(d0, neg_r);
+  const uint32x4_t cmp_out1 = vcgeq_f32(d1, neg_r);
+  const uint32x4_t all_out  = vandq_u32(cmp_out0, cmp_out1);
+  const uint32_t r11_val    = (vminvq_u32(all_out) == 0xFFFFFFFFu) ? 1u : 0u;
+
+  const uint32x4_t cmp_in0  = vcgeq_f32(d0, zero);
+  const uint32x4_t cmp_in1  = vcgeq_f32(d1, zero);
+  const uint32x4_t all_in   = vandq_u32(cmp_in0, cmp_in1);
+  const uint32_t r9_val     = (vminvq_u32(all_in) == 0xFFFFFFFFu) ? 1u : 0u;
+
+  ctx.r3.u64 = r11_val + r9_val;
+#else
   __imp__sub_828BD310(ctx, base);
+#endif
   if (trace && !ctx.r3.u32) {
     MarkNativeLocalLightBranch(base, ctx, caller, NativeLocalLightOutcome::kVisibilityRejected,
                                "visibility-rejected");
   }
+}
+
+extern "C" void sub_828BD478(PPCContext& ctx, uint8_t* base) {
+#if defined(__aarch64__)
+  const uint32_t vp = ctx.r3.u32;
+  const uint32_t pt_ea = ctx.r4.u32;
+  const uint32_t r5_flag = ctx.r5.u32;
+
+  const uint8_t* vp_ptr = reinterpret_cast<const uint8_t*>(REX_RAW_ADDR(vp));
+  const uint8_t* pt_ptr = reinterpret_cast<const uint8_t*>(REX_RAW_ADDR(pt_ea));
+
+  const float32x4_t pt = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(pt_ptr)));
+  const float radius = vgetq_lane_f32(pt, 3);
+
+  const float32x4_t m0 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(vp_ptr + 128 + 0)));
+  const float32x4_t m1 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(vp_ptr + 128 + 16)));
+  const float32x4_t m2 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(vp_ptr + 128 + 32)));
+  const float32x4_t m3 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(vp_ptr + 128 + 48)));
+
+  float32x4_t t = m3;
+  t = vfmaq_laneq_f32(t, m0, pt, 0);
+  t = vfmaq_laneq_f32(t, m1, pt, 1);
+  t = vfmaq_laneq_f32(t, m2, pt, 2);
+
+  ctx.f1.f64 = static_cast<double>(vgetq_lane_f32(t, 0));
+  ctx.f2.f64 = static_cast<double>(vgetq_lane_f32(t, 1));
+  ctx.f3.f64 = static_cast<double>(vgetq_lane_f32(t, 2));
+  ctx.f4.f64 = static_cast<double>(radius);
+  ctx.r8.u64 = r5_flag;
+
+  sub_828BD310(ctx, base);
+#else
+  __imp__sub_828BD478(ctx, base);
+#endif
 }
 
 extern "C" void sub_82271FF8(PPCContext& ctx, uint8_t* base) {
