@@ -7836,6 +7836,14 @@ extern "C" void sub_821671F8(PPCContext& ctx, uint8_t* base) {
 
 #include "gta4_bulb_source_trace.inc"
 
+#ifndef REX_LOAD_F32
+#define REX_LOAD_F32(addr) std::bit_cast<float>(REX_LOAD_U32(addr))
+#endif
+#ifndef REX_STORE_F32
+#define REX_STORE_F32(addr, val) REX_STORE_U32(addr, std::bit_cast<uint32_t>(val))
+#endif
+extern "C" void D3DDevice_SetViewportF(PPCContext& ctx, uint8_t* base);
+
 extern "C" void sub_822072D0(PPCContext& ctx, uint8_t* base) {
   ScopedNativeLightingExecution lighting_scope(
       base, 0x822072D0, RenderExecutionStage::kDeferredLighting, LightPassRole::kCorona,
@@ -8338,7 +8346,7 @@ extern "C" void sub_82A3E910(PPCContext& ctx, uint8_t* base) {
     ctx.r5.u64 = frame_r1 + 80u;
     ctx.r6.u64 = clear_color_ptr;
     ctx.lr = 0x82A3EC08u;
-    sub_82A3BE98(ctx, base);
+    D3DDevice_SetViewportF(ctx, base);
 
 
     ctx.r3.u64 = device;
@@ -8632,3 +8640,9 @@ extern "C" void sub_824F6AF0(PPCContext& ctx, uint8_t* base) {
   ctx.r12.u64 = saved_lr;
   ctx.lr = saved_lr;
 }
+
+#include "gta4_help_trace_hooks.inc"
+#include "gta4_fade_trace_hooks.inc"
+#include "gta4_phone_trace_hooks.inc"
+#include "gta4_main_and_drawable_hooks.inc"
+#include "gta4_batch2_hooks.inc"
