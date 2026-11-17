@@ -140,6 +140,8 @@ extern "C" void sub_821BB3D8(PPCContext& ctx, uint8_t* base) {
       (generation << 32) | uint32_t(elapsed));
 }
 
+extern "C" void Optimized_sub_821BB2D0(PPCContext& ctx, uint8_t* base);
+
 extern "C" void sub_821BB2D0(PPCContext& ctx, uint8_t* base) {
   // This is the real deferred-DC execution boundary. The producer's phase
   // scope may have ended long before this list runs on the consuming thread.
@@ -172,7 +174,8 @@ extern "C" void sub_821BB2D0(PPCContext& ctx, uint8_t* base) {
       (uint64_t{argument5} << 32) | argument6,
       (generation << 32) | rex::thread::current_thread_system_id());
 
-  __imp__sub_821BB2D0(ctx, base);
+  // Hardware-verified fast-path with L1 prefetch and devirtualization to sub_821BB6D8
+  Optimized_sub_821BB2D0(ctx, base);
 
   const uint64_t elapsed =
       rex::chrono::Clock::QueryHostTickCount() - begin_tick;

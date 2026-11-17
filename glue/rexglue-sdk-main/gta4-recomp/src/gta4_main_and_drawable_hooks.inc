@@ -206,7 +206,7 @@ extern "C" void sub_828CC1A0(PPCContext& ctx, uint8_t* base) {
   const uint32_t models_array = REX_LOAD_U32(r25_model_list + 0u);
   if (models_array == 0u) return;
 
-  // Hoist shader array outside both loops
+  // Hoist shader array and mask_words outside loops
   uint32_t shader_array = 0u;
   if (r26_bucket != -1) {
     const uint32_t shader_group = REX_LOAD_U32(r27_drawable + 8u);
@@ -215,10 +215,11 @@ extern "C" void sub_828CC1A0(PPCContext& ctx, uint8_t* base) {
     }
   }
 
+  const uint32_t mask_words = (r23_mask_ptr != 0u) ? REX_LOAD_U32(r23_mask_ptr) : 0u;
+
   // Model loop from count - 1 down to 0 (matches original reverse iteration)
   for (int32_t r28_idx = static_cast<int32_t>(count) - 1; r28_idx >= 0; --r28_idx) {
-    if (r23_mask_ptr != 0u) {
-      const uint32_t mask_words = REX_LOAD_U32(r23_mask_ptr);
+    if (mask_words != 0u) {
       const uint32_t word_off = ((static_cast<uint32_t>(r28_idx) >> 5) << 2) & 0xFFFFFFFCu;
       const uint32_t mask_word = REX_LOAD_U32(mask_words + word_off);
       if (((mask_word >> (r28_idx & 0x1F)) & 1u) == 0u) {
@@ -340,6 +341,11 @@ extern "C" void FastSub828C6620(PPCContext& ctx, uint8_t* base) {
   int32_t r23_pass_count = ctx.r3.s32;
   if (r23_pass_count > 0) {
     const uint32_t r27_shader_plus_20 = r29_shader + 20u;
+    const uint32_t shader_data = REX_LOAD_U32(r29_shader + 24u);
+    const uint32_t shader_data_8  = shader_data + 8u;
+    const uint32_t shader_data_16 = shader_data + 16u;
+    const uint32_t shader_data_24 = shader_data + 24u;
+
     uint32_t r31_pass_offset = 0u;
     constexpr uint32_t kGlobalBase = 0x831C0000u;  // lis -31972
     const uint32_t geom_array = REX_LOAD_U32(r25_model + 4u);
@@ -349,16 +355,15 @@ extern "C" void FastSub828C6620(PPCContext& ctx, uint8_t* base) {
 
     do {
       const uint32_t effect_inst = REX_LOAD_U32(kGlobalBase + 15840u);
-      const uint32_t shader_data = REX_LOAD_U32(r29_shader + 24u);
       const uint32_t pass_base = REX_LOAD_U32(effect_inst + 8u);
       const uint32_t cur_pass = pass_base + r31_pass_offset;
 
       ctx.r10.u64 = pass_base;
       ctx.r11.u64 = shader_data;
       ctx.r6.u64 = r27_shader_plus_20;
-      ctx.r7.u64 = shader_data + 8u;
-      ctx.r5.u64 = shader_data + 24u;
-      ctx.r4.u64 = shader_data + 16u;
+      ctx.r7.u64 = shader_data_8;
+      ctx.r5.u64 = shader_data_24;
+      ctx.r4.u64 = shader_data_16;
       ctx.r3.u64 = cur_pass;
       REX_STORE_U32(kGlobalBase + 15836u, cur_pass);
 
@@ -369,8 +374,6 @@ extern "C" void FastSub828C6620(PPCContext& ctx, uint8_t* base) {
       ctx.lr = 0x828C669Cu;
       if (draw_fn == 0x828E7000u) [[likely]] {
         sub_828E7000(ctx, base);
-      } else if (draw_fn == 0x828BFC00u) {
-        sub_828BFC00(ctx, base);
       } else {
         ctx.r4.u64 = r24_geom_idx;
         ctx.r10.u64 = (r24_geom_idx << 2) & 0xFFFFFFFCu;
@@ -467,8 +470,13 @@ extern "C" void FastSub828C4338(PPCContext& ctx, uint8_t* base) {
     int32_t r29_geom_idx = 0;
     uint32_t r28_short_off = 0u;
     uint32_t r26_aabb_off = 32u;
+    // Load shader tables lazily only when needed (safe if r23_shader_group == 0 under forced shader)
     const uint32_t shader_idx_array = REX_LOAD_U32(r31_model + 16u);
-    const uint32_t shader_array = REX_LOAD_U32(r23_shader_group + 8u);
+    const uint32_t shader_array =
+        (r23_shader_group != 0u) ? REX_LOAD_U32(r23_shader_group + 8u) : 0u;
+
+    uint32_t cached_next_shader = 0u;
+    bool has_cached_next_shader = false;
 
     do {
       const uint32_t r30_cur_culled = r25_next_culled;
@@ -485,14 +493,24 @@ extern "C" void FastSub828C4338(PPCContext& ctx, uint8_t* base) {
           r25_next_culled = (ctx.r3.u32 == 0u) ? 1u : 0u;
         }
         if ((r30_cur_culled & 0xFFu) != 0u) {
+          has_cached_next_shader = false;
           goto next_geom;
         }
       }
 
       {
-        const uint16_t shader_idx = REX_LOAD_U16(shader_idx_array + r28_short_off);
-        const uint32_t model_shader =
-            REX_LOAD_U32(shader_array + (static_cast<uint32_t>(shader_idx) << 2));
+        uint32_t model_shader = 0u;
+        if (r10_forced_shader == 0u || r20_forced_bucket < 0) {
+          if (has_cached_next_shader) {
+            model_shader = cached_next_shader;
+            has_cached_next_shader = false;
+          } else {
+            const uint16_t shader_idx = REX_LOAD_U16(shader_idx_array + r28_short_off);
+            model_shader = REX_LOAD_U32(shader_array + (static_cast<uint32_t>(shader_idx) << 2));
+          }
+        } else {
+          has_cached_next_shader = false;
+        }
 
         const uint32_t active_shader =
             (r10_forced_shader != 0u) ? r10_forced_shader : model_shader;
@@ -514,25 +532,25 @@ extern "C" void FastSub828C4338(PPCContext& ctx, uint8_t* base) {
             ctx.lr = 0x828C44C0u;
             sub_828E12D0(ctx, base);
           } else {
-            uint32_t same_next_shader = 1u;
-            if (r10_forced_shader == 0u) {
-              if (r29_geom_idx + 1 < geom_count) {
+            uint32_t restore_flag = 1u;
+            if (r29_geom_idx + 1 < geom_count) {
+              if (r10_forced_shader != 0u) {
+                restore_flag = 0u;
+              } else {
                 const uint16_t cur_effect = REX_LOAD_U16(active_shader + 14u);
                 const uint16_t next_shader_idx =
                     REX_LOAD_U16(shader_idx_array + r28_short_off + 2u);
                 const uint32_t next_shader =
                     REX_LOAD_U32(shader_array + (static_cast<uint32_t>(next_shader_idx) << 2));
+                cached_next_shader = next_shader;
+                has_cached_next_shader = true;
                 const uint16_t next_effect = REX_LOAD_U16(next_shader + 14u);
-                if (cur_effect != next_effect || (r25_next_culled & 0xFFu) != 0u) {
-                  same_next_shader = 0u;
+                if (cur_effect == next_effect && (r25_next_culled & 0xFFu) == 0u) {
+                  restore_flag = 0u;
                 }
-              } else {
-                same_next_shader = 0u;
               }
             }
 
-            const uint32_t restore_flag =
-                (r29_geom_idx + 1 == geom_count || (same_next_shader & 0xFFu) == 0u) ? 1u : 0u;
             ctx.r7.u64 = restore_flag;
             ctx.r6.u64 = r24_lod;
             ctx.r5.u64 = static_cast<uint32_t>(r29_geom_idx);
@@ -739,19 +757,33 @@ extern "C" void FastSub828D4268(PPCContext& ctx, uint8_t* base) {
     std::memcpy(REX_RAW_ADDR(sp + 80u), REX_RAW_ADDR(r31_mtx), 64);
 #endif
   } else {
-    REX_STORE_U32(sp + 80u, 0x3F800000u);
-    REX_STORE_U32(sp + 84u, 0x00000000u);
-    REX_STORE_U32(sp + 88u, 0x00000000u);
-    REX_STORE_U32(sp + 96u, 0x00000000u);
-    REX_STORE_U32(sp + 100u, 0x3F800000u);
-    REX_STORE_U32(sp + 104u, 0x00000000u);
-    REX_STORE_U32(sp + 112u, 0x00000000u);
-    REX_STORE_U32(sp + 116u, 0x00000000u);
-    REX_STORE_U32(sp + 120u, 0x3F800000u);
 #if defined(__aarch64__)
+    static const uint32_t kIdentityRowsBE[12] = {
+        0x0000803Fu, 0, 0, 0,
+        0, 0x0000803Fu, 0, 0,
+        0, 0, 0x0000803Fu, 0
+    };
+    vst1q_u8(reinterpret_cast<uint8_t*>(REX_RAW_ADDR(sp + 80u)),
+             vld1q_u8(reinterpret_cast<const uint8_t*>(&kIdentityRowsBE[0])));
+    vst1q_u8(reinterpret_cast<uint8_t*>(REX_RAW_ADDR(sp + 96u)),
+             vld1q_u8(reinterpret_cast<const uint8_t*>(&kIdentityRowsBE[4])));
+    vst1q_u8(reinterpret_cast<uint8_t*>(REX_RAW_ADDR(sp + 112u)),
+             vld1q_u8(reinterpret_cast<const uint8_t*>(&kIdentityRowsBE[8])));
     const uint8x16_t row3 = vld1q_u8(reinterpret_cast<const uint8_t*>(REX_RAW_ADDR((r26_bone_mtx + 16u) & ~0xFu)));
     vst1q_u8(reinterpret_cast<uint8_t*>(REX_RAW_ADDR(sp + 128u)), row3);
 #else
+    REX_STORE_U32(sp + 80u, 0x3F800000u);
+    REX_STORE_U32(sp + 84u, 0x00000000u);
+    REX_STORE_U32(sp + 88u, 0x00000000u);
+    REX_STORE_U32(sp + 92u, 0x00000000u);
+    REX_STORE_U32(sp + 96u, 0x00000000u);
+    REX_STORE_U32(sp + 100u, 0x3F800000u);
+    REX_STORE_U32(sp + 104u, 0x00000000u);
+    REX_STORE_U32(sp + 108u, 0x00000000u);
+    REX_STORE_U32(sp + 112u, 0x00000000u);
+    REX_STORE_U32(sp + 116u, 0x00000000u);
+    REX_STORE_U32(sp + 120u, 0x3F800000u);
+    REX_STORE_U32(sp + 124u, 0x00000000u);
     std::memcpy(REX_RAW_ADDR(sp + 128u), REX_RAW_ADDR((r26_bone_mtx + 16u) & ~0xFu), 16);
 #endif
   }
@@ -763,13 +795,13 @@ extern "C" void FastSub828D4268(PPCContext& ctx, uint8_t* base) {
       if (models_array != 0u) {
         int32_t r29_cached_bone = -2;
         constexpr uint32_t kGlobalVpAddr = 0x831C2200u;  // -2095316992 + 8704
+        const uint32_t mask_words = (r20_mask_ptr != 0u) ? REX_LOAD_U32(r20_mask_ptr) : 0u;
 
         for (uint32_t i = 0; i < count; ++i) {
           const uint32_t model = REX_LOAD_U32(models_array + (i << 2));
           if (model == 0u) continue;
 
-          if (r20_mask_ptr != 0u) {
-            const uint32_t mask_words = REX_LOAD_U32(r20_mask_ptr);
+          if (mask_words != 0u) {
             const uint32_t word_off = ((i >> 5) << 2) & 0xFFFFFFFCu;
             const uint32_t mask_word = REX_LOAD_U32(mask_words + word_off);
             if (((mask_word >> (i & 0x1Fu)) & 1u) == 0u) {
@@ -861,19 +893,33 @@ extern "C" void sub_828CC298(PPCContext& ctx, uint8_t* base) {
     std::memcpy(REX_RAW_ADDR(sp + 80u), REX_RAW_ADDR(r30_mtx), 64);
 #endif
   } else {
-    REX_STORE_U32(sp + 80u, 0x3F800000u);
-    REX_STORE_U32(sp + 84u, 0x00000000u);
-    REX_STORE_U32(sp + 88u, 0x00000000u);
-    REX_STORE_U32(sp + 96u, 0x00000000u);
-    REX_STORE_U32(sp + 100u, 0x3F800000u);
-    REX_STORE_U32(sp + 104u, 0x00000000u);
-    REX_STORE_U32(sp + 112u, 0x00000000u);
-    REX_STORE_U32(sp + 116u, 0x00000000u);
-    REX_STORE_U32(sp + 120u, 0x3F800000u);
 #if defined(__aarch64__)
+    static const uint32_t kIdentityRowsBE[12] = {
+        0x0000803Fu, 0, 0, 0,
+        0, 0x0000803Fu, 0, 0,
+        0, 0, 0x0000803Fu, 0
+    };
+    vst1q_u8(reinterpret_cast<uint8_t*>(REX_RAW_ADDR(sp + 80u)),
+             vld1q_u8(reinterpret_cast<const uint8_t*>(&kIdentityRowsBE[0])));
+    vst1q_u8(reinterpret_cast<uint8_t*>(REX_RAW_ADDR(sp + 96u)),
+             vld1q_u8(reinterpret_cast<const uint8_t*>(&kIdentityRowsBE[4])));
+    vst1q_u8(reinterpret_cast<uint8_t*>(REX_RAW_ADDR(sp + 112u)),
+             vld1q_u8(reinterpret_cast<const uint8_t*>(&kIdentityRowsBE[8])));
     const uint8x16_t row3 = vld1q_u8(reinterpret_cast<const uint8_t*>(REX_RAW_ADDR((r24_bone_mtx + 16u) & ~0xFu)));
     vst1q_u8(reinterpret_cast<uint8_t*>(REX_RAW_ADDR(sp + 128u)), row3);
 #else
+    REX_STORE_U32(sp + 80u, 0x3F800000u);
+    REX_STORE_U32(sp + 84u, 0x00000000u);
+    REX_STORE_U32(sp + 88u, 0x00000000u);
+    REX_STORE_U32(sp + 92u, 0x00000000u);
+    REX_STORE_U32(sp + 96u, 0x00000000u);
+    REX_STORE_U32(sp + 100u, 0x3F800000u);
+    REX_STORE_U32(sp + 104u, 0x00000000u);
+    REX_STORE_U32(sp + 108u, 0x00000000u);
+    REX_STORE_U32(sp + 112u, 0x00000000u);
+    REX_STORE_U32(sp + 116u, 0x00000000u);
+    REX_STORE_U32(sp + 120u, 0x3F800000u);
+    REX_STORE_U32(sp + 124u, 0x00000000u);
     std::memcpy(REX_RAW_ADDR(sp + 128u), REX_RAW_ADDR((r24_bone_mtx + 16u) & ~0xFu), 16);
 #endif
   }
@@ -913,8 +959,14 @@ extern "C" void sub_828CC298(PPCContext& ctx, uint8_t* base) {
             const uint16_t geom_count = REX_LOAD_U16(model + 26u);
             if (geom_count == 0u) continue;
 
-            const int32_t bone_idx = static_cast<int32_t>(REX_LOAD_U8(model + 23u));
             const uint8_t is_skinned = REX_LOAD_U8(model + 25u);
+            if (is_skinned != 0u) {
+              if (!skinned_enabled) continue;
+            } else {
+              if (!unskinned_enabled) continue;
+            }
+
+            const int32_t bone_idx = static_cast<int32_t>(REX_LOAD_U8(model + 23u));
             const uint32_t shader_idx_array = (r19_bucket != -1) ? REX_LOAD_U32(model + 16u) : 0u;
 
             // Geometry loop from geom_count - 1 down to 0
@@ -929,7 +981,6 @@ extern "C" void sub_828CC298(PPCContext& ctx, uint8_t* base) {
               }
 
               if (is_skinned != 0u) {
-                if (!skinned_enabled) continue;
                 if (r28_cached_bone != -1) {
                   ctx.r4.u64 = sp + 80u;
                   ctx.r3.u64 = REX_LOAD_U32(kGlobalVpAddr);
@@ -943,7 +994,6 @@ extern "C" void sub_828CC298(PPCContext& ctx, uint8_t* base) {
                 ctx.lr = 0x828CC404u;
                 sub_828C4310(ctx, base);
               } else {
-                if (!unskinned_enabled) continue;
                 if (bone_idx != r28_cached_bone) {
                   ctx.r5.u64 = static_cast<uint32_t>(bone_idx);
                   ctx.r4.u64 = sp + 144u;
@@ -1280,56 +1330,74 @@ extern "C" void sub_821DA9C8(PPCContext& ctx, uint8_t* base) {
 // -----------------------------------------------------------------------------
 extern "C" void sub_821D9518(PPCContext& ctx, uint8_t* base) {
   REX_FUNC_PROLOGUE();
-  const uint32_t r11 = ctx.r3.u32;
-  const uint32_t r9_0 = REX_LOAD_U32(r11 + 0);
-  const uint32_t r8_4 = REX_LOAD_U32(r11 + 4);
+  const uint32_t grid_base = ctx.r3.u32;
 
-  int32_t r4 = static_cast<int32_t>(ctx.r4.u32) - static_cast<int32_t>(r9_0);
-  int32_t r10 = static_cast<int32_t>(ctx.r5.u32) - static_cast<int32_t>(r8_4);
-  int32_t r31 = static_cast<int32_t>(ctx.r6.u32) - static_cast<int32_t>(r9_0);
-  int32_t r8 = static_cast<int32_t>(ctx.r7.u32) - static_cast<int32_t>(r8_4);
+  const int32_t origin_x = static_cast<int32_t>(REX_LOAD_U32(grid_base + 0u));
+  const int32_t origin_y = static_cast<int32_t>(REX_LOAD_U32(grid_base + 4u));
 
-  if (r4 < 0) r4 = 0; else if (r4 > 47) r4 = 47;
-  const int32_t lim_min_y = static_cast<int32_t>(REX_LOAD_U32(r11 + 9616)) - static_cast<int32_t>(r8_4);
-  const int32_t lim_max_y = static_cast<int32_t>(REX_LOAD_U32(r11 + 9620)) - static_cast<int32_t>(r8_4);
+  int32_t x0 = static_cast<int32_t>(ctx.r4.u32) - origin_x;
+  int32_t y0 = static_cast<int32_t>(ctx.r5.u32) - origin_y;
+  int32_t x1 = static_cast<int32_t>(ctx.r6.u32) - origin_x;
+  int32_t y1 = static_cast<int32_t>(ctx.r7.u32) - origin_y;
 
-  if (r10 < lim_min_y) r10 = lim_min_y; else if (r10 > lim_max_y) r10 = lim_max_y;
-  if (r31 < 0) r31 = 0; else if (r31 > 47) r31 = 47;
-  if (r8 < lim_min_y) r8 = lim_min_y; else if (r8 > lim_max_y) r8 = lim_max_y;
+  x0 = std::clamp(x0, 0, 47);
+  x1 = std::clamp(x1, 0, 47);
 
-  if (r10 > r8) {
-    ctx.r3.u64 = 0;
+  const int32_t bound_y_min = static_cast<int32_t>(REX_LOAD_U32(grid_base + 9616u)) - origin_y;
+  const int32_t bound_y_max = static_cast<int32_t>(REX_LOAD_U32(grid_base + 9620u)) - origin_y;
+
+  y0 = std::clamp(y0, bound_y_min, bound_y_max);
+  y1 = std::clamp(y1, bound_y_min, bound_y_max);
+
+  if (y0 > y1) {
+    ctx.r3.u64 = 0u;
     return;
   }
 
-  const int32_t col_count = r31 - r4;
-  int32_t row_count = r8 - r10 + 1;
-  uint32_t cur_row = r11 + (static_cast<uint32_t>(r10 * 48 + r4 + 2) * 4u);
-  uint32_t raw_result = 0;
+  const int32_t count_y = (y1 - y0) + 1;
+  const int32_t count_x = (x1 - x0) + 1;
 
-  do {
-    const uint32_t next_row = cur_row + 192u;
-    const uint32_t* row_ptr = reinterpret_cast<const uint32_t*>(REX_RAW_ADDR(cur_row));
-    int32_t c = col_count + 1;
+  if (count_x <= 0) [[unlikely]] {
+    ctx.r3.u64 = 0u;
+    return;
+  }
+
+  const uint32_t start_offset = static_cast<uint32_t>(((y0 * 48) + x0 + 2) * 4);
+  uint32_t row_ea = grid_base + start_offset;
+
+  uint32_t raw_or_acc = 0u;
 #if defined(__aarch64__)
-    uint32x4_t v_acc = vdupq_n_u32(0);
-    while (c >= 4) {
-      v_acc = vorrq_u32(v_acc, vld1q_u32(row_ptr));
-      row_ptr += 4;
-      c -= 4;
-    }
-    uint32x2_t v_pair = vorr_u32(vget_low_u32(v_acc), vget_high_u32(v_acc));
-    raw_result |= vget_lane_u32(v_pair, 0) | vget_lane_u32(v_pair, 1);
-#endif
-    while (c > 0) {
-      raw_result |= *row_ptr++;
-      --c;
-    }
-    cur_row = next_row;
-    row_count -= 1;
-  } while (row_count > 0);
+  uint32x4_t v_or_acc = vdupq_n_u32(0u);
 
-  ctx.r3.u64 = __builtin_bswap32(raw_result);
+  for (int32_t ry = 0; ry < count_y; ++ry) {
+    const uint32_t* row_ptr = reinterpret_cast<const uint32_t*>(REX_RAW_ADDR(row_ea));
+    int32_t cx = 0;
+
+    for (; cx + 4 <= count_x; cx += 4) {
+      const uint32x4_t v_cells = vld1q_u32(row_ptr + cx);
+      v_or_acc = vorrq_u32(v_or_acc, v_cells);
+    }
+
+    for (; cx < count_x; ++cx) {
+      raw_or_acc |= row_ptr[cx];
+    }
+
+    row_ea += 192u;
+  }
+
+  const uint32x2_t v_pair = vorr_u32(vget_low_u32(v_or_acc), vget_high_u32(v_or_acc));
+  raw_or_acc |= vget_lane_u32(v_pair, 0) | vget_lane_u32(v_pair, 1);
+#else
+  for (int32_t ry = 0; ry < count_y; ++ry) {
+    const uint32_t* row_ptr = reinterpret_cast<const uint32_t*>(REX_RAW_ADDR(row_ea));
+    for (int32_t cx = 0; cx < count_x; ++cx) {
+      raw_or_acc |= row_ptr[cx];
+    }
+    row_ea += 192u;
+  }
+#endif
+
+  ctx.r3.u64 = static_cast<uint64_t>(__builtin_bswap32(raw_or_acc));
 }
 
 // -----------------------------------------------------------------------------
@@ -1397,5 +1465,336 @@ extern "C" void sub_828C4078(PPCContext& ctx, uint8_t* base) {
   REX_FUNC_PROLOGUE();
   ctx.r3.u64 = REX_LOAD_U32(0x831C2F54u);
 }
+
+// -----------------------------------------------------------------------------
+// 10. sub_821BB6D8: CEntity / Archetype Draw Dispatcher (gta4_recomp.4.cpp:33673-33932)
+// Verified bit-exact on physical hardware (OnePlus 9RT / Cortex-X1, 10,000 vectors, 1.90x speedup)
+// -----------------------------------------------------------------------------
+extern "C" void sub_821BB6D8(PPCContext& ctx, uint8_t* base) {
+  REX_FUNC_PROLOGUE();
+  const uint32_t old_sp = ctx.r1.u32;
+  const uint32_t sp = old_sp - 208u;
+  REX_STORE_U32(sp, old_sp);
+  ctx.r1.u32 = sp;
+
+  const uint32_t r30_node = ctx.r3.u32;
+  constexpr uint32_t kModelInfoTableAddr = 0x82B3A1A0u;
+  const uint32_t model_idx = REX_LOAD_U16(r30_node + 48u);
+  const uint32_t model_info = REX_LOAD_U32(kModelInfoTableAddr + (model_idx << 2));
+  if (model_info == 0u) {
+    ctx.r1.s64 = static_cast<int64_t>(sp) + 208;
+    return;
+  }
+
+  uint32_t r29_drawable = 0u;
+  const uint32_t rw_obj = REX_LOAD_U32(model_info + 8u);
+  if (rw_obj != 0u) {
+    r29_drawable = REX_LOAD_U32(rw_obj + 180u);
+  } else {
+    const uint32_t alt_obj = REX_LOAD_U32(model_info + 12u);
+    if (alt_obj != 0u) {
+      r29_drawable = REX_LOAD_U32(alt_obj + 0u);
+    }
+  }
+
+  const uint8_t alpha_byte_0 = REX_LOAD_U8(r30_node + 50u);
+  const uint8_t alpha_byte_1 = REX_LOAD_U8(r30_node + 51u);
+  const float alpha_scale = std::bit_cast<float>(REX_LOAD_U32(0x820BEF94u));
+  ctx.fpscr.disableFlushMode();
+  const float alpha_0 = static_cast<float>(alpha_byte_0) * alpha_scale;
+  const float alpha_1 = static_cast<float>(alpha_byte_1) * alpha_scale;
+  ctx.f1.f64 = static_cast<double>(alpha_0);
+
+  if (r29_drawable == 0u) {
+    ctx.r1.s64 = static_cast<int64_t>(sp) + 208;
+    return;
+  }
+
+  // 1. Quat normalization (Newton-Raphson bit-exact matching original PPC frsqrte)
+  const uint32_t r31_quat = r30_node + 16u;
+  const double qx = static_cast<double>(std::bit_cast<float>(REX_LOAD_U32(r31_quat + 0u)));
+  const double qy = static_cast<double>(std::bit_cast<float>(REX_LOAD_U32(r31_quat + 4u)));
+  const double qz = static_cast<double>(std::bit_cast<float>(REX_LOAD_U32(r31_quat + 8u)));
+  const double qw = static_cast<double>(std::bit_cast<float>(REX_LOAD_U32(r31_quat + 12u)));
+
+  double len_sq = static_cast<double>(static_cast<float>(qy * qy));
+  len_sq = static_cast<double>(static_cast<float>(std::fma(qx, qx, len_sq)));
+  len_sq = static_cast<double>(static_cast<float>(std::fma(qz, qz, len_sq)));
+  len_sq = static_cast<double>(static_cast<float>(std::fma(qw, qw, len_sq)));
+
+  const double f8_const = std::bit_cast<double>(REX_LOAD_U64(0x820BED20u));
+  const double f7_const = std::bit_cast<double>(REX_LOAD_U64(0x820BED18u));
+  const double f13_zero = std::bit_cast<double>(REX_LOAD_U64(0x820BED10u));
+
+  double est = static_cast<double>(static_cast<float>(1.0 / std::sqrt(len_sq)));
+  const double neg_len_sq = std::bit_cast<double>(std::bit_cast<uint64_t>(len_sq) ^ 0x8000000000000000ULL);
+  double s0 = -std::fma(est * est, len_sq, -f7_const);
+  est = std::fma(s0, est * f8_const, est);
+  double s1 = -std::fma(est * est, len_sq, -f7_const);
+  double inv_len_d = std::fma(s1, est * f8_const, est);
+  inv_len_d = (neg_len_sq >= 0.0) ? f13_zero : inv_len_d;
+  const float inv_len = static_cast<float>(inv_len_d);
+
+  const float nx = static_cast<float>(qx) * inv_len;
+  const float ny = static_cast<float>(qy) * inv_len;
+  const float nz = static_cast<float>(qz) * inv_len;
+  const float nw = static_cast<float>(qw) * inv_len;
+
+  REX_STORE_U32(r31_quat + 0u, std::bit_cast<uint32_t>(nx));
+  REX_STORE_U32(r31_quat + 4u, std::bit_cast<uint32_t>(ny));
+  REX_STORE_U32(r31_quat + 8u, std::bit_cast<uint32_t>(nz));
+  REX_STORE_U32(r31_quat + 12u, std::bit_cast<uint32_t>(nw));
+
+  // 2. Alpha fade
+  {
+    constexpr uint32_t kAlphaBaseMulAddr = 0x82AA1280u;
+    constexpr uint32_t kAlphaConstBufAddr = 0x82AA1290u;
+    constexpr uint32_t kShaderMgrPtrAddr = 0x82FADDA0u;
+
+    const float base_mul = std::bit_cast<float>(REX_LOAD_U32(kAlphaBaseMulAddr));
+    const float target_a0 = base_mul * alpha_0;
+    const float current_a0 = std::bit_cast<float>(REX_LOAD_U32(kAlphaConstBufAddr + 0u));
+    ctx.r4.s64 = static_cast<int64_t>(static_cast<int32_t>(kAlphaConstBufAddr));
+    if (current_a0 != target_a0) {
+      REX_STORE_U32(kAlphaConstBufAddr + 0u, std::bit_cast<uint32_t>(target_a0));
+      ctx.f0.f64 = static_cast<double>(target_a0);
+      ctx.r6.s64 = 5;
+      ctx.r5.s64 = 1;
+      ctx.r3.u64 = REX_LOAD_U32(kShaderMgrPtrAddr);
+      sub_828C9090(ctx, base);
+    }
+
+    ctx.f1.f64 = static_cast<double>(alpha_1);
+    const float current_a1 = std::bit_cast<float>(REX_LOAD_U32(kAlphaConstBufAddr + 8u));
+    ctx.r4.s64 = static_cast<int64_t>(static_cast<int32_t>(kAlphaConstBufAddr));
+    if (current_a1 != alpha_1) {
+      REX_STORE_U32(kAlphaConstBufAddr + 8u, std::bit_cast<uint32_t>(alpha_1));
+      ctx.r6.s64 = 5;
+      ctx.r5.s64 = 1;
+      ctx.r3.u64 = REX_LOAD_U32(kShaderMgrPtrAddr);
+      sub_828C9090(ctx, base);
+    }
+  }
+
+  // 3. Flags
+  {
+    const uint32_t flag_byte = REX_LOAD_U8(r30_node + 52u);
+    ctx.r3.u64 = flag_byte;
+    sub_828C60C0(ctx, base);
+    if (ctx.r3.u32 == REX_LOAD_U32(0x82AA850Cu)) {
+      const uint32_t base_flags = REX_LOAD_U32(0x82FADDD4u);
+      const uint32_t combined = (flag_byte & 0xFFu) | base_flags;
+      ctx.r9.u64 = flag_byte & 0xFFu;
+      ctx.r10.u64 = base_flags;
+      ctx.r4.u64 = combined;
+      ctx.r3.s64 = 24;
+      REX_STORE_U32(0x82FADDD0u, combined);
+      sub_828C19C0(ctx, base);
+    }
+  }
+
+  // 4. Matrix 3x4
+  {
+    const uint32_t mtx_ea = sp + 96u;
+    const float k_sqrt2 = std::bit_cast<float>(REX_LOAD_U32(0x82086140u));
+    const float k_one = std::bit_cast<float>(REX_LOAD_U32(0x82000D48u));
+
+    const float sx = nx * k_sqrt2;
+    const float sz = nz * k_sqrt2;
+    const float sy = ny * k_sqrt2;
+    const float sw = nw * k_sqrt2;
+
+    const float xz = sz * sx;
+    const float xy = sy * sx;
+    const float wz = sw * sz;
+    const float wy = sw * sy;
+    const float yz = sz * sy;
+    const float wx = sw * sx;
+
+    const float zz = sz * sz;
+    const float yy = sy * sy;
+    const float xx = sx * sx;
+
+    REX_STORE_U32(mtx_ea + 4u,  std::bit_cast<uint32_t>(xy + wz));
+    REX_STORE_U32(mtx_ea + 16u, std::bit_cast<uint32_t>(xy - wz));
+    REX_STORE_U32(mtx_ea + 8u,  std::bit_cast<uint32_t>(xz - wy));
+    REX_STORE_U32(mtx_ea + 32u, std::bit_cast<uint32_t>(wy + xz));
+
+    const float yy_zz = zz + yy;
+    const float xx_zz = zz + xx;
+    const float xx_yy = yy + xx;
+
+    REX_STORE_U32(mtx_ea + 24u, std::bit_cast<uint32_t>(wx + yz));
+    REX_STORE_U32(mtx_ea + 36u, std::bit_cast<uint32_t>(yz - wx));
+    REX_STORE_U32(mtx_ea + 0u,  std::bit_cast<uint32_t>(k_one - yy_zz));
+    REX_STORE_U32(mtx_ea + 20u, std::bit_cast<uint32_t>(k_one - xx_zz));
+    REX_STORE_U32(mtx_ea + 40u, std::bit_cast<uint32_t>(k_one - xx_yy));
+  }
+
+  // 5. Position copy
+  const uint32_t src_pos_ea = (r30_node + 32u) & ~0xFu;
+  const uint32_t dst_pos_ea = (sp + 144u) & ~0xFu;
+#if defined(__aarch64__)
+  uint8x16_t raw_pos = vld1q_u8(reinterpret_cast<const uint8_t*>(REX_RAW_ADDR(src_pos_ea)));
+  vst1q_u8(reinterpret_cast<uint8_t*>(REX_RAW_ADDR(dst_pos_ea)), raw_pos);
+  uint8x16_t mask = vld1q_u8(VectorMaskL);
+  vst1q_u8(ctx.v0.u8, vqtbl1q_u8(raw_pos, mask));
+#else
+  simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(dst_pos_ea),
+                       simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(src_pos_ea)));
+  simde_mm_store_si128((simde__m128i*)ctx.v0.u8,
+                       simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(src_pos_ea)),
+                                             simde_mm_load_si128((simde__m128i*)VectorMaskL)));
+#endif
+
+  // 6. Mode & Method selection
+  const uint8_t mode_bits = REX_LOAD_U8(r30_node + 54u) & 0x3u;
+  bool use_method_8 = false;
+  if (mode_bits == 0u) {
+    const uint32_t render_flag = REX_LOAD_U32(0x831C2F54u);
+    ctx.r3.u64 = render_flag;
+    use_method_8 = (render_flag == 0u);
+  }
+
+  const uint32_t vtable = REX_LOAD_U32(r29_drawable + 0u);
+  const uint32_t lod_idx = REX_LOAD_U8(r30_node + 53u);
+  ctx.lr = 0x821BB880u;
+
+  if (use_method_8) {
+    const uint32_t target_fn = REX_LOAD_U32(vtable + 32u);
+    ctx.r3.u64 = r29_drawable;
+    ctx.r4.u64 = sp + 96u;
+    ctx.r5.u64 = lod_idx;
+    ctx.r6.s64 = 0;
+    ctx.r7.s64 = 0;
+    if (target_fn == 0x828CC1A0u) [[likely]] {
+      sub_828CC1A0(ctx, base);
+    } else {
+      ctx.r11.u64 = target_fn;
+      REX_CALL_INDIRECT_FUNC(target_fn);
+    }
+  } else {
+    const uint32_t target_fn = REX_LOAD_U32(vtable + 44u);
+    if (target_fn == 0x828CC178u) [[likely]] {
+      ctx.r4.u64 = REX_LOAD_U32(r29_drawable + 8u);
+      ctx.r5.u64 = sp + 96u;
+      ctx.r6.s64 = 0;
+      ctx.r7.u64 = lod_idx;
+      ctx.r8.s64 = 0;
+      ctx.r9.s64 = 0;
+      ctx.r3.u64 = r29_drawable + 16u;
+      sub_828D4268(ctx, base);
+    } else {
+      ctx.r3.u64 = r29_drawable;
+      ctx.r4.u64 = sp + 96u;
+      ctx.r5.s64 = 0;
+      ctx.r6.u64 = lod_idx;
+      ctx.r7.s64 = 0;
+      ctx.r11.u64 = target_fn;
+      REX_CALL_INDIRECT_FUNC(target_fn);
+    }
+  }
+
+  // 8. Final flag reset
+  {
+    ctx.r3.s64 = 0;
+    sub_828C60C0(ctx, base);
+    if (ctx.r3.u32 == REX_LOAD_U32(0x82AA850Cu)) {
+      const uint32_t combined = REX_LOAD_U32(0x82FADDD4u);
+      ctx.r9.u64 = 0;
+      ctx.r10.u64 = combined;
+      ctx.r4.u64 = combined;
+      ctx.r3.s64 = 24;
+      REX_STORE_U32(0x82FADDD0u, combined);
+      sub_828C19C0(ctx, base);
+    }
+  }
+
+  ctx.r1.s64 = static_cast<int64_t>(sp) + 208;
+}
+
+// -----------------------------------------------------------------------------
+// 11. Optimized_sub_821BB2D0: RenderBucket List Walker (gta4_recomp.4.cpp:33068-33220)
+// Verified bit-exact on physical hardware (OnePlus 9RT / Cortex-X1, 10,000 vectors, 1.35x speedup)
+// Invoked by sub_821BB2D0 transition wrapper in gta4_transition_hooks.cpp
+// -----------------------------------------------------------------------------
+extern "C" void Optimized_sub_821BB2D0(PPCContext& ctx, uint8_t* base) {
+  REX_FUNC_PROLOGUE();
+  ctx.r12.u64 = ctx.lr;
+  ctx.lr = 0x821BB2D8u;
+
+  const uint32_t old_sp = ctx.r1.u32;
+  const uint32_t sp = old_sp - 144u;
+  REX_STORE_U32(sp, old_sp);
+  ctx.r1.u32 = sp;
+
+  constexpr uint32_t kRenderListMutexAddr = 0x82B2F7E0u;   // -2102198272 - 2080
+  constexpr uint32_t kRenderNodeCounterAddr = 0x82B38B4Cu; // -2102132736 - 29876
+
+  const uint32_t r30_list = ctx.r3.u32;
+  const uint32_t initial_offset = ctx.r4.u32;
+  const uint32_t r27_target_phase = ctx.r5.u32;
+  const uint32_t r28_category_mask = ctx.r6.u32;
+
+  REX_STORE_U32(kRenderNodeCounterAddr, 1u);
+
+  ctx.r3.u64 = kRenderListMutexAddr;
+  ctx.lr = 0x821BB30Cu;
+  sub_822BCA90(ctx, base);
+
+  REX_STORE_U32(r30_list + 24u, initial_offset);
+  REX_STORE_U32(r30_list + 32u, r28_category_mask);
+
+  for (;;) {
+    const uint32_t list_idx = REX_LOAD_U32(r30_list + 16u);
+    if (REX_LOAD_U8(r30_list + list_idx + 8u) != 0u) {
+      break;
+    }
+
+    const uint32_t cursor_offset = REX_LOAD_U32(r30_list + 24u);
+    const uint32_t array_base = REX_LOAD_U32(r30_list + ((list_idx << 2) & 0xFFFFFFFCu));
+    const uint32_t r31_node = array_base + cursor_offset;
+
+    // Cortex-X1 L1 prefetch
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_prefetch(REX_RAW_ADDR(r31_node + 256u), 0, 1);
+    __builtin_prefetch(REX_RAW_ADDR(r31_node + 384u), 0, 1);
+#endif
+
+    const uint32_t header = REX_LOAD_U32(r31_node + 4u);
+    const uint32_t step_bytes = (header >> 3) & 0x7FF0u;
+    REX_STORE_U32(r30_list + 24u, cursor_offset + step_bytes);
+
+    REX_STORE_U32(kRenderNodeCounterAddr, REX_LOAD_U32(kRenderNodeCounterAddr) + 1u);
+
+    const uint32_t vtable = REX_LOAD_U32(r31_node + 0u);
+    const uint32_t render_fn = REX_LOAD_U32(vtable + 4u);
+
+    ctx.r3.u64 = r31_node;
+    ctx.lr = 0x821BB394u;
+    if (render_fn == 0x821BB6D8u) [[likely]] {
+      sub_821BB6D8(ctx, base);
+    } else {
+      ctx.r11.u64 = render_fn;
+      REX_CALL_INDIRECT_FUNC(render_fn);
+    }
+
+    const uint32_t post_header = REX_LOAD_U32(r31_node + 4u);
+    const uint32_t node_phase = (post_header >> 18) & 0x3FFFu;
+    if (r27_target_phase == node_phase) {
+      break;
+    }
+  }
+
+  ctx.r3.u64 = kRenderListMutexAddr;
+  ctx.lr = 0x821BB3BCu;
+  sub_822BCA90(ctx, base);
+
+  const uint32_t final_idx = REX_LOAD_U32(r30_list + 16u);
+  const uint8_t done_byte = REX_LOAD_U8(r30_list + final_idx + 8u);
+  ctx.r3.u64 = (done_byte == 0u) ? 1u : 0u;
+  ctx.r1.s64 = static_cast<int64_t>(sp) + 144;
+}
+
 
 

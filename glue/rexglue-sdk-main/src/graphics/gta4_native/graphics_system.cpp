@@ -26737,7 +26737,7 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
       command.shader_state->versions.Get(DirtyStateComponent::kBooleanConstants);
   const bool can_reuse_shared_allocation =
       pipeline_serial != 0 &&
-      command.texture_inputs_signature != 0 &&
+      (command.texture_inputs_signature != 0 || command.used_texture_mask == 0) &&
       s_fast_shared_memo.frame              == diagnostic_submitted_frame_ &&
       s_fast_shared_memo.cb                 == command_buffer &&
       s_fast_shared_memo.pipeline_serial    == pipeline_serial &&
@@ -26745,6 +26745,7 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
       s_fast_shared_memo.fixed_state        == command.fixed_function_state.get() &&
       s_fast_shared_memo.env_data           == (command.extras ? command.extras->environmental_data.get() : nullptr) &&
       s_fast_shared_memo.texture_inputs_sig == command.texture_inputs_signature &&
+      s_fast_shared_memo.used_texture_mask  == command.used_texture_mask &&
       s_fast_shared_memo.vertex_booleans    == vertex_booleans &&
       s_fast_shared_memo.pixel_booleans     == pixel_booleans &&
       s_fast_shared_memo.boolean_version    == boolean_ver &&
@@ -27022,6 +27023,7 @@ if (!pipeline || !draw_pipeline_layout || !command.shader_state ||
   s_fast_shared_memo.fixed_state        = command.fixed_function_state.get();
   s_fast_shared_memo.env_data           = command_env;
   s_fast_shared_memo.texture_inputs_sig = command.texture_inputs_signature;
+  s_fast_shared_memo.used_texture_mask  = command.used_texture_mask;
   s_fast_shared_memo.vertex_booleans    = vertex_booleans;
   s_fast_shared_memo.pixel_booleans     = pixel_booleans;
   s_fast_shared_memo.boolean_version    = boolean_ver;
@@ -28468,10 +28470,11 @@ bool Gta4NativeGraphicsSystem::RecordIndexedPrimitive(VkCommandBuffer command_bu
 
   auto* vulkan_provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
   const auto& dfn = vulkan_provider->vulkan_device()->functions();
+  const uint64_t cb_identity = NativeVulkanHandleIdentity(command_buffer);
   const VkBuffer upload_buffer = upload_buffer_.buffer;
   const VkDeviceSize default_vertex_offset = 0;
   if (native_draw_state_cache_.UpdateVertexBuffer(
-          NativeVulkanHandleIdentity(command_buffer), kDefaultVertexBinding,
+          cb_identity, kDefaultVertexBinding,
           NativeVulkanHandleIdentity(upload_buffer), uint64_t(default_vertex_offset)) ||
       !frame_cvar_cache_.dedupe_vertex_bindings) {
     profile::CpuCall(profile::CpuOp::kDriverBind, [&] {
@@ -28490,6 +28493,12 @@ bool Gta4NativeGraphicsSystem::RecordIndexedPrimitive(VkCommandBuffer command_bu
           : kVertexStreamCount;
   const uint32_t limit_mask =
       max_stream_limit >= kVertexStreamCount ? ~uint32_t{0} : ((uint32_t{1} << max_stream_limit) - 1);
+
+  std::array<VkBuffer, kVertexStreamCount> pending_vbs{};
+  std::array<VkDeviceSize, kVertexStreamCount> pending_offsets{};
+  uint32_t pending_first_stream = 0;
+  uint32_t pending_stream_count = 0;
+
   for (uint32_t active_mask = required_streams_mask & limit_mask; active_mask;
        active_mask &= active_mask - 1) {
     const uint32_t stream = uint32_t(std::countr_zero(active_mask));
@@ -28519,14 +28528,34 @@ bool Gta4NativeGraphicsSystem::RecordIndexedPrimitive(VkCommandBuffer command_bu
     }
     const VkDeviceSize stream_offset = stream_allocation.offset + stream_state.offset;
     if (native_draw_state_cache_.UpdateVertexBuffer(
-            NativeVulkanHandleIdentity(command_buffer), stream,
+            cb_identity, stream,
             NativeVulkanHandleIdentity(stream_allocation.buffer), uint64_t(stream_offset)) ||
         !frame_cvar_cache_.dedupe_vertex_bindings) {
-      profile::CpuCall(profile::CpuOp::kDriverBind, [&] {
-        return dfn.vkCmdBindVertexBuffers(command_buffer, stream, 1, &stream_allocation.buffer,
-                                          &stream_offset);
-      });
+      if (pending_stream_count > 0 && stream == pending_first_stream + pending_stream_count) {
+        pending_vbs[pending_stream_count] = stream_allocation.buffer;
+        pending_offsets[pending_stream_count] = stream_offset;
+        ++pending_stream_count;
+      } else {
+        if (pending_stream_count > 0) {
+          profile::CpuCall(profile::CpuOp::kDriverBind, [&] {
+            return dfn.vkCmdBindVertexBuffers(command_buffer, pending_first_stream,
+                                              pending_stream_count, pending_vbs.data(),
+                                              pending_offsets.data());
+          });
+        }
+        pending_first_stream = stream;
+        pending_vbs[0] = stream_allocation.buffer;
+        pending_offsets[0] = stream_offset;
+        pending_stream_count = 1;
+      }
     }
+  }
+  if (pending_stream_count > 0) {
+    profile::CpuCall(profile::CpuOp::kDriverBind, [&] {
+      return dfn.vkCmdBindVertexBuffers(command_buffer, pending_first_stream,
+                                        pending_stream_count, pending_vbs.data(),
+                                        pending_offsets.data());
+    });
   }
 
   const uint64_t element_size = index32 ? sizeof(uint32_t) : sizeof(uint16_t);
@@ -40641,11 +40670,14 @@ const bool keeps_draw_state =
             if (other.type != CommandType::kDrawIndexedPrimitive ||
                 other.captured_vertex_constants_hash != command.captured_vertex_constants_hash ||
                 other.captured_pixel_constants_hash != command.captured_pixel_constants_hash ||
+                other.captured_fixed_function_state_hash != command.captured_fixed_function_state_hash ||
+                other.texture_inputs_signature != command.texture_inputs_signature ||
                 other.pipeline_state != command.pipeline_state ||
                 other.shader_state != command.shader_state ||
                 other.index_buffer != command.index_buffer ||
                 other.render_phase != command.render_phase ||
                 other.used_texture_mask != command.used_texture_mask ||
+                other.captured_stream_mask != command.captured_stream_mask ||
                 other.descriptor_page != command.descriptor_page ||
                 (other.extras && (other.extras->fire_trace || other.extras->bulb_trace ||
                                   other.extras->tv_trace || other.extras->temporal_instance)) ||
@@ -40659,14 +40691,35 @@ const bool keeps_draw_state =
                 merged_indices > UINT32_MAX - draw.index_count) {
               break;
             }
-            if (other.vertex_buffers != command.vertex_buffers ||
-                other.textures != command.textures ||
-                other.texture_descriptor_indices != command.texture_descriptor_indices ||
-                other.sampler_descriptor_indices != command.sampler_descriptor_indices ||
-                std::memcmp(&other.lighting(), &command.lighting(), sizeof(command.lighting())) != 0 ||
-                std::memcmp(&other.texture_fetches, &command.texture_fetches,
-                            sizeof(command.texture_fetches)) != 0 ||
-                !NativeFixedStateBytesEqual(other.fixed_function_state, command.fixed_function_state)) {
+            // Сравниваем только реально задействованные вертексные потоки
+            bool streams_match = true;
+            for (uint32_t mask = command.captured_stream_mask; mask; mask &= mask - 1) {
+              const uint32_t s = uint32_t(std::countr_zero(mask));
+              if (other.vertex_buffers[s] != command.vertex_buffers[s]) {
+                streams_match = false;
+                break;
+              }
+            }
+            if (!streams_match) break;
+
+            // Сравниваем только реально используемые текстурные слоты (не трогая 24 холодные кэш-линии)
+            bool textures_match = true;
+            for (uint32_t mask = command.used_texture_mask; mask; mask &= mask - 1) {
+              const uint32_t stage = uint32_t(std::countr_zero(mask));
+              if (other.textures[stage] != command.textures[stage] ||
+                  other.texture_descriptor_indices[stage] != command.texture_descriptor_indices[stage] ||
+                  other.sampler_descriptor_indices[stage] != command.sampler_descriptor_indices[stage] ||
+                  std::memcmp(&other.texture_fetches[stage], &command.texture_fetches[stage],
+                              sizeof(command.texture_fetches[stage])) != 0) {
+                textures_match = false;
+                break;
+              }
+            }
+            if (!textures_match) break;
+
+            if (std::memcmp(&other.lighting(), &command.lighting(), sizeof(command.lighting())) != 0 ||
+                (other.fixed_function_state.get() != command.fixed_function_state.get() &&
+                 !NativeFixedStateBytesEqual(other.fixed_function_state, command.fixed_function_state))) {
               break;
             }
             merged_indices += draw.index_count;

@@ -4109,6 +4109,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     uint32_t vertex_booleans = 0, pixel_booleans = 0;
     StateVersionStamp boolean_version{};
     uint64_t texture_inputs_sig = 0;
+    uint32_t used_texture_mask = UINT32_MAX;
     uint32_t width = 0, height = 0, logical_width = 0, logical_height = 0, samples = 0;
     uint32_t color_mask = 0;
     uint32_t color_output_info_0 = 0;

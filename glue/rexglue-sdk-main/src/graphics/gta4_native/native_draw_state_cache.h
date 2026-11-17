@@ -40,15 +40,10 @@ class NativeDrawStateCache {
     if (!pipeline_.Update(pipeline)) {
       return false;
     }
-    // A different pipeline can contain static state that invalidates dynamic
-    // values. Conservatively re-emit them even for compatible native pipelines.
-    viewport_ = {};
-    scissor_ = {};
-    depth_bias_ = {};
-    stencil_ = {};
-    blend_constants_ = {};
-    push_constants_ = {};
-    dynamic_draw_ = {};
+    // All graphics pipelines in Gta4NativeGraphicsSystem declare VIEWPORT, SCISSOR,
+    // DEPTH_BIAS, STENCIL_* and BLEND_CONSTANTS as VK_DYNAMIC_STATE_*, which are
+    // command-buffer bound in Vulkan and not invalidated across pipeline switches.
+    // PushConstants layout is tracked per layout in push_constants_.
     return true;
   }
 
