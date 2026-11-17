@@ -4963,11 +4963,102 @@ extern "C" void sub_828C4338(PPCContext& ctx, uint8_t* base) {
 }
 
 extern "C" void sub_828C4578(PPCContext& ctx, uint8_t* base) {
-  if (!temporal_host::enabled.load(std::memory_order_relaxed)) [[likely]] {
-    __imp__sub_828C4578(ctx, base);
-    return;
+  REX_FUNC_PROLOGUE();
+
+
+  constexpr uint32_t kOverrideMaterialGlobal = 0x831C2F54u;
+
+
+  const uint64_t saved_lr = ctx.lr;
+  const uint32_t saved_r1 = ctx.r1.u32;
+  const uint32_t frame_r1 = saved_r1 - 160u;
+  REX_STORE_U32(frame_r1, saved_r1);
+  ctx.r1.u32 = frame_r1;
+
+
+  const uint32_t drawable = ctx.r3.u32;
+  const uint32_t shader_group = ctx.r4.u32;
+  const uint32_t draw_arg5 = ctx.r5.u32;
+  const int32_t target_bucket = ctx.r6.s32;
+  const uint32_t draw_arg7 = ctx.r7.u32;
+
+
+  const bool temporal_active = temporal_host::enabled.load(std::memory_order_relaxed);
+  temporal_host::Instance saved_temporal{};
+  if (temporal_active) [[unlikely]] {
+    saved_temporal = temporal_host::instance;
+    temporal_host::instance = {saved_temporal.matrix, drawable, saved_temporal.pose};
   }
-  SlowSub828C4578(ctx, base);
+
+
+  uint32_t override_mat = REX_LOAD_U32(kOverrideMaterialGlobal);
+  int32_t override_bucket = -1;
+  if (override_mat != 0u && REX_LOAD_U8(override_mat + 11u) == 0u) {
+    override_bucket = static_cast<int32_t>(REX_LOAD_U8(override_mat + 9u));
+  }
+
+
+  uint32_t count = REX_LOAD_U16(drawable + 26u);
+  if (count > 0u) {
+    uint32_t mat_idx_table = REX_LOAD_U32(drawable + 16u);
+    uint32_t mat_ptr_table = REX_LOAD_U32(shader_group + 8u);
+
+
+    for (uint32_t i = 0u; i < count; ++i) {
+      const uint32_t byte_off = i << 1;
+      const uint32_t mat_idx = REX_LOAD_U16(mat_idx_table + byte_off);
+      const uint32_t mat_entry = REX_LOAD_U32(mat_ptr_table + (mat_idx << 2));
+
+
+      const uint32_t mat_ptr = (override_mat != 0u) ? override_mat : mat_entry;
+      ctx.r3.u64 = mat_ptr;
+
+
+      const int32_t bucket =
+          (override_bucket >= 0) ? override_bucket : static_cast<int32_t>(REX_LOAD_U8(mat_entry + 9u));
+
+
+      if (bucket == target_bucket) {
+        uint32_t is_batch_end = 1u;
+        if ((i + 1u) < count) {
+          if (override_mat != 0u) {
+            is_batch_end = 0u;
+          } else {
+            const uint32_t next_idx = REX_LOAD_U16(mat_idx_table + byte_off + 2u);
+            const uint32_t next_mat = REX_LOAD_U32(mat_ptr_table + (next_idx << 2));
+            if (REX_LOAD_U16(mat_ptr + 14u) == REX_LOAD_U16(next_mat + 14u)) {
+              is_batch_end = 0u;
+            }
+          }
+        }
+
+
+        ctx.r4.u64 = drawable;
+        ctx.r5.u64 = i;
+        ctx.r6.u64 = draw_arg5;
+        ctx.r7.u64 = draw_arg7;
+        ctx.r8.u64 = is_batch_end;
+        ctx.lr = 0x828C46A4u;
+        sub_828C66E8(ctx, base);
+
+
+        override_mat = REX_LOAD_U32(kOverrideMaterialGlobal);
+        count = REX_LOAD_U16(drawable + 26u);
+        mat_idx_table = REX_LOAD_U32(drawable + 16u);
+        mat_ptr_table = REX_LOAD_U32(shader_group + 8u);
+      }
+    }
+  }
+
+
+  if (temporal_active) [[unlikely]] {
+    temporal_host::instance = saved_temporal;
+  }
+
+
+  ctx.r1.u32 = saved_r1;
+  ctx.r12.u64 = saved_lr;
+  ctx.lr = saved_lr;
 }
 
 extern "C" void sub_821BE8A0(PPCContext& ctx, uint8_t* base) {
@@ -5303,139 +5394,129 @@ inline bool ValidateEffectPassTables(const char* fn, uint8_t* base, uint64_t sav
 }  // namespace
 
 extern "C" void sub_828C8DB0(PPCContext& ctx, uint8_t* base) {
+  REX_FUNC_PROLOGUE();
+
+
   const uint64_t saved_lr = ctx.lr;
+  const uint32_t saved_r1 = ctx.r1.u32;
+  const uint32_t frame_r1 = saved_r1 - 144u;
+  REX_STORE_U32(frame_r1, saved_r1);
+  ctx.r1.u32 = frame_r1;
+
+
   const uint32_t pass = ctx.r3.u32;
   const uint32_t arg1 = ctx.r4.u32;
   const uint32_t shader_data = ctx.r5.u32;
   const uint32_t effect_ptr = ctx.r6.u32;
 
-  if (IsPlausibleGuestPtr(arg1)) {
-    // Inlined sub_828DFF00: only emit SetVertexShader when bound handle changes.
-    constexpr uint32_t kBoundVertexShaderGlobal = 0x831C5DD8u;
-    const uint32_t vs = LoadU32(base, arg1 + 8u);
-    if (LoadU32(base, kBoundVertexShaderGlobal) != vs) {
-      StoreU32(base, kBoundVertexShaderGlobal, vs);
-      ctx.r3.u64 = LoadU32(base, 0x831C22A4u);
-      ctx.r4.u64 = vs;
-      ctx.lr = 0x828C8DD4u;
-      sub_82A42760(ctx, base);
+
+  ctx.r3.u64 = arg1;
+  ctx.lr = 0x828C8DD4u;
+  sub_828DFF00(ctx, base);
+
+
+  const uint32_t param_count = REX_LOAD_U16(pass + 8u);
+  for (uint32_t i = 0u; i < param_count; ++i) {
+    const uint32_t pair_table = REX_LOAD_U32(pass + 4u);
+    const uint32_t type_table = REX_LOAD_U32(shader_data + 16u);
+    const uint32_t val_table = REX_LOAD_U32(shader_data + 0u);
+
+
+    const uint16_t pair = REX_LOAD_U16(pair_table + (i << 1));
+    const uint32_t idx0 = static_cast<uint32_t>(pair >> 8);
+    const uint32_t param_idx = static_cast<uint32_t>(pair & 0xFFu);
+    const uint8_t is_const = REX_LOAD_U8(type_table + idx0);
+    const uint32_t val = REX_LOAD_U32(val_table + (idx0 << 2));
+
+
+    if (is_const == 0u) {
+      const uint32_t effect_base = REX_LOAD_U32(effect_ptr + 0u);
+      const uint32_t desc = effect_base + (idx0 * 48u);
+      const uint32_t override_count = static_cast<uint32_t>(REX_LOAD_U8(desc + 2u) >> 1);
+      const uint32_t overrides = REX_LOAD_U32(desc + 24u);
+      ctx.r3.u64 = arg1;
+      ctx.r4.u64 = param_idx;
+      ctx.r5.u64 = val;
+      ctx.r6.u64 = override_count;
+      ctx.r7.u64 = overrides;
+      ctx.lr = 0x828C8E3Cu;
+      sub_828E01B8(ctx, base);
+    } else {
+      ctx.r3.u64 = arg1;
+      ctx.r4.u64 = param_idx;
+      ctx.r5.u64 = val;
+      ctx.r6.u64 = is_const;
+      ctx.lr = 0x828C8E64u;
+      sub_828E0348(ctx, base);
     }
   }
 
-  uint16_t count = 0u;
-  uint32_t pair_table = 0u, type_table = 0u, val_table = 0u, effect_base = 0u, arg1_table = 0u;
-  if (!ValidateEffectPassTables("828C8DB0", base, saved_lr, pass, arg1, shader_data, effect_ptr,
-                                count, pair_table, type_table, val_table, effect_base, arg1_table)) {
-    ctx.r12.u64 = saved_lr;
-    ctx.lr = saved_lr;
-    return;
-  }
-  if (count > 0u) {
-    const bool native_mode = IsNativeMode();
 
-    for (uint32_t i = 0; i < count; ++i) {
-      const uint32_t entry = pair_table + (i << 1);
-      const uint8_t idx0 = LoadU8(base, entry);
-      const uint8_t param_idx = LoadU8(base, entry + 1u);
-      const uint8_t is_const = LoadU8(base, type_table + idx0);
-      const uint32_t val = LoadU32(base, val_table + (static_cast<uint32_t>(idx0) << 2));
-
-      if (is_const == 0u) {
-        const uint32_t desc = effect_base + (static_cast<uint32_t>(idx0) * 48u);
-        const int32_t override_count =
-            static_cast<int32_t>((static_cast<uint32_t>(LoadU8(base, desc + 2u)) >> 1) & 0x7FFFFFFFu);
-        const uint32_t overrides = LoadU32(base, desc + 24u);
-        if (native_mode) [[likely]] {
-          const uint32_t stage = 16u + LoadU16(base, arg1_table + (uint32_t(param_idx) << 3) + 2u);
-          BindRAGEEffectTextureStage(ctx, base, stage, val, override_count, overrides);
-        } else {
-          ctx.r3.u64 = arg1;
-          ctx.r4.u64 = param_idx;
-          ctx.r5.u64 = val;
-          ctx.r6.u64 = uint32_t(override_count);
-          ctx.r7.u64 = overrides;
-          ctx.lr = 0x828C8E3Cu;
-          sub_828E01B8(ctx, base);
-        }
-      } else {
-        if (native_mode) [[likely]] {
-          const uint32_t param_entry = arg1_table + (uint32_t(param_idx) << 3);
-          const uint32_t reg_type = LoadU8(base, param_entry);
-          const uint32_t reg = LoadU16(base, param_entry + 2u);
-          SetVertexShaderConstantFromRAGE(ctx, base, reg, reg_type, val, is_const);
-        } else {
-          ctx.r3.u64 = arg1;
-          ctx.r4.u64 = param_idx;
-          ctx.r6.u64 = is_const;
-          ctx.r5.u64 = val;
-          ctx.lr = 0x828C8E64u;
-          sub_828E0348(ctx, base);
-        }
-      }
-    }
-  }
-
+  ctx.r1.u32 = saved_r1;
   ctx.r12.u64 = saved_lr;
   ctx.lr = saved_lr;
 }
 
 extern "C" void sub_828C8E80(PPCContext& ctx, uint8_t* base) {
-  if (!IsNativeMode()) {
-    __imp__sub_828C8E80(ctx, base);
-    return;
-  }
+  REX_FUNC_PROLOGUE();
+
+
   const uint64_t saved_lr = ctx.lr;
+  const uint32_t saved_r1 = ctx.r1.u32;
+  const uint32_t frame_r1 = saved_r1 - 144u;
+  REX_STORE_U32(frame_r1, saved_r1);
+  ctx.r1.u32 = frame_r1;
+
+
   const uint32_t pass = ctx.r3.u32;
   const uint32_t arg1 = ctx.r4.u32;
   const uint32_t shader_data = ctx.r5.u32;
   const uint32_t effect_ptr = ctx.r6.u32;
 
-  if (IsPlausibleGuestPtr(arg1)) {
-    // Inlined sub_828DFF28: only emit SetPixelShader when bound handle changes.
-    constexpr uint32_t kBoundPixelShaderGlobal = 0x82B0D8BCu;
-    const uint32_t ps = LoadU32(base, arg1 + 8u);
-    if (LoadU32(base, kBoundPixelShaderGlobal) != ps) {
-      StoreU32(base, kBoundPixelShaderGlobal, ps);
-      ctx.r3.u64 = LoadU32(base, 0x831C22A4u);
-      ctx.r4.u64 = ps;
-      ctx.lr = 0x828C8EA8u;
-      sub_82A424A8(ctx, base);
+
+  ctx.r3.u64 = arg1;
+  ctx.lr = 0x828C8EA8u;
+  sub_828DFF28(ctx, base);
+
+
+  const uint32_t param_count = REX_LOAD_U16(pass + 8u);
+  for (uint32_t i = 0u; i < param_count; ++i) {
+    const uint32_t pair_table = REX_LOAD_U32(pass + 4u);
+    const uint32_t type_table = REX_LOAD_U32(shader_data + 16u);
+    const uint32_t val_table = REX_LOAD_U32(shader_data + 0u);
+
+
+    const uint16_t pair = REX_LOAD_U16(pair_table + (i << 1));
+    const uint32_t idx0 = static_cast<uint32_t>(pair >> 8);
+    const uint32_t param_idx = static_cast<uint32_t>(pair & 0xFFu);
+    const uint8_t is_const = REX_LOAD_U8(type_table + idx0);
+    const uint32_t val = REX_LOAD_U32(val_table + (idx0 << 2));
+
+
+    if (is_const == 0u) {
+      const uint32_t effect_base = REX_LOAD_U32(effect_ptr + 0u);
+      const uint32_t desc = effect_base + (idx0 * 48u);
+      const uint32_t override_count = static_cast<uint32_t>(REX_LOAD_U8(desc + 2u) >> 1);
+      const uint32_t overrides = REX_LOAD_U32(desc + 24u);
+      ctx.r3.u64 = arg1;
+      ctx.r4.u64 = param_idx;
+      ctx.r5.u64 = val;
+      ctx.r6.u64 = override_count;
+      ctx.r7.u64 = overrides;
+      ctx.lr = 0x828C8F08u;
+      sub_828E02B0(ctx, base);
+    } else {
+      ctx.r3.u64 = arg1;
+      ctx.r4.u64 = param_idx;
+      ctx.r5.u64 = val;
+      ctx.r6.u64 = is_const;
+      ctx.lr = 0x828C8F1Cu;
+      sub_828E0360(ctx, base);
     }
   }
 
-  uint16_t count = 0u;
-  uint32_t pair_table = 0u, type_table = 0u, val_table = 0u, effect_base = 0u, arg1_table = 0u;
-  if (!ValidateEffectPassTables("828C8E80", base, saved_lr, pass, arg1, shader_data, effect_ptr,
-                                count, pair_table, type_table, val_table, effect_base, arg1_table)) {
-    ctx.r12.u64 = saved_lr;
-    ctx.lr = saved_lr;
-    return;
-  }
-  if (count > 0u) {
 
-    for (uint32_t i = 0; i < count; ++i) {
-      const uint32_t entry = pair_table + (i << 1);
-      const uint8_t idx0 = LoadU8(base, entry);
-      const uint8_t param_idx = LoadU8(base, entry + 1u);
-      const uint8_t is_const = LoadU8(base, type_table + idx0);
-      const uint32_t val = LoadU32(base, val_table + (static_cast<uint32_t>(idx0) << 2));
-      const uint32_t param_entry = arg1_table + (static_cast<uint32_t>(param_idx) << 3);
-
-      if (is_const == 0u) {
-        const uint32_t stage = LoadU16(base, param_entry + 2u);
-        const uint32_t desc = effect_base + (static_cast<uint32_t>(idx0) * 48u);
-        const int32_t override_count =
-            static_cast<int32_t>((static_cast<uint32_t>(LoadU8(base, desc + 2u)) >> 1) & 0x7FFFFFFFu);
-        const uint32_t overrides = LoadU32(base, desc + 24u);
-        BindRAGEEffectTextureStage(ctx, base, stage, val, override_count, overrides);
-      } else {
-        const uint32_t reg_type = LoadU8(base, param_entry);
-        const uint32_t reg = LoadU16(base, param_entry + 2u);
-        SetPixelShaderConstantFromRAGE(ctx, base, reg, reg_type, val, is_const);
-      }
-    }
-  }
-
+  ctx.r1.u32 = saved_r1;
   ctx.r12.u64 = saved_lr;
   ctx.lr = saved_lr;
 }
@@ -7932,12 +8013,55 @@ extern "C" void sub_828BD478(PPCContext& ctx, uint8_t* base) {
 }
 
 extern "C" void sub_82271FF8(PPCContext& ctx, uint8_t* base) {
-  const bool trace = IsNativeMode() && IsNativeLightLoopTraceEnabled();
-  const uint32_t caller = uint32_t(ctx.lr);
-  __imp__sub_82271FF8(ctx, base);
-  if (trace && ctx.r3.s32 == -1) {
-    TraceNativeLocalLightShadowUnavailable(base, ctx, caller);
+  REX_FUNC_PROLOGUE();
+
+
+  const int32_t light_id = ctx.r3.s32;
+  const int32_t slot_param = ctx.r4.s32;
+  const uint32_t flags = ctx.r5.u32;
+
+
+  if (light_id == -1 && slot_param == -1) {
+    ctx.r3.s64 = 0;
+    return;
   }
+
+
+  const uint32_t frame_slot = REX_LOAD_U32(0x82B307A4u);
+
+
+  if (light_id != 0) {
+    if (slot_param != -1) {
+      const uint32_t clear_ea = 0x82C5991Cu + (static_cast<uint32_t>(slot_param) * 240u);
+      REX_STORE_U32(clear_ea, 0u);
+    }
+
+
+    if ((flags & 0x4u) != 0u) {
+      uint32_t entry_ea = 0x82C5D878u + ((frame_slot << 11) & 0xFFFFF800u);
+      const uint32_t target_id = static_cast<uint32_t>(light_id);
+      for (int32_t idx = 1; idx < 8; ++idx, entry_ea += 256u) {
+        if (REX_LOAD_U32(entry_ea) == target_id) {
+          ctx.r3.s64 = static_cast<int64_t>(idx);
+          return;
+        }
+      }
+    }
+  }
+
+
+  if (slot_param != -1) {
+    const uint32_t table_idx = ((frame_slot << 6) & 0xFFFFFFC0u) + static_cast<uint32_t>(slot_param);
+    const uint32_t flag_ea = 0x82C5E760u + (table_idx * 240u);
+    const int32_t next_slot = static_cast<int32_t>(static_cast<uint32_t>(slot_param) + 8u);
+    ctx.r3.s64 = static_cast<int64_t>(next_slot);
+    if (REX_LOAD_U32(flag_ea) != 0u) {
+      return;
+    }
+  }
+
+
+  ctx.r3.s64 = -1;
 }
 
 extern "C" void sub_824F6208(PPCContext& ctx, uint8_t* base) {
@@ -8021,822 +8145,490 @@ extern "C" void sub_821BC5B0(PPCContext& ctx, uint8_t* base) {
   OptSub821BC5B0(ctx, base);
 }
 
-extern "C" void sub_82A3E910(PPCContext& ctx, uint8_t* base) {
-  if (!IsNativeMode() || ctx.lr != kDeferredPhaseBeginReturnAddress) {
-    __imp__sub_82A3E910(ctx, base);
-    return;
+static inline void CopyAligned16AndSetV0(PPCContext& ctx, uint8_t* base, uint32_t src_ea,
+                                         uint32_t dst_ea) {
+  const uint32_t aligned_src = src_ea & ~0xFu;
+  const uint32_t aligned_dst = dst_ea & ~0xFu;
+  for (uint32_t lane = 0u; lane < 4u; ++lane) {
+    const uint32_t w = REX_LOAD_U32(aligned_src + (lane << 2));
+    ctx.v0.u32[lane] = w;
+    REX_STORE_U32(aligned_dst + (lane << 2), w);
   }
-
-  const uint32_t rectangles = ctx.r6.u32;
-  const uint32_t width = LoadU32(base, kDeferredWidthGlobal);
-  const uint32_t height = LoadU32(base, kDeferredHeightGlobal);
-  const bool expected = ctx.r5.u32 == kDeferredOriginalRectangleCount && rectangles && width &&
-                        height && LoadU32(base, rectangles) == 0 &&
-                        LoadU32(base, rectangles + 4) == 0 &&
-                        LoadU32(base, rectangles + 8) == width;
-  if (!expected) {
-    static std::atomic<uint64_t> mismatch_count{0};
-    const uint64_t mismatch = NextNativeHookDiagnosticCall(mismatch_count);
-    if (ShouldLogNativeHookCall(mismatch)) {
-      REXLOG_ERROR(
-          "gta4-native-notile: deferred phase begin invariant mismatch lr={:08X} count={} "
-          "rectangles={:08X} size={}x{}",
-          ctx.lr, ctx.r5.u32, rectangles, width, height);
-    }
-    __imp__sub_82A3E910(ctx, base);
-    return;
-  }
-
-  const std::array<uint32_t, 4> saved_rectangle = {
-      LoadU32(base, rectangles), LoadU32(base, rectangles + 4), LoadU32(base, rectangles + 8),
-      LoadU32(base, rectangles + 12)};
-  StoreU32(base, rectangles, 0);
-  StoreU32(base, rectangles + 4, 0);
-  StoreU32(base, rectangles + 8, width);
-  StoreU32(base, rectangles + 12, height);
-  ctx.r5.u32 = kDeferredNativeRectangleCount;
-
-  static std::atomic<uint64_t> begin_count{0};
-  const uint64_t begin = NextNativeHookDiagnosticCall(begin_count);
-  if (ShouldLogNativeHookCall(begin)) {
-    REXLOG_INFO("gta4-native-notile: deferred phase begin #{} rectangles={}->{} size={}x{}", begin,
-                kDeferredOriginalRectangleCount, kDeferredNativeRectangleCount, width, height);
-  }
-
-  __imp__sub_82A3E910(ctx, base);
-  StoreU32(base, rectangles, saved_rectangle[0]);
-  StoreU32(base, rectangles + 4, saved_rectangle[1]);
-  StoreU32(base, rectangles + 8, saved_rectangle[2]);
-  StoreU32(base, rectangles + 12, saved_rectangle[3]);
 }
+
+
+extern "C" void sub_82A3E910(PPCContext& ctx, uint8_t* base) {
+  REX_FUNC_PROLOGUE();
+
+
+  const uint64_t saved_lr = ctx.lr;
+  const uint32_t saved_r1 = ctx.r1.u32;
+  REX_STORE_U64(saved_r1 + static_cast<uint32_t>(-96), 0ULL);
+
+
+  const uint32_t frame_r1 = saved_r1 + static_cast<uint32_t>(-240);
+  REX_STORE_U32(frame_r1, saved_r1);
+  ctx.r1.u32 = frame_r1;
+
+
+  const uint32_t device = ctx.r3.u32;
+  const uint32_t flags = ctx.r4.u32;
+  const uint32_t count = ctx.r5.u32;
+  const uint32_t rects_ptr = ctx.r6.u32;
+  const uint32_t clear_color_ptr = ctx.r7.u32;
+  const uint32_t clear_stencil = ctx.r9.u32;
+  const double clear_z = ctx.f1.f64;
+
+
+  REX_STORE_U32(device + 12740u, count);
+
+
+  uint32_t max_x2 = 0u;
+  uint32_t max_y2 = 0u;
+  for (uint32_t i = 0u; i < count; ++i) {
+    const uint32_t src_rect = rects_ptr + (i << 4);
+    const uint32_t dst_rect = device + 12744u + (i << 4);
+    const uint32_t dst_aligned = device + 12984u + (i << 3);
+
+
+    const uint32_t x1 = REX_LOAD_U32(src_rect);
+    const uint32_t y1 = REX_LOAD_U32(src_rect + 4u);
+    const uint32_t x2 = REX_LOAD_U32(src_rect + 8u);
+    const uint32_t y2 = REX_LOAD_U32(src_rect + 12u);
+
+
+    if (x2 > max_x2) {
+      max_x2 = x2;
+    }
+    if (y2 > max_y2) {
+      max_y2 = y2;
+    }
+
+
+    REX_STORE_U32(dst_rect, x1);
+    REX_STORE_U32(dst_rect + 4u, y1);
+    REX_STORE_U32(dst_rect + 8u, x2);
+    REX_STORE_U32(dst_rect + 12u, y2);
+
+
+    REX_STORE_U32(dst_aligned, x1 & 0xFFFFFFE0u);
+    REX_STORE_U32(dst_aligned + 4u, y1 & 0xFFFFFFE0u);
+  }
+
+
+  if ((flags & 0x2u) != 0u) {
+    uint8_t b10943 = REX_LOAD_U8(device + 10943u) | 0x20u;
+    if ((flags & 0x4u) != 0u) {
+      b10943 |= 0x10u;
+    }
+    REX_STORE_U8(device + 10943u, b10943);
+
+
+    const uint32_t tile_mode = REX_LOAD_U16(device + 10368u) & 0x3u;
+    uint32_t tile_h_shift = 3u;
+    uint32_t tile_w = 16u;
+    uint32_t tile_w_shift = 4u;
+    uint32_t pitch_align = 40u;
+    if (tile_mode == 0u) {
+      tile_h_shift = 4u;
+      tile_w = 32u;
+      tile_w_shift = 5u;
+      pitch_align = 80u;
+    } else if (tile_mode == 1u) {
+      tile_h_shift = 3u;
+      tile_w = 32u;
+      tile_w_shift = 5u;
+      pitch_align = 80u;
+    }
+
+
+    const uint32_t aligned_w = (max_x2 + tile_w - 1u) & ~(tile_w - 1u);
+    const uint32_t tiles_per_row = aligned_w >> tile_w_shift;
+
+
+    for (uint32_t i = 0u; i < count; ++i) {
+      const uint32_t ax = REX_LOAD_U32(device + 12984u + (i << 3));
+      const uint32_t ay = REX_LOAD_U32(device + 12988u + (i << 3));
+      const uint32_t tile_idx = (ay >> tile_h_shift) * tiles_per_row + (ax >> tile_w_shift);
+      REX_STORE_U32(device + 13104u + (i << 2), tile_idx);
+    }
+
+
+    uint32_t w10368 = REX_LOAD_U32(device + 10368u);
+    REX_STORE_U32(device + 13164u, aligned_w);
+    w10368 = ((aligned_w << 18) & 0xFFFC0000u) | (w10368 & 0x0003FFFFu);
+    REX_STORE_U32(device + 10368u, w10368);
+
+
+    const uint32_t aligned_pitch = ((max_x2 + pitch_align - 1u) / pitch_align) * pitch_align;
+    REX_STORE_U32(device + 13168u, aligned_pitch);
+    REX_STORE_U64(device + 16u, REX_LOAD_U64(device + 16u) | 256ULL);
+    REX_STORE_U64(device + 40u, REX_LOAD_U64(device + 40u) | 256ULL);
+  }
+
+
+  REX_STORE_U32(device + 13172u, max_x2);
+  REX_STORE_U32(device + 13176u, max_y2);
+  REX_STORE_U32(device + 13180u, flags);
+
+
+  constexpr uint32_t kDefaultDeclAddr = 0x820B0314u;
+  constexpr uint32_t kDefaultStreamAddr = 0x820B032Cu;
+
+
+  if ((flags & 0x1u) == 0u && (REX_LOAD_U8(device + 10943u) & 0x20u) == 0u) {
+    uint32_t max_tile_w = 0u;
+    uint32_t max_tile_h = 0u;
+    for (uint32_t i = 0u; i < count; ++i) {
+      const uint32_t dev_rect = device + 12744u + (i << 4);
+      const uint32_t aln_rect = device + 12984u + (i << 3);
+      const uint32_t w = REX_LOAD_U32(dev_rect + 8u) - REX_LOAD_U32(aln_rect);
+      const uint32_t h = REX_LOAD_U32(dev_rect + 12u) - REX_LOAD_U32(aln_rect + 4u);
+      if (w > max_tile_w) {
+        max_tile_w = w;
+      }
+      if (h > max_tile_h) {
+        max_tile_h = h;
+      }
+    }
+
+
+    REX_STORE_U32(frame_r1 + 80u, 0u);
+    REX_STORE_U32(frame_r1 + 84u, 0u);
+    REX_STORE_U32(frame_r1 + 88u, max_tile_w);
+    REX_STORE_U32(frame_r1 + 92u, max_tile_h);
+
+
+    for (uint32_t w = 0u; w < 7u; ++w) {
+      REX_STORE_U32(frame_r1 + 112u + (w << 2), REX_LOAD_U32(device + 12640u + (w << 2)));
+    }
+    for (uint32_t w = 0u; w < 4u; ++w) {
+      REX_STORE_U32(frame_r1 + 96u + (w << 2), REX_LOAD_U32(device + 12668u + (w << 2)));
+    }
+
+
+    ctx.r3.u64 = device;
+    ctx.r4.u64 = kDefaultDeclAddr;
+    ctx.r5.u64 = 28u;
+    ctx.r6.u64 = max_tile_h;
+    ctx.lr = 0x82A3EBD0u;
+    sub_82A3BE18(ctx, base);
+
+
+    ctx.r3.u64 = device;
+    ctx.r4.u64 = kDefaultStreamAddr;
+    ctx.r5.u64 = 28u;
+    ctx.r6.u64 = max_tile_h;
+    ctx.lr = 0x82A3EBE0u;
+    sub_82A3B540(ctx, base);
+
+
+    ctx.r3.u64 = device;
+    ctx.r4.u64 = 63u;
+    ctx.r5.u64 = frame_r1 + 80u;
+    ctx.r6.u64 = clear_color_ptr;
+    ctx.r8.u64 = clear_stencil;
+    ctx.f1.f64 = clear_z;
+    ctx.lr = 0x82A3EBFCu;
+    sub_82A45E40(ctx, base);
+
+
+    ctx.r3.u64 = device;
+    ctx.r4.u64 = frame_r1 + 112u;
+    ctx.r5.u64 = frame_r1 + 80u;
+    ctx.r6.u64 = clear_color_ptr;
+    ctx.lr = 0x82A3EC08u;
+    sub_82A3BE98(ctx, base);
+
+
+    ctx.r3.u64 = device;
+    ctx.r4.u64 = frame_r1 + 96u;
+    ctx.r5.u64 = frame_r1 + 80u;
+    ctx.r6.u64 = clear_color_ptr;
+    ctx.lr = 0x82A3EC14u;
+    sub_82A3B540(ctx, base);
+  }
+
+
+  if (clear_color_ptr != 0u) {
+    CopyAligned16AndSetV0(ctx, base, clear_color_ptr, device + 13184u);
+  } else {
+    REX_STORE_U64(device + 13184u, 0ULL);
+    REX_STORE_U64(device + 13192u, 0ULL);
+  }
+
+
+  const uint32_t rt0 = REX_LOAD_U32(device + 12432u);
+  const uint32_t rt1 = REX_LOAD_U32(device + 12436u);
+  const uint32_t rt2 = REX_LOAD_U32(device + 12440u);
+  const uint32_t rt3 = REX_LOAD_U32(device + 12444u);
+  const uint32_t ds = REX_LOAD_U32(device + 12448u);
+
+
+  REX_STORE_F32(device + 13200u, static_cast<float>(clear_z));
+  REX_STORE_U32(device + 13204u, clear_stencil);
+
+
+  const uint32_t rt0_or_ds = (rt0 != 0u) ? rt0 : ds;
+  const uint8_t b10940 = REX_LOAD_U8(device + 10940u) | 0x20u;
+
+
+  REX_STORE_U32(device + 12720u, rt0);
+  REX_STORE_U32(device + 12716u, rt0_or_ds);
+  REX_STORE_U32(device + 12724u, rt1);
+  REX_STORE_U32(device + 12728u, rt2);
+  REX_STORE_U32(device + 12732u, rt3);
+  REX_STORE_U32(device + 12736u, ds);
+  REX_STORE_U32(device + 12712u, 2u);
+  REX_STORE_U32(device + 12708u, 0u);
+
+
+  const uint8_t bit0 =
+      ((b10940 & 0x0Cu) == 0u && REX_LOAD_U8(device + 12179u) == 0u) ? 1u : 0u;
+
+
+  REX_STORE_U32(device + 12704u, 0u);
+  REX_STORE_U32(device + 10932u, 0u);
+  REX_STORE_U32(device + 10936u, 0u);
+  REX_STORE_U32(device + 12700u, 0xFFFFFFFFu);
+  REX_STORE_U8(device + 10940u, static_cast<uint8_t>((b10940 & 0xFEu) | bit0));
+
+
+  ctx.r3.u64 = device;
+  ctx.r4.u64 = ds;
+  ctx.r5.u64 = 2u;
+  ctx.r6.u64 = rt3;
+  ctx.lr = 0x82A3ED08u;
+  sub_82A4F258(ctx, base);
+
+
+  uint32_t rb_cur = REX_LOAD_U32(device + 13360u);
+  const uint32_t rb_end = REX_LOAD_U32(device + 13364u);
+  if (rb_cur + 4u > rb_end) {
+    ctx.r3.u64 = device + 13352u;
+    ctx.r4.u64 = ds;
+    ctx.r5.u64 = 2u;
+    ctx.r6.u64 = rt3;
+    ctx.lr = 0x82A3ED24u;
+    sub_82A49458(ctx, base);
+    rb_cur = ctx.r3.u32;
+  }
+  REX_STORE_U32(rb_cur, 0x86000000u);
+  REX_STORE_U32(device + 13360u, rb_cur + 4u);
+
+
+  uint32_t cmd_cur = REX_LOAD_U32(device + 48u);
+  const uint32_t cmd_end = REX_LOAD_U32(device + 56u);
+  if (cmd_cur > cmd_end) {
+    ctx.r3.u64 = device;
+    ctx.r4.u64 = ds;
+    ctx.r5.u64 = 2u;
+    ctx.r6.u64 = rt3;
+    ctx.lr = 0x82A3ED50u;
+    sub_82A499B8(ctx, base);
+    cmd_cur = ctx.r3.u32;
+  }
+  REX_STORE_U32(cmd_cur + 4u, 0xC0004600u);
+  REX_STORE_U32(cmd_cur + 8u, 25u);
+  REX_STORE_U32(device + 48u, cmd_cur + 8u);
+
+
+  ctx.r3.u64 = device;
+  ctx.r4.u64 = flags;
+  ctx.r5.u64 = rects_ptr;
+  ctx.r6.u64 = count;
+  ctx.lr = 0x82A3ED80u;
+  sub_82A4DC58(ctx, base);
+
+
+  ctx.r3.u64 = device;
+  ctx.r4.u64 = kDefaultDeclAddr;
+  ctx.r5.u64 = rects_ptr;
+  ctx.r6.u64 = count;
+  ctx.lr = 0x82A3ED8Cu;
+  sub_82A3BE18(ctx, base);
+
+
+  ctx.r3.u64 = device;
+  ctx.r4.u64 = 1u;
+  ctx.r5.u64 = rects_ptr;
+  ctx.r6.u64 = count;
+  ctx.lr = 0x82A3ED98u;
+  sub_82A3BAA8(ctx, base);
+
+
+  ctx.r1.u32 = saved_r1;
+  (void)REX_LOAD_U64(saved_r1 + static_cast<uint32_t>(-96));
+  ctx.r12.u64 = saved_lr;
+  ctx.lr = saved_lr;
+}
+
+static inline void EmitDeferredTileResolve(PPCContext& ctx, uint8_t* base, uint32_t device,
+                                           uint32_t wrapper_obj, uint32_t resolve_flags,
+                                           uint32_t rect_ea, uint32_t clear_color_ea,
+                                           uint32_t frame_r1, double clear_z, uint32_t vcall_lr,
+                                           uint32_t resolve_lr) {
+  const uint32_t vtable = REX_LOAD_U32(wrapper_obj);
+  const uint32_t get_surface_fn = REX_LOAD_U32(vtable + 64u);
+  ctx.r3.u64 = wrapper_obj;
+  ctx.lr = vcall_lr;
+  REX_CALL_INDIRECT_FUNC(get_surface_fn);
+
+
+  const uint32_t dst_surface = ctx.r3.u32;
+  REX_STORE_U32(frame_r1 + 100u, 0u);
+  REX_STORE_U32(frame_r1 + 92u, 0u);
+
+
+  ctx.r3.u64 = device;
+  ctx.r4.u64 = resolve_flags;
+  ctx.r5.u64 = rect_ea;
+  ctx.r6.u64 = dst_surface;
+  ctx.r7.u64 = rect_ea;
+  ctx.r8.u64 = 0u;
+  ctx.r9.u64 = 0u;
+  ctx.r10.u64 = clear_color_ea;
+  ctx.f1.f64 = clear_z;
+  ctx.lr = resolve_lr;
+  sub_82A3CC68(ctx, base);
+}
+
 
 extern "C" void sub_824F6AF0(PPCContext& ctx, uint8_t* base) {
-  if (!IsNativeMode()) {
-    __imp__sub_824F6AF0(ctx, base);
-    return;
+  REX_FUNC_PROLOGUE();
+
+
+  const uint64_t saved_lr = ctx.lr;
+  const uint32_t saved_r1 = ctx.r1.u32;
+  REX_STORE_U64(saved_r1 - 80u, 0ULL);
+
+
+  const uint32_t frame_r1 = saved_r1 - 256u;
+  REX_STORE_U32(frame_r1, saved_r1);
+  ctx.r1.u32 = frame_r1;
+
+
+  ctx.lr = 0x824F6B04u;
+  sub_824F5230(ctx, base);
+
+
+  const uint32_t width = REX_LOAD_U32(0x83016B1Cu);
+  const uint32_t height = REX_LOAD_U32(0x83016B20u);
+  const double clear_z = static_cast<double>(REX_LOAD_F32(0x82000A34u));
+  const uint32_t clear_bits = std::bit_cast<uint32_t>(static_cast<float>(clear_z));
+
+
+  const uint32_t clear_color_ea = frame_r1 + 112u;
+  REX_STORE_U32(clear_color_ea + 0u, clear_bits);
+  REX_STORE_U32(clear_color_ea + 4u, clear_bits);
+  REX_STORE_U32(clear_color_ea + 8u, clear_bits);
+  REX_STORE_U32(clear_color_ea + 12u, clear_bits);
+
+
+  const int32_t div3_raw =
+      static_cast<int32_t>((static_cast<int64_t>(static_cast<int32_t>(height)) * 0x55555556LL) >> 32);
+  uint32_t tile_h = static_cast<uint32_t>(div3_raw) + (static_cast<uint32_t>(div3_raw) >> 31);
+  if ((tile_h & 0x1Fu) != 0u) {
+    tile_h = (tile_h & 0xFFFFFFE0u) + 32u;
+  }
+  const uint32_t tile_h2 = (tile_h << 1) & 0xFFFFFFFEu;
+
+
+  const uint32_t rects_base = frame_r1 + 128u;
+  REX_STORE_U32(rects_base + 0u, 0u);
+  REX_STORE_U32(rects_base + 4u, 0u);
+  REX_STORE_U32(rects_base + 8u, width);
+  REX_STORE_U32(rects_base + 12u, tile_h);
+
+
+  REX_STORE_U32(rects_base + 16u, 0u);
+  REX_STORE_U32(rects_base + 20u, tile_h);
+  REX_STORE_U32(rects_base + 24u, width);
+  REX_STORE_U32(rects_base + 28u, tile_h2);
+
+
+  REX_STORE_U32(rects_base + 32u, 0u);
+  REX_STORE_U32(rects_base + 36u, tile_h2);
+  REX_STORE_U32(rects_base + 40u, width);
+  REX_STORE_U32(rects_base + 44u, height);
+
+
+  const uint32_t marker_end = REX_LOAD_U32(0x82AA858Cu);
+  ctx.r3.u64 = marker_end;
+  ctx.r4.u64 = 128u - marker_end;
+  ctx.lr = 0x824F6B9Cu;
+  sub_828BFBE8(ctx, base);
+
+
+  for (uint32_t tile_idx = 0u; tile_idx < 3u; ++tile_idx) {
+    const uint32_t rect_ea = rects_base + (tile_idx << 4);
+    const uint32_t device = REX_LOAD_U32(0x831C22A4u);
+
+
+    ctx.r3.u64 = device;
+    ctx.r4.u64 = 3u << (tile_idx << 1);
+    ctx.lr = 0x824F6BC4u;
+    sub_82A3E7A0(ctx, base);
+
+
+    EmitDeferredTileResolve(ctx, base, REX_LOAD_U32(0x831C22A4u), REX_LOAD_U32(0x83016B30u), 20u,
+                            rect_ea, clear_color_ea, frame_r1, clear_z, 0x824F6BDCu, 0x824F6C0Cu);
+    EmitDeferredTileResolve(ctx, base, REX_LOAD_U32(0x831C22A4u), REX_LOAD_U32(0x83016B24u), 16u,
+                            rect_ea, clear_color_ea, frame_r1, clear_z, 0x824F6C24u, 0x824F6C54u);
+    EmitDeferredTileResolve(ctx, base, REX_LOAD_U32(0x831C22A4u), REX_LOAD_U32(0x83016B44u), 768u,
+                            rect_ea, clear_color_ea, frame_r1, clear_z, 0x824F6C6Cu, 0x824F6C9Cu);
+
+
+    ctx.r3.u64 = REX_LOAD_U32(0x83016B24u);
+    ctx.r4.u64 = REX_LOAD_U32(0x83016B44u);
+    ctx.lr = 0x824F6CA8u;
+    sub_824F56F8(ctx, base);
+
+
+    EmitDeferredTileResolve(ctx, base, REX_LOAD_U32(0x831C22A4u), REX_LOAD_U32(0x83016B28u), 273u,
+                            rect_ea, clear_color_ea, frame_r1, clear_z, 0x824F6CC0u, 0x824F6CF0u);
+    EmitDeferredTileResolve(ctx, base, REX_LOAD_U32(0x831C22A4u), REX_LOAD_U32(0x83016B2Cu), 274u,
+                            rect_ea, clear_color_ea, frame_r1, clear_z, 0x824F6D08u, 0x824F6D38u);
   }
 
-  const uint32_t device = LoadU32(base, kDeferredDeviceGlobal);
-  const uint32_t width = LoadU32(base, kDeferredWidthGlobal);
-  const uint32_t height = LoadU32(base, kDeferredHeightGlobal);
-  std::array<uint32_t, 4> outputs{};
-  for (size_t index = 0; index < outputs.size(); ++index) {
-    outputs[index] = LoadU32(base, kDeferredOutputsGlobal + uint32_t(index * sizeof(uint32_t)));
-  }
-  const uint32_t alias = LoadU32(base, kDeferredAliasGlobal);
-  const uint32_t primary_depth_surface = LoadU32(base, kPrimaryDepthSurfaceGlobal);
-  const uint32_t deferred_depth_wrapper = LoadU32(base, kDeferredDepthAaWrapperGlobal);
-  const uint32_t deferred_depth_surface =
-      deferred_depth_wrapper ? LoadU32(base, deferred_depth_wrapper + kDeferredWrapperSurfaceOffset)
-                             : 0;
 
-  bool resources_valid =
-      device && width && height && alias && primary_depth_surface && deferred_depth_surface;
-  for (uint32_t output : outputs) {
-    resources_valid = resources_valid && output;
-  }
-  if (!resources_valid) {
-    static std::atomic<uint64_t> fallback_count{0};
-    const uint64_t fallback = NextNativeHookDiagnosticCall(fallback_count);
-    if (ShouldLogNativeHookCall(fallback)) {
-      REXLOG_ERROR(
-          "gta4-native-notile: deferred phase end invariant mismatch device={:08X} size={}x{} "
-          "outputs={:08X},{:08X},{:08X},{:08X} alias={:08X} "
-          "deferred-depth={:08X} primary-depth={:08X}; "
-          "using generated path",
-          device, width, height, outputs[0], outputs[1], outputs[2], outputs[3], alias,
-          deferred_depth_surface, primary_depth_surface);
-    }
-    __imp__sub_824F6AF0(ctx, base);
-    return;
-  }
+  ctx.r3.u64 = REX_LOAD_U32(0x831C22A4u);
+  ctx.r4.u64 = 0u;
+  ctx.lr = 0x824F6D54u;
+  sub_82A3E7A0(ctx, base);
 
-  static std::atomic<uint64_t> object_snapshot_count{0};
-  const uint64_t object_snapshot = NextNativeHookDiagnosticCall(object_snapshot_count);
-  if (ShouldLogNativeHookCall(object_snapshot)) {
-    std::array<uint32_t, 10> wrappers{};
-    for (size_t index = 0; index < kDeferredFullSizeWrapperGlobals.size(); ++index) {
-      wrappers[index] = LoadU32(base, kDeferredFullSizeWrapperGlobals[index]);
-    }
-    wrappers.back() = alias;
-    constexpr std::array<const char*, 10> roles = {
-        "gbuffer-0",    "gbuffer-1",    "gbuffer-2",    "gbuffer-z",   "gbuffer-0-aa",
-        "gbuffer-1-aa", "gbuffer-2-aa", "gbuffer-z-aa", "depth-alias", "gbuffer-2-alias"};
-    for (size_t index = 0; index < wrappers.size(); ++index) {
-      const uint32_t wrapper = wrappers[index];
-      REXLOG_INFO(
-          "gta4-native-architecture: point=deferred-wrapper-pair snapshot={} "
-          "role={} wrapper={:08X} surface={:08X} texture={:08X} "
-          "physical={}x{} logical={}x{}",
-          object_snapshot, roles[index], wrapper,
-          LoadU32(base, wrapper + kDeferredWrapperSurfaceOffset),
-          LoadU32(base, wrapper + kDeferredWrapperTextureOffset),
-          LoadU16(base, wrapper + kDeferredWrapperPhysicalWidthOffset),
-          LoadU16(base, wrapper + kDeferredWrapperPhysicalHeightOffset),
-          LoadU16(base, wrapper + kDeferredWrapperLogicalWidthOffset),
-          LoadU16(base, wrapper + kDeferredWrapperLogicalHeightOffset));
-    }
-  }
 
-  InvokeGuest(ctx, base, sub_824F5230);
-  const auto invoke_phase_marker = [&](uint32_t marker_global) {
-    const uint32_t marker = LoadU32(base, marker_global);
-    InvokeGuest(ctx, base, sub_828BFBE8, marker, kDeferredPhaseMarkerLimit - marker);
-  };
-  invoke_phase_marker(kDeferredPhaseMarkerEndGlobal);
+  const uint32_t marker_begin = REX_LOAD_U32(0x82AA8588u);
+  ctx.r3.u64 = marker_begin;
+  ctx.r4.u64 = 128u - marker_begin;
+  ctx.lr = 0x824F6D64u;
+  sub_828BFBE8(ctx, base);
 
-  const ResolveRectangle full_rectangle{0, 0, int32_t(width), int32_t(height)};
-  const ResolvePoint origin{0, 0};
-  const uint32_t clear_color_bits[4]{};
-  const auto get_surface = [&](uint32_t resource) {
-    return InvokeGuest(ctx, base, sub_828D9608, resource).r3.u32;
-  };
 
-  const uint32_t depth_output = get_surface(outputs[3]);
-  if (IsNativeLightProvenanceTraceEnabled()) {
-  REXLOG_WARN(
-      "gta4-native-cause: point=deferred-depth-lifecycle-submit "
-      "attachment-wrapper={:08X} attachment-surface={:08X} "
-      "resolved-wrapper={:08X} resolved-texture={:08X} "
-      "forward-wrapper={:08X} forward-surface={:08X} caller={:08X}",
-      deferred_depth_wrapper, deferred_depth_surface, outputs[3], depth_output,
-      primary_depth_surface, primary_depth_surface, uint32_t(ctx.lr));
-  }
-  SubmitNativeResolve(base, device, 20, &full_rectangle, depth_output, &origin, 0, 0,
-                      clear_color_bits, 0.0, 0, 0, 3, uint32_t(ctx.lr), outputs[3],
-                      deferred_depth_wrapper);
-  const uint32_t color_output = get_surface(outputs[0]);
-  SubmitNativeResolve(base, device, 16, &full_rectangle, color_output, &origin, 0, 0,
-                      clear_color_bits, 0.0, 0, 0, 3, uint32_t(ctx.lr), outputs[0]);
-  const uint32_t alias_output = get_surface(alias);
-  SubmitNativeResolve(base, device, 768, &full_rectangle, alias_output, &origin, 0, 0,
-                      clear_color_bits, 0.0, 0, 0, 3, uint32_t(ctx.lr), alias);
-  InvokeGuest(ctx, base, sub_824F56F8, outputs[0], alias);
-  const uint32_t second_output = get_surface(outputs[1]);
-  SubmitNativeResolve(base, device, 273, &full_rectangle, second_output, &origin, 0, 0,
-                      clear_color_bits, 0.0, 0, 0, 3, uint32_t(ctx.lr), outputs[1]);
-  const uint32_t third_output = get_surface(outputs[2]);
-  SubmitNativeResolve(base, device, 274, &full_rectangle, third_output, &origin, 0, 0,
-                      clear_color_bits, 0.0, 0, 0, 3, uint32_t(ctx.lr), outputs[2]);
+  ctx.r3.u64 = REX_LOAD_U32(0x831C22A4u);
+  ctx.r4.u64 = 0u;
+  ctx.r5.u64 = 0u;
+  ctx.r6.u64 = 0u;
+  ctx.r7.u64 = clear_color_ea;
+  ctx.r8.u64 = 0u;
+  ctx.r9.u64 = 0u;
+  ctx.r10.u64 = 0u;
+  ctx.f1.f64 = static_cast<double>(REX_LOAD_F32(0x82000D48u));
+  ctx.lr = 0x824F6D8Cu;
+  sub_82A3EDA8(ctx, base);
 
-  DepthSurfaceHandoffCommand depth_handoff{};
-  depth_handoff.device = device;
-  depth_handoff.source = CaptureSurfaceDescriptor(base, deferred_depth_surface);
-  depth_handoff.destination = CaptureSurfaceDescriptor(base, primary_depth_surface);
-  depth_handoff.source_wrapper = deferred_depth_wrapper;
-  depth_handoff.destination_wrapper = primary_depth_surface;
-  depth_handoff.source_texture = depth_output;
-  depth_handoff.trace_caller = uint32_t(ctx.lr);
-  // Replace the scene depth-copy alias contract explicitly: PS_depthCopy0
-  // generates forward coverage from packed depth, never last frame's UI mask.
-  depth_handoff.stencil_policy = ForwardStencilHandoffPolicy::kRebuildSceneCoverage;
-  if (!SubmitNativeCommand(depth_handoff)) {
-    REXLOG_ERROR(
-        "gta4-native-cause: point=explicit-depth-handoff-submit result=rejected "
-        "source-wrapper={:08X} source={:08X} destination-wrapper={:08X} "
-        "destination={:08X}",
-        depth_handoff.source_wrapper, depth_handoff.source.handle,
-        depth_handoff.destination_wrapper, depth_handoff.destination.handle);
-  }
 
-  invoke_phase_marker(kDeferredPhaseMarkerBeginGlobal);
-  PPCContext finalizer = ctx;
-  finalizer.r3.u32 = device;
-  finalizer.r4.u32 = 0;
-  finalizer.r5.u32 = 0;
-  finalizer.r6.u32 = 0;
-  finalizer.r7.u32 = 0;
-  finalizer.r8.u32 = 0;
-  finalizer.r9.u32 = 0;
-  finalizer.r10.u32 = 0;
-  finalizer.f1.f64 = 1.0;
-  sub_82A3EDA8(finalizer, base);
-  InvokeGuest(ctx, base, sub_824F4E88);
-  const PPCContext tail =
-      InvokeGuest(ctx, base, sub_822CF200, LoadU32(base, kDeferredPhaseTailGlobal));
-  ctx.r3 = tail.r3;
+  ctx.lr = 0x824F6D90u;
+  sub_824F4E88(ctx, base);
 
-  static std::atomic<uint64_t> phase_count{0};
-  const uint64_t phase = NextNativeHookDiagnosticCall(phase_count);
-  if (ShouldLogNativeHookCall(phase)) {
-    REXLOG_INFO("gta4-native-notile: deferred phase end #{} size={}x{} resolves=5 predicates=0",
-                phase, width, height);
-  }
+
+  ctx.r3.u64 = REX_LOAD_U32(0x82D475D0u);
+  ctx.lr = 0x824F6D9Cu;
+  sub_822CF200(ctx, base);
+
+
+  ctx.r1.u32 = saved_r1;
+  (void)REX_LOAD_U64(saved_r1 - 80u);
+  ctx.r12.u64 = saved_lr;
+  ctx.lr = saved_lr;
 }
-
-extern "C" void sub_82A3CC68(PPCContext& ctx, uint8_t* base) {
-  if (!IsNativeMode()) {
-    __imp__sub_82A3CC68(ctx, base);
-    return;
-  }
-
-  if (g_tv_final_path_active) {
-    ++g_tv_final_resolve_count;
-  }
-  if (g_tv_watching.load(std::memory_order_relaxed) && ctx.lr == kScriptRtResolveCaller &&
-      (!TvTraceConfig().enabled || ctx.r6.u32 == TvDetailScriptTexture()) &&
-      ConsumeTvEventTraceBudget()) {
-    REXLOG_INFO(
-        "gta4-tv-script-rt-resolve: session={} final={} movie={} rect={} bink={}:{} "
-        "caller={:08X} device={:08X} flags={:08X} source-rect={:08X} "
-        "destination={:08X} point={:08X} level={} slice={}",
-        g_tv_session_id.load(std::memory_order_relaxed), g_tv_final_sequence,
-        g_tv_last_movie_sequence.load(std::memory_order_relaxed),
-        g_tv_last_rect_sequence.load(std::memory_order_relaxed),
-        g_tv_last_bink_sequence.load(std::memory_order_relaxed),
-        g_tv_last_bink_result.load(std::memory_order_relaxed), uint32_t(ctx.lr), ctx.r3.u32,
-        ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32, ctx.r9.u32);
-  }
-
-  static std::atomic<uint64_t> call_count{0};
-  const uint64_t call = NextNativeHookDiagnosticCall(call_count);
-  if (ShouldLogNativeHookCall(call)) {
-    REXLOG_INFO(
-        "gta4-native-hook: Resolve #{} lr={:08X} device={:08X} flags={:08X} "
-        "source-rect={:08X} destination={:08X}",
-        call, ctx.lr, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32);
-  }
-
-  ResolveRectangle source_rectangle{};
-  ResolvePoint destination_point{};
-  uint32_t clear_color_bits[4]{};
-  const ResolveRectangle* source_rectangle_pointer = nullptr;
-  const ResolvePoint* destination_point_pointer = nullptr;
-  const uint32_t* clear_color_pointer = nullptr;
-  if (ctx.r5.u32) {
-    source_rectangle = LoadResolveRectangle(base, ctx.r5.u32);
-    source_rectangle_pointer = &source_rectangle;
-  }
-  if (ctx.r7.u32) {
-    destination_point = LoadResolvePoint(base, ctx.r7.u32);
-    destination_point_pointer = &destination_point;
-  }
-  if (ctx.r10.u32) {
-    for (uint32_t index = 0; index < 4; ++index) {
-      clear_color_bits[index] = LoadU32(base, ctx.r10.u32 + index * sizeof(uint32_t));
-    }
-    clear_color_pointer = clear_color_bits;
-  }
-
-  const uint32_t known_frontbuffer = g_last_present_frontbuffer.load(std::memory_order_relaxed);
-  if (rex::diagnostics::IsEnabled(rex::diagnostics::Category::kGuestHooks) && known_frontbuffer &&
-      ctx.r6.u32 == known_frontbuffer) {
-    std::array<uint32_t, kRenderTargetCount> render_targets{};
-    for (uint32_t index = 0; index < kRenderTargetCount; ++index) {
-      render_targets[index] =
-          LoadU32(base, ctx.r3.u32 + (kRenderTargetBase + index) * sizeof(uint32_t));
-    }
-    std::fprintf(stderr,
-                 "[GuestResolveTrace] origin=direct caller=%08X device=%08X flags=%08X "
-                 "destination=%08X rt=%08X,%08X,%08X,%08X depth=%08X\n",
-                 uint32_t(ctx.lr), ctx.r3.u32, ctx.r4.u32, ctx.r6.u32, render_targets[0],
-                 render_targets[1], render_targets[2], render_targets[3],
-                 LoadU32(base, ctx.r3.u32 + kDepthStencilOffset));
-    std::fflush(stderr);
-  }
-
-  SubmitNativeResolve(base, ctx.r3.u32, ctx.r4.u32, source_rectangle_pointer, ctx.r6.u32,
-                      destination_point_pointer, ctx.r8.u32, ctx.r9.u32, clear_color_pointer,
-                      ctx.f1.f64, LoadU32(base, ctx.r1.u32 + 92), LoadU32(base, ctx.r1.u32 + 100),
-                      1, uint32_t(ctx.lr), 0);
-}
-
-extern "C" void sub_82A3EDA8(PPCContext& ctx, uint8_t* base) {
-  if (!IsNativeMode()) {
-    __imp__sub_82A3EDA8(ctx, base);
-    return;
-  }
-
-  const uint32_t device = ctx.r3.u32;
-  const uint32_t base_flags = ctx.r4.u32;
-  uint32_t resolve_records = ctx.r5.u32;
-  const uint32_t destination_texture = ctx.r6.u32;
-  const uint32_t final_clear_color = ctx.r7.u32;
-  const double final_clear_depth = ctx.f1.f64;
-  const uint32_t final_clear_stencil = ctx.r9.u32;
-  const uint32_t final_parameters = ctx.r10.u32;
-  const uint32_t resolve_count = device ? LoadU32(base, device + 12740) : 0;
-
-  if (!device) {
-    ctx.r3.u32 = 0;
-    return;
-  }
-
-  static std::atomic<uint64_t> call_count{0};
-  const uint64_t call = NextNativeHookDiagnosticCall(call_count);
-  if (ShouldLogNativeHookCall(call)) {
-    REXLOG_INFO(
-        "gta4-native-hook: ResolveBatch #{} lr={:08X} device={:08X} flags={:08X} "
-        "records={:08X} count={} destination={:08X}",
-        call, ctx.lr, device, base_flags, resolve_records, resolve_count, destination_texture);
-  }
-
-  if (!resolve_records && destination_texture) {
-    resolve_records = device + 12744;
-  }
-
-  const uint32_t source_surface = device ? LoadU32(base, device + 12716) : 0;
-  const uint32_t known_frontbuffer = g_last_present_frontbuffer.load(std::memory_order_relaxed);
-  if (rex::diagnostics::IsEnabled(rex::diagnostics::Category::kGuestHooks) && known_frontbuffer &&
-      destination_texture == known_frontbuffer) {
-    std::fprintf(stderr,
-                 "[GuestResolveTrace] origin=batch caller=%08X device=%08X flags=%08X "
-                 "destination=%08X source=%08X records=%08X count=%u\n",
-                 uint32_t(ctx.lr), device, base_flags, destination_texture, source_surface,
-                 resolve_records, resolve_count);
-    std::fflush(stderr);
-  }
-  if (destination_texture && resolve_count && source_surface) {
-    const uint32_t packed_dimensions = LoadU32(base, source_surface + 36);
-    const uint32_t surface_width = (std::rotl(packed_dimensions, 14) & 0x3FFF) + 1;
-    const uint32_t surface_height = (std::rotl(packed_dimensions, 29) & 0x7FFF) + 1;
-
-    for (uint32_t index = 0; index < resolve_count; ++index) {
-      const uint32_t record = resolve_records + index * 16;
-      ResolveRectangle source_rectangle = LoadResolveRectangle(base, record);
-      const ResolvePoint destination_point = LoadResolvePoint(base, record);
-      if (uint32_t(source_rectangle.right) == surface_width) {
-        source_rectangle.right = int32_t((uint32_t(source_rectangle.right) + 7) & ~uint32_t(7));
-      }
-      if (uint32_t(source_rectangle.bottom) == surface_height) {
-        source_rectangle.bottom = int32_t((uint32_t(source_rectangle.bottom) + 7) & ~uint32_t(7));
-      }
-
-      uint32_t flags = base_flags;
-      uint32_t clear_color_bits[4]{};
-      const uint32_t* clear_color_pointer = nullptr;
-      double clear_depth = final_clear_depth;
-      uint32_t clear_stencil = final_clear_stencil;
-      uint32_t parameters = final_parameters;
-      if (index + 1 < resolve_count) {
-        if (LoadU32(base, device + 12432)) {
-          flags |= 0x100;
-        }
-        if (LoadU32(base, device + 12448)) {
-          flags |= 0x200;
-        }
-        for (uint32_t color_index = 0; color_index < 4; ++color_index) {
-          clear_color_bits[color_index] =
-              LoadU32(base, device + 13184 + color_index * sizeof(uint32_t));
-        }
-        clear_color_pointer = clear_color_bits;
-        clear_depth = double(std::bit_cast<float>(LoadU32(base, device + 13200)));
-        clear_stencil = LoadU32(base, device + 13204);
-        parameters = 0;
-      } else if (final_clear_color) {
-        for (uint32_t color_index = 0; color_index < 4; ++color_index) {
-          clear_color_bits[color_index] =
-              LoadU32(base, final_clear_color + color_index * sizeof(uint32_t));
-        }
-        clear_color_pointer = clear_color_bits;
-      }
-
-      SubmitNativeResolve(base, device, flags, &source_rectangle, destination_texture,
-                          &destination_point, 0, 0, clear_color_pointer, clear_depth, clear_stencil,
-                          parameters, 2, uint32_t(ctx.lr), 0);
-    }
-  } else if (destination_texture && resolve_count) {
-    REXLOG_ERROR(
-        "gta4-native-hook: ResolveBatch #{} missing source surface device={:08X} count={} "
-        "destination={:08X}",
-        call, device, resolve_count, destination_texture);
-  }
-
-  InvokeGuest(ctx, base, sub_82A3AA08, device, 2);
-  FinalizeNativeResolveBatchState(base, device);
-  InvokeGuest(ctx, base, sub_82A3BE18, device, 0x820B0314);
-  ctx.r3.u32 = 0;
-}
-
-extern "C" void sub_82A3E348(PPCContext& ctx, uint8_t* base) {
-  if (!IsNativeMode()) {
-    __imp__sub_82A3E348(ctx, base);
-    return;
-  }
-
-  static std::atomic<uint64_t> call_count{0};
-  const uint64_t call = NextNativeHookDiagnosticCall(call_count);
-  if (ShouldLogNativeHookCall(call)) {
-    REXLOG_INFO(
-        "gta4-native-hook: DrawIndexedPrimitive #{} lr={:08X} device={:08X} primitive={} "
-        "base={} start={} indices={}",
-        call, ctx.lr, ctx.r3.u32, ctx.r4.u32, ctx.r5.s32, ctx.r6.u32, ctx.r7.u32);
-  }
-
-  const uint32_t device = ctx.r3.u32;
-  DrawIndexedPrimitiveCommand command{};
-  command.device = device;
-  command.primitive_type = ctx.r4.u32;
-  command.base_vertex = ctx.r5.s32;
-  command.start_index = ctx.r6.u32;
-  command.index_count = ctx.r7.u32;
-  command.primitive_restart_enabled = (LoadU32(base, device + 10568) & uint32_t(1u << 21)) != 0;
-  command.primitive_restart_index = LoadU32(base, device + 10444) & 0x00FFFFFF;
-  command.caller = static_cast<uint32_t>(ctx.lr);
-  command.origin_flags = kDrawCommandOriginDirect;
-  command.command_list = 0;
-  command.draw_id = call;
-
-  ConsumeNativeDrawDirtyStateInto(base, device, command.dirty_state);
-  temporal_host::Draw(base,command.device);
-  SubmitNativeDrawIndexed(command);
-}
-
-extern "C" void sub_82A457B0(PPCContext& ctx, uint8_t* base) {
-  if (!IsNativeMode()) {
-    __imp__sub_82A457B0(ctx, base);
-    return;
-  }
-
-  const uint32_t device = ctx.r3.u32;
-  uint32_t flags = ctx.r4.u32;
-  const uint32_t rectangle = ctx.r5.u32;
-  const uint32_t color = ctx.r6.u32;
-  if (!device || !rectangle) {
-    return;
-  }
-
-  if (!LoadU32(base, device + 12448)) {
-    flags &= ~uint32_t(0x30);
-  }
-  if (!flags) {
-    return;
-  }
-
-  const int32_t viewport_x =
-      TruncateViewportCoordinate(std::bit_cast<float>(LoadU32(base, device + 12640)));
-  const int32_t viewport_y =
-      TruncateViewportCoordinate(std::bit_cast<float>(LoadU32(base, device + 12644)));
-  const int32_t viewport_width =
-      TruncateViewportCoordinate(std::bit_cast<float>(LoadU32(base, device + 12648)));
-  const int32_t viewport_height =
-      TruncateViewportCoordinate(std::bit_cast<float>(LoadU32(base, device + 12652)));
-
-  int32_t left = std::max(int32_t(LoadU32(base, rectangle)), viewport_x);
-  int32_t top = std::max(int32_t(LoadU32(base, rectangle + 4)), viewport_y);
-  int32_t right = std::min(int32_t(LoadU32(base, rectangle + 8)),
-                           std::bit_cast<int32_t>(uint32_t(viewport_x) + uint32_t(viewport_width)));
-  int32_t bottom =
-      std::min(int32_t(LoadU32(base, rectangle + 12)),
-               std::bit_cast<int32_t>(uint32_t(viewport_y) + uint32_t(viewport_height)));
-  if (int32_t(LoadU32(base, device + 11848))) {
-    left = std::max(left, int32_t(LoadU32(base, device + 12668)));
-    top = std::max(top, int32_t(LoadU32(base, device + 12672)));
-    right = std::min(right, int32_t(LoadU32(base, device + 12676)));
-    bottom = std::min(bottom, int32_t(LoadU32(base, device + 12680)));
-  }
-  if (right <= left || bottom <= top) {
-    return;
-  }
-
-  ClearCommand command{};
-  command.device = device;
-  command.flags = flags;
-  command.left = left;
-  command.top = top;
-  command.right = right;
-  command.bottom = bottom;
-  if (ShadowTraceActive(base)) {
-    uint32_t slot = 0;
-    const int target = ShadowBoundTarget(base, device, &slot);
-    if (target >= 0) {
-      SHADOW_TRACE("shadow-trace: frame={} clear flags={:08X} rect={},{},{},{} bound-target={} "
-                  "slot={}",
-                  GetNativeLightSubmittedFrame(base), flags, left, top, right, bottom, target, slot);
-    }
-  }
-  if (color) {
-    for (uint32_t index = 0; index < 4; ++index) {
-      command.color_bits[index] = LoadU32(base, color + index * sizeof(uint32_t));
-    }
-  } else {
-    // generated .81:16055 loads 0x82000A34 into every lane; retail is +0.0.
-    std::fill(std::begin(command.color_bits), std::end(command.color_bits),
-              LoadU32(base, kRetailNullClearColorGlobal));
-  }
-  command.depth_bits = std::bit_cast<uint64_t>(ctx.f1.f64);
-  command.stencil = ctx.r8.u32;
-
-  command.dirty_state = ConsumeNativeDrawDirtyState(base, device);
-  SubmitNativeCommand(command);
-  StoreU8(base, device + 10941, LoadU8(base, device + 10941) | uint8_t(4));
-  StoreU64(base, device + 16, LoadU64(base, device + 16) | uint64_t(0x00020000));
-}
-
-extern "C" void sub_82A46DA0(PPCContext& ctx, uint8_t* base) {
-  if (!IsNativeMode()) {
-    __imp__sub_82A46DA0(ctx, base);
-    return;
-  }
-
-  const uint32_t device = ctx.r3.u32;
-  uint32_t behavior = LoadU32(base, device + 22280);
-  if (ctx.r4.u32) {
-    behavior |= 4;
-  } else {
-    behavior &= ~uint32_t(4);
-  }
-  StoreU32(base, device + 22280, behavior);
-}
-
-extern "C" void sub_8247BD88(PPCContext& ctx, uint8_t* base) {
-  if (!IsNativeMode()) {
-    __imp__sub_8247BD88(ctx, base);
-    return;
-  }
-
-  const bool watching = g_tv_watching.load(std::memory_order_relaxed);
-  const uint32_t script_context = ctx.r3.u32;
-  const uint32_t arguments = script_context ? LoadU32(base, script_context + 8) : 0;
-  std::array<uint32_t, 8> raw{};
-  if (arguments) {
-    for (uint32_t index = 0; index < raw.size(); ++index) {
-      raw[index] = LoadU32(base, arguments + index * sizeof(uint32_t));
-    }
-  }
-  const uint64_t sequence =
-      watching ? g_tv_script_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
-  if (watching) {
-    g_tv_last_rect_sequence.store(sequence, std::memory_order_relaxed);
-  }
-
-  __imp__sub_8247BD88(ctx, base);
-
-  if (watching && ConsumeTvEventTraceBudget()) {
-    REXLOG_INFO(
-        "gta4-tv-script-background: session={} sequence={} caller={:08X} "
-        "context={:08X} arguments={:08X} rect-bits={:08X},{:08X},{:08X},{:08X} "
-        "rgba={:08X},{:08X},{:08X},{:08X}",
-        g_tv_session_id.load(std::memory_order_relaxed), sequence, uint32_t(ctx.lr), script_context,
-        arguments, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
-  }
-}
-
-extern "C" void sub_8247BED8(PPCContext& ctx, uint8_t* base) {
-  if (!IsNativeMode()) {
-    __imp__sub_8247BED8(ctx, base);
-    return;
-  }
-
-  const bool watching = g_tv_watching.load(std::memory_order_relaxed);
-  const uint32_t script_context = ctx.r3.u32;
-  const uint32_t arguments = script_context ? LoadU32(base, script_context + 8) : 0;
-  std::array<uint32_t, 9> raw{};
-  if (arguments) {
-    for (uint32_t index = 0; index < raw.size(); ++index) {
-      raw[index] = LoadU32(base, arguments + index * sizeof(uint32_t));
-    }
-  }
-  const uint64_t sequence =
-      watching ? g_tv_script_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
-  if (watching) {
-    g_tv_last_movie_sequence.store(sequence, std::memory_order_relaxed);
-  }
-
-  __imp__sub_8247BED8(ctx, base);
-
-  if (watching && ConsumeTvEventTraceBudget()) {
-    REXLOG_INFO(
-        "gta4-tv-script-draw: session={} sequence={} caller={:08X} context={:08X} "
-        "arguments={:08X} rect-rotation-bits={:08X},{:08X},{:08X},{:08X},{:08X} "
-        "rgba={:08X},{:08X},{:08X},{:08X}",
-        g_tv_session_id.load(std::memory_order_relaxed), sequence, uint32_t(ctx.lr), script_context,
-        arguments, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8]);
-  }
-}
-
-extern "C" void sub_827BB138(PPCContext& ctx, uint8_t* base) {
-  if (!IsNativeMode()) {
-    __imp__sub_827BB138(ctx, base);
-    return;
-  }
-
-  const bool watching = g_tv_watching.load(std::memory_order_relaxed);
-  const uint32_t player = ctx.r3.u32;
-  const uint32_t binding_caller = uint32_t(ctx.lr);
-  ObserveTvBinding(base, player, binding_caller, false, 0);
-  const uint32_t decoder = player ? LoadU32(base, player) : 0;
-  const uint32_t frame_table = player ? LoadU32(base, player + 8) : 0;
-  const uint32_t draw_parameters = player ? LoadU32(base, player + 104) : 0;
-  const uint32_t plane_y = player ? LoadU32(base, player + 108) : 0;
-  const uint32_t plane_cr = player ? LoadU32(base, player + 112) : 0;
-  const uint32_t plane_cb = player ? LoadU32(base, player + 116) : 0;
-  const uint32_t plane_a = player ? LoadU32(base, player + 120) : 0;
-  const uint32_t state_96 = player ? LoadU8(base, player + 96) : 0;
-  const uint32_t state_97 = player ? LoadU8(base, player + 97) : 0;
-  const uint32_t state_98 = player ? LoadU8(base, player + 98) : 0;
-  const uint32_t state_99 = player ? LoadU8(base, player + 99) : 0;
-  const uint32_t state_100 = player ? LoadU8(base, player + 100) : 0;
-  const uint64_t sequence =
-      watching ? g_tv_script_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
-
-  __imp__sub_827BB138(ctx, base);
-
-  const uint32_t result = ctx.r3.u32;
-  ObserveTvBinding(base, player, binding_caller, true, result);
-  if (watching) {
-    g_tv_last_bink_sequence.store(sequence, std::memory_order_relaxed);
-    g_tv_last_bink_result.store(result, std::memory_order_relaxed);
-  }
-  if (watching && ConsumeTvEventTraceBudget()) {
-    const char* reason = result       ? "effect-binding-applied"
-                         : !player    ? "no-player"
-                         : !decoder   ? "no-decoder"
-                         : !state_100 ? "not-ready"
-                                      : "resource-unavailable";
-    REXLOG_INFO(
-        "gta4-tv-bink-draw-result: session={} sequence={} movie={} caller={:08X} "
-        "player={:08X} decoder={:08X} frame-table={:08X} parameters={:08X} "
-        "state={},{},{},{},{} parameter-ids={:08X},{:08X},{:08X},{:08X} "
-        "result={} reason={}",
-        g_tv_session_id.load(std::memory_order_relaxed), sequence,
-        g_tv_last_movie_sequence.load(std::memory_order_relaxed), uint32_t(ctx.lr), player, decoder,
-        frame_table, draw_parameters, state_96, state_97, state_98, state_99, state_100, plane_y,
-        plane_cr, plane_cb, plane_a, result, reason);
-  }
-}
-
-extern "C" void sub_828C15C8(PPCContext& ctx, uint8_t* base) {
-  if (!IsNativeMode()) {
-    __imp__sub_828C15C8(ctx, base);
-    return;
-  }
-
-  const bool watching = g_tv_watching.load(std::memory_order_relaxed);
-  const uint32_t fade = ctx.r3.u32;
-  const uint32_t fade_amount_bits = fade ? LoadU32(base, fade) : 0;
-  const uint32_t fade_color = fade ? LoadU32(base, fade + 8) : 0;
-  const uint32_t fade_flags = fade ? LoadU32(base, fade + 12) : 0;
-  const bool previous_active = g_tv_final_path_active;
-  const uint32_t previous_resolve_count = g_tv_final_resolve_count;
-  const uint64_t previous_sequence = g_tv_final_sequence;
-  const uint64_t sequence =
-      watching ? g_tv_script_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
-  g_tv_final_path_active = watching;
-  g_tv_final_resolve_count = 0;
-  g_tv_final_sequence = sequence;
-
-  __imp__sub_828C15C8(ctx, base);
-
-  const uint32_t resolve_count = g_tv_final_resolve_count;
-  if (watching && ConsumeTvEventTraceBudget()) {
-    const char* path = !resolve_count ? "direct-present"
-                       : fade         ? "fade-resolve"
-                                      : "ordinary-resolve";
-    REXLOG_INFO(
-        "gta4-tv-final-path: session={} sequence={} movie={} rect={} bink={}:{} "
-        "caller={:08X} fade={:08X} fade-amount-bits={:08X} "
-        "fade-color={:08X} fade-flags={:08X} resolves={} path={}",
-        g_tv_session_id.load(std::memory_order_relaxed), sequence,
-        g_tv_last_movie_sequence.load(std::memory_order_relaxed),
-        g_tv_last_rect_sequence.load(std::memory_order_relaxed),
-        g_tv_last_bink_sequence.load(std::memory_order_relaxed),
-        g_tv_last_bink_result.load(std::memory_order_relaxed), uint32_t(ctx.lr), fade,
-        fade_amount_bits, fade_color, fade_flags, resolve_count, path);
-  }
-
-  g_tv_final_path_active = previous_active;
-  g_tv_final_resolve_count = previous_resolve_count;
-  g_tv_final_sequence = previous_sequence;
-}
-
-extern "C" void sub_826273A0(PPCContext& ctx, uint8_t* base) {
-  if (!IsNativeMode()) {
-    __imp__sub_826273A0(ctx, base);
-    return;
-  }
-
-  // Complete retail behavior: this function is exactly the one-byte commit
-  // used by MUTE_GAMEWORLD_AND_POSITIONED_RADIO_FOR_TV.
-  const bool watching = ctx.r4.u8 != 0;
-  StoreU8(base, kTvMuteGlobal, ctx.r4.u8);
-
-  const bool was_watching = g_tv_watching.exchange(watching, std::memory_order_relaxed);
-  if (watching == was_watching) {
-    return;
-  }
-  if (watching) {
-    const uint64_t session = g_tv_session_id.fetch_add(1, std::memory_order_relaxed) + 1;
-    g_tv_trace_present_remaining.store(kTvTracePresentBudget, std::memory_order_relaxed);
-    g_tv_trace_event_remaining.store(kTvTraceEventBudget, std::memory_order_relaxed);
-    g_tv_last_movie_sequence.store(0, std::memory_order_relaxed);
-    g_tv_last_rect_sequence.store(0, std::memory_order_relaxed);
-    g_tv_last_bink_sequence.store(0, std::memory_order_relaxed);
-    g_tv_last_bink_result.store(0, std::memory_order_relaxed);
-    REXLOG_INFO(
-        "gta4-tv-session: event=begin session={} guest-global={:08X} "
-        "present-budget={} event-budget={}",
-        session, kTvMuteGlobal, kTvTracePresentBudget, kTvTraceEventBudget);
-  } else {
-    const uint64_t session = g_tv_session_id.load(std::memory_order_relaxed);
-    g_tv_trace_present_remaining.store(0, std::memory_order_relaxed);
-    g_tv_trace_event_remaining.store(0, std::memory_order_relaxed);
-    REXLOG_INFO("gta4-tv-session: event=end session={} guest-global={:08X}", session,
-                kTvMuteGlobal);
-  }
-}
-
-extern "C" void sub_82A467D8(PPCContext& ctx, uint8_t* base) {
-  if (!IsNativeMode()) {
-    __imp__sub_82A467D8(ctx, base);
-    return;
-  }
-
-  const uint32_t device = ctx.r3.u32;
-  const uint32_t submitted_frame = LoadU32(base, device + kSubmittedFrameOffset) + 1;
-  StoreU32(base, device + kSubmittedFrameOffset, submitted_frame);
-  StoreU8(base, device + 10941, LoadU8(base, device + 10941) & uint8_t(0xEF));
-  StoreAllDirty(base, device);
-
-  PresentCommand command{};
-  command.device = device;
-  command.frontbuffer_texture = ctx.r4.u32;
-  if (command.frontbuffer_texture) {
-    for (uint32_t index = 0; index < std::size(command.frontbuffer_fetch); ++index) {
-      command.frontbuffer_fetch[index] =
-          LoadU32(base, command.frontbuffer_texture + 28 + index * sizeof(uint32_t));
-    }
-  }
-  command.diagnostic_present_id = g_tv_present_id.fetch_add(1, std::memory_order_relaxed) + 1;
-  command.diagnostic_tv_session_id = g_tv_session_id.load(std::memory_order_relaxed);
-  command.diagnostic_tv_final_sequence = g_tv_final_sequence;
-  command.diagnostic_tv_movie_sequence = g_tv_last_movie_sequence.load(std::memory_order_relaxed);
-  command.diagnostic_tv_rect_sequence = g_tv_last_rect_sequence.load(std::memory_order_relaxed);
-  command.diagnostic_tv_bink_sequence = g_tv_last_bink_sequence.load(std::memory_order_relaxed);
-  command.diagnostic_tv_bink_result = g_tv_last_bink_result.load(std::memory_order_relaxed);
-  command.diagnostic_guest_caller = ctx.lr;
-  command.diagnostic_origin = ctx.lr == kMainPresentCaller     ? 1
-                              : ctx.lr == kWorkerPresentCaller ? 2
-                                                               : 0;
-  command.diagnostic_persisted_texture = device + kPersistedPresentTextureOffset;
-  command.diagnostic_device_flag_10941 = LoadU8(base, device + kPresentFlag10941Offset);
-  command.diagnostic_device_flag_10942 = LoadU8(base, device + kPresentFlag10942Offset);
-  command.diagnostic_trace =
-      g_tv_watching.load(std::memory_order_relaxed) && ConsumeTvPresentTraceBudget();
-  command.diagnostic_force_content_probe = command.diagnostic_trace;
-  if (command.diagnostic_trace) {
-    for (uint32_t index = 0; index < std::size(command.diagnostic_persisted_fetch); ++index) {
-      command.diagnostic_persisted_fetch[index] =
-          LoadU32(base, command.diagnostic_persisted_texture + 28 + index * sizeof(uint32_t));
-    }
-    if (command.frontbuffer_texture) {
-      command.diagnostic_requested_descriptor_hash =
-          XXH3_64bits(GuestPointer(base, command.frontbuffer_texture), kPresentDescriptorSize);
-    }
-    command.diagnostic_persisted_descriptor_hash =
-        XXH3_64bits(GuestPointer(base, command.diagnostic_persisted_texture), kPresentDescriptorSize);
-    command.diagnostic_descriptor_equal =
-        command.frontbuffer_texture != 0 &&
-        std::memcmp(GuestPointer(base, command.frontbuffer_texture),
-                    GuestPointer(base, command.diagnostic_persisted_texture),
-                    kPresentDescriptorSize) == 0;
-  }
-  {
-    std::lock_guard lock(g_native_resolution_mutex);
-    command.width = g_native_resolution.render_width;
-    command.height = g_native_resolution.render_height;
-    command.display_width = g_native_resolution.display_width;
-    command.display_height = g_native_resolution.display_height;
-  }
-  command.submitted_frame = submitted_frame;
-  if (const uint64_t dropped = GetNativeLightTraceDroppedRecords(); dropped) {
-    static std::atomic<uint64_t> last_reported_drops{0};
-    if (last_reported_drops.exchange(dropped, std::memory_order_relaxed) != dropped) {
-      REXLOG_WARN(
-          "gta4-native-light-trace: point=frame-completion frame={} dropped={} "
-          "capture-complete=0",
-          submitted_frame, dropped);
-    }
-  }
-  if (command.diagnostic_trace) {
-    const uint64_t requested_fetch_hash =
-        XXH3_64bits(command.frontbuffer_fetch, sizeof(command.frontbuffer_fetch));
-    const uint64_t persisted_fetch_hash =
-        XXH3_64bits(command.diagnostic_persisted_fetch, sizeof(command.diagnostic_persisted_fetch));
-    REXLOG_INFO(
-        "gta4-tv-present-title: session={} present={} frame={} final={} movie={} "
-        "rect={} bink={}:{} origin={} caller={:08X} "
-        "device={:08X} requested={:08X} persisted={:08X} descriptor-equal={} "
-        "descriptor-hash={:016X}/{:016X} fetch-hash={:016X}/{:016X} "
-        "flags={:02X}/{:02X} force-probe={}",
-        command.diagnostic_tv_session_id, command.diagnostic_present_id, command.submitted_frame,
-        command.diagnostic_tv_final_sequence, command.diagnostic_tv_movie_sequence,
-        command.diagnostic_tv_rect_sequence, command.diagnostic_tv_bink_sequence,
-        command.diagnostic_tv_bink_result, TvPresentOriginName(command.diagnostic_origin),
-        command.diagnostic_guest_caller, command.device, command.frontbuffer_texture,
-        command.diagnostic_persisted_texture, command.diagnostic_descriptor_equal,
-        command.diagnostic_requested_descriptor_hash, command.diagnostic_persisted_descriptor_hash,
-        requested_fetch_hash, persisted_fetch_hash, command.diagnostic_device_flag_10941,
-        command.diagnostic_device_flag_10942, command.diagnostic_force_content_probe);
-  }
-  g_last_present_frontbuffer.store(command.frontbuffer_texture, std::memory_order_relaxed);
-  SubmitNativeCommand(command);
-  ctx.r3.u32 = device;
-}
-
-#include "gta4_help_trace_hooks.inc"
-#include "gta4_fade_trace_hooks.inc"
-#include "gta4_phone_trace_hooks.inc"
-// #include "gta4_neon_transform_hooks.inc"
-#include "gta4_main_and_drawable_hooks.inc"
-#include "gta4_batch2_hooks.inc"
