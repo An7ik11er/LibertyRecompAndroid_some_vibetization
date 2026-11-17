@@ -20,7 +20,8 @@ namespace {
 constexpr uint32_t kPrimaryPlayer = 0x82A98778;
 constexpr uint32_t kPlayerInfoTable = 0x82C01C70;
 constexpr uint32_t kPedOffset = 1400;
-constexpr uint32_t kCamPtrAddr = 0x82BEF9B8u;
+constexpr uint32_t kCamCountAddr = 0x82BEF9B0u;
+constexpr uint32_t kCamArrayAddr = 0x82BEF9B8u;
 
 uint32_t s_frame_counter = 0;
 
@@ -57,9 +58,78 @@ inline void StoreGuestF32(uint8_t* base, uint32_t address, float value) {
   REX_STORE_U32(address, u);
 }
 
+uint32_t FindActive3DCamera(uint8_t* base) {
+  if (!base) return 0;
+  const uint32_t count = REX_LOAD_U32(kCamCountAddr);
+  uint32_t best_cam = 0;
+  for (uint32_t i = 0; i < count && i < 16; ++i) {
+    const uint32_t c = REX_LOAD_U32(kCamArrayAddr + i * 4);
+    if (c && GuestSpan(base, c, 300)) {
+      float pz = 0.0f, lz = 0.0f;
+      const uint32_t u_pz = REX_LOAD_U32(c + 88);
+      const uint32_t u_lz = REX_LOAD_U32(c + 280);
+      std::memcpy(&pz, &u_pz, 4);
+      std::memcpy(&lz, &u_lz, 4);
+      if (pz > 0.0f && std::abs(lz) < 0.99f) {
+        best_cam = c;
+      }
+    }
+  }
+  return best_cam;
+}
+
+void ApplyCameraVectors(uint8_t* base, uint32_t cam, float yaw_deg, float pitch_deg) {
+  if (!base || !cam || !GuestSpan(base, cam, 300)) return;
+
+  const float rad_y = yaw_deg * (3.14159265358979323846f / 180.0f);
+  const float rad_p = pitch_deg * (3.14159265358979323846f / 180.0f);
+  const float cos_y = std::cos(rad_y);
+  const float sin_y = std::sin(rad_y);
+  const float cos_p = std::cos(rad_p);
+  const float sin_p = std::sin(rad_p);
+
+  // Look vector (+272): Lx = -sin(yaw)*cos(pitch), Ly = cos(yaw)*cos(pitch), Lz = sin(pitch)
+  StoreGuestF32(base, cam + 272, -sin_y * cos_p);
+  StoreGuestF32(base, cam + 276,  cos_y * cos_p);
+  StoreGuestF32(base, cam + 280,  sin_p);
+
+  // Right vector (+240): Rx = cos(yaw), Ry = sin(yaw), Rz = 0
+  StoreGuestF32(base, cam + 240,  cos_y);
+  StoreGuestF32(base, cam + 244,  sin_y);
+  StoreGuestF32(base, cam + 248,  0.0f);
+
+  // Up vector (+256): Right x Look
+  StoreGuestF32(base, cam + 256,  sin_y * sin_p);
+  StoreGuestF32(base, cam + 260, -cos_y * sin_p);
+  StoreGuestF32(base, cam + 264,  cos_p);
+}
+
+void ReadCameraAngles(uint8_t* base, uint32_t cam, float& out_yaw_deg, float& out_pitch_deg) {
+  if (!base || !cam || !GuestSpan(base, cam, 300)) return;
+  float lx = 0.0f, ly = 0.0f, lz = 0.0f;
+  const uint32_t u_lx = REX_LOAD_U32(cam + 272);
+  const uint32_t u_ly = REX_LOAD_U32(cam + 276);
+  const uint32_t u_lz = REX_LOAD_U32(cam + 280);
+  std::memcpy(&lx, &u_lx, 4);
+  std::memcpy(&ly, &u_ly, 4);
+  std::memcpy(&lz, &u_lz, 4);
+
+  if (lx != 0.0f || ly != 0.0f) {
+    float yaw = std::atan2(-lx, ly) * (180.0f / 3.14159265358979323846f);
+    while (yaw < 0.0f) yaw += 360.0f;
+    while (yaw >= 360.0f) yaw -= 360.0f;
+    out_yaw_deg = yaw;
+
+    const float clamped_lz = std::max(-1.0f, std::min(1.0f, lz));
+    out_pitch_deg = std::asin(clamped_lz) * (180.0f / 3.14159265358979323846f);
+  }
+}
+
 }  // namespace
 
 void RequestCameraHeading(float heading_degrees, float pitch_degrees, bool persistent_lock) {
+  while (heading_degrees < 0.0f) heading_degrees += 360.0f;
+  while (heading_degrees >= 360.0f) heading_degrees -= 360.0f;
   s_target_heading.store(heading_degrees, std::memory_order_relaxed);
   s_target_pitch.store(pitch_degrees, std::memory_order_relaxed);
   s_lock_angle.store(persistent_lock, std::memory_order_release);
@@ -86,17 +156,24 @@ void OnCameraUpdate(uint8_t* base, uint32_t camera, uint32_t pitch, uint32_t yaw
   if (!base || !camera || !GuestSpan(base, camera, std::max(yaw, pitch) + 16)) return;
 
   if (s_snap_active.load(std::memory_order_relaxed) || s_lock_angle.load(std::memory_order_relaxed)) {
-    const float heading_rad = s_target_heading.load(std::memory_order_relaxed) * (3.14159265358979323846f / 180.0f);
-    const float pitch_rad = s_target_pitch.load(std::memory_order_relaxed) * (3.14159265358979323846f / 180.0f);
+    float h_deg = s_target_heading.load(std::memory_order_relaxed);
+    while (h_deg > 180.0f) h_deg -= 360.0f;
+    while (h_deg < -180.0f) h_deg += 360.0f;
+    const float heading_rad = h_deg * (3.14159265358979323846f / 180.0f);
+
+    float p_deg = s_target_pitch.load(std::memory_order_relaxed);
+    while (p_deg > 180.0f) p_deg -= 360.0f;
+    while (p_deg < -180.0f) p_deg += 360.0f;
+    const float pitch_rad = p_deg * (3.14159265358979323846f / 180.0f);
 
     StoreGuestF32(base, camera + yaw, heading_rad);
     StoreGuestF32(base, camera + prev_yaw, heading_rad);
     StoreGuestF32(base, camera + pitch, pitch_rad);
     StoreGuestF32(base, camera + prev_pitch, pitch_rad);
 
-    // Zero out angular velocities (at yaw + 4 and pitch + 4)
+    // Zero out velocity components without corrupting yaw (pitch velocity at pitch + 12, yaw at yaw + 4)
     StoreGuestF32(base, camera + yaw + 4, 0.0f);
-    StoreGuestF32(base, camera + pitch + 4, 0.0f);
+    StoreGuestF32(base, camera + pitch + 12, 0.0f);
   }
 }
 
@@ -182,29 +259,12 @@ bool TeleportPlayer(PPCContext& ctx, uint8_t* base, float x, float y, float z,
     StoreGuestF32(base, matrix + 60, -rad);
   }
 
-  // 4. Initial camera hint
+  // 4. Initial camera update directly on active 3D camera
   if (snap_camera) {
-    const uint32_t cam = REX_LOAD_U32(kCamPtrAddr);
-    if (cam && GuestSpan(base, cam, 300)) {
-      // Camera Position (Offset 80 / 0x50)
-      StoreGuestF32(base, cam + 80, kDefaultCamX);
-      StoreGuestF32(base, cam + 84, kDefaultCamY);
-      StoreGuestF32(base, cam + 88, kDefaultCamZ);
-
-      // Camera Right (Offset 240 / 0xF0)
-      StoreGuestF32(base, cam + 240, kDefaultCamRightX);
-      StoreGuestF32(base, cam + 244, kDefaultCamRightY);
-      StoreGuestF32(base, cam + 248, 0.0f);
-
-      // Camera Up (Offset 256 / 0x100)
-      StoreGuestF32(base, cam + 256, kDefaultCamUpX);
-      StoreGuestF32(base, cam + 260, kDefaultCamUpY);
-      StoreGuestF32(base, cam + 264, kDefaultCamUpZ);
-
-      // Camera Look / Forward (Offset 272 / 0x110)
-      StoreGuestF32(base, cam + 272, kDefaultCamLookX);
-      StoreGuestF32(base, cam + 276, kDefaultCamLookY);
-      StoreGuestF32(base, cam + 280, kDefaultCamLookZ);
+    RequestCameraHeading(cam_heading, pitch, true);
+    const uint32_t active_cam = FindActive3DCamera(base);
+    if (active_cam) {
+      ApplyCameraVectors(base, active_cam, cam_heading, pitch);
     }
   }
 
@@ -214,15 +274,33 @@ bool TeleportPlayer(PPCContext& ctx, uint8_t* base, float x, float y, float z,
 }
 
 void PollTeleportBridge(PPCContext& ctx, uint8_t* base) {
+  // Apply locked camera vectors directly every frame to active 3D camera
+  const uint32_t active_cam = FindActive3DCamera(base);
+  if (active_cam) {
+    if (s_lock_angle.load(std::memory_order_relaxed) || s_snap_active.load(std::memory_order_relaxed)) {
+      ApplyCameraVectors(base, active_cam, s_target_heading.load(std::memory_order_relaxed), s_target_pitch.load(std::memory_order_relaxed));
+    } else {
+      float live_yaw = 0.0f, live_pitch = 0.0f;
+      ReadCameraAngles(base, active_cam, live_yaw, live_pitch);
+      if (live_yaw != 0.0f || live_pitch != 0.0f) {
+        s_target_heading.store(live_yaw, std::memory_order_relaxed);
+        s_target_pitch.store(live_pitch, std::memory_order_relaxed);
+      }
+    }
+  }
+
   const std::filesystem::path folder = rex::filesystem::GetUserFolder();
 
-  // Handle 2-second settle state machine:
+  // Handle settle state machine:
   if (s_phase == TeleportPhase::kWarpedWaiting2Sec) {
     if (--s_phase_countdown <= 0) {
-      REXLOG_INFO("gta4-teleport: 2.0s elapsed after teleport, now executing secondary camera rotation...");
-      RequestCameraHeading(s_pending_cam_heading, s_pending_pitch);
+      REXLOG_INFO("gta4-teleport: elapsed after teleport, snapping camera vectors...");
+      RequestCameraHeading(s_pending_cam_heading, s_pending_pitch, true);
+      if (active_cam) {
+        ApplyCameraVectors(base, active_cam, s_pending_cam_heading, s_pending_pitch);
+      }
       s_phase = TeleportPhase::kSnappingCamera;
-      s_phase_countdown = 60;  // max timeout for camera settle
+      s_phase_countdown = 20;
     }
     return;
   } else if (s_phase == TeleportPhase::kSnappingCamera) {
@@ -236,7 +314,7 @@ void PollTeleportBridge(PPCContext& ctx, uint8_t* base) {
         out << (s_pending_ok ? "OK" : "ERROR") << " " << ms << " " << s_pending_x << " " << s_pending_y
             << " " << s_pending_z << " " << s_pending_heading << "\n";
       }
-      REXLOG_INFO("gta4-teleport: completed 2-second settle handshake written to teleport.done");
+      REXLOG_INFO("gta4-teleport: completed handshake written to teleport.done");
     }
     return;
   }
@@ -281,22 +359,37 @@ void PollTeleportBridge(PPCContext& ctx, uint8_t* base) {
     return;
   } else if (line == "lock") {
     RequestCameraHeading(s_target_heading.load(), s_target_pitch.load(), true);
+    if (active_cam) {
+      ApplyCameraVectors(base, active_cam, s_target_heading.load(), s_target_pitch.load());
+    }
     std::filesystem::remove(cmd_file, ec);
     return;
   } else if (line == "higher" || line == "up") {
-    RequestCameraHeading(s_target_heading.load(), s_target_pitch.load() + 1.0f);
+    RequestCameraHeading(s_target_heading.load(), s_target_pitch.load() + 1.0f, true);
+    if (active_cam) {
+      ApplyCameraVectors(base, active_cam, s_target_heading.load(), s_target_pitch.load());
+    }
     std::filesystem::remove(cmd_file, ec);
     return;
   } else if (line == "lower" || line == "down") {
-    RequestCameraHeading(s_target_heading.load(), s_target_pitch.load() - 1.0f);
+    RequestCameraHeading(s_target_heading.load(), s_target_pitch.load() - 1.0f, true);
+    if (active_cam) {
+      ApplyCameraVectors(base, active_cam, s_target_heading.load(), s_target_pitch.load());
+    }
     std::filesystem::remove(cmd_file, ec);
     return;
   } else if (line == "left") {
-    RequestCameraHeading(s_target_heading.load() - 2.0f, s_target_pitch.load());
+    RequestCameraHeading(s_target_heading.load() - 2.0f, s_target_pitch.load(), true);
+    if (active_cam) {
+      ApplyCameraVectors(base, active_cam, s_target_heading.load(), s_target_pitch.load());
+    }
     std::filesystem::remove(cmd_file, ec);
     return;
   } else if (line == "right") {
-    RequestCameraHeading(s_target_heading.load() + 2.0f, s_target_pitch.load());
+    RequestCameraHeading(s_target_heading.load() + 2.0f, s_target_pitch.load(), true);
+    if (active_cam) {
+      ApplyCameraVectors(base, active_cam, s_target_heading.load(), s_target_pitch.load());
+    }
     std::filesystem::remove(cmd_file, ec);
     return;
   }
@@ -329,9 +422,9 @@ void PollTeleportBridge(PPCContext& ctx, uint8_t* base) {
   // Remove command file
   std::filesystem::remove(cmd_file, ec);
 
-  // Arm 2.0-second (~120 frames) settle countdown before secondary camera snap
+  // Arm brief settle countdown before confirming
   s_phase = TeleportPhase::kWarpedWaiting2Sec;
-  s_phase_countdown = 120;
+  s_phase_countdown = 30;
   s_pending_ok = ok;
   s_pending_x = target_x;
   s_pending_y = target_y;

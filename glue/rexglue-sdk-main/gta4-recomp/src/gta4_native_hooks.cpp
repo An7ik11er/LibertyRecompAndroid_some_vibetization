@@ -62,6 +62,13 @@
 #include "gta4_font_selection_trace.h"
 #include "gta4_draw_distance_policy.h"
 
+// Batch 2 optimized hook forward declarations
+void OptSub821671F8(PPCContext& ctx, uint8_t* base);
+void OptSub821BC5B0(PPCContext& ctx, uint8_t* base);
+void OptSub821BC690(PPCContext& ctx, uint8_t* base);
+void OptSub821BD0A0(PPCContext& ctx, uint8_t* base);
+void OptSub821BE8A0(PPCContext& ctx, uint8_t* base);
+
 REXCVAR_DECLARE(uint32_t, gta4_shadow_map_base_size);
 REXCVAR_DEFINE_UINT32(gta4_shadow_cascade_count, 0, "GTA IV/Graphics/Shadows",
                       "Directional shadow cascades (0 keeps the stock 5)")
@@ -4965,11 +4972,11 @@ extern "C" void sub_828C4578(PPCContext& ctx, uint8_t* base) {
 
 extern "C" void sub_821BE8A0(PPCContext& ctx, uint8_t* base) {
   if (!IsNativeMode() || !CachedNativeTraceEnabled()) [[likely]] {
-    __imp__sub_821BE8A0(ctx, base);
+    OptSub821BE8A0(ctx, base);
     return;
   }
   TraceKnownOffscreenTransformTransition("offscreen-transition-model-materials-legacy-caller", ctx,
-                                         base, __imp__sub_821BE8A0);
+                                         base, OptSub821BE8A0);
 }
 
 [[gnu::noinline]] void SlowSub828D41A8(PPCContext& ctx, uint8_t* base) {
@@ -5168,14 +5175,6 @@ extern "C" void sub_828E7000(PPCContext& ctx, uint8_t* base) {
 
   const uint32_t r31_geom = ctx.r3.u32;
 
-  // Secondary vertex stream guard (100% passive: zero extra Vulkan driver calls).
-  // Complex geometries with secondary vertex streams (cables, bridge suspension, multi-uv)
-  // require explicit unbinding via sub_828BEAA8 in D3D9 to avoid leaking Stream 1 state.
-  if (REX_LOAD_U32(r31_geom + 68u) != 0u) [[unlikely]] {
-    __imp__sub_828E7000(ctx, base);
-    return;
-  }
-
   // Fast path: bypass 112-byte guest stack frame allocation & D3D9 SetStreamSource overhead
   uint32_t r30_slot = 0u;
   if (static_cast<int32_t>(REX_LOAD_U32(r31_geom + 72u)) != 0) [[unlikely]] {
@@ -5195,64 +5194,65 @@ extern "C" void sub_828E7000(PPCContext& ctx, uint8_t* base) {
 }
 
 extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
-  if (!IsNativeMode()) {
-    // Verified 3.54x fast path: zero stack allocation, hoisted D3DDevice, direct constant lookup
-    const uint32_t r26_geom_type = ctx.r3.u32;
-    const uint32_t r11_state = ctx.r4.u32;
-    const uint32_t r30_buf = ctx.r5.u32;
-    const uint32_t r27_desc = ctx.r6.u32;
-    uint32_t r28_count = ctx.r7.u32;
-
-    const uint32_t max_count = REX_LOAD_U32(r27_desc + 4);
-    if (r28_count == 0 || static_cast<int32_t>(r28_count) > static_cast<int32_t>(max_count)) {
-      r28_count = max_count;
-    }
-
-    constexpr uint32_t kD3DDeviceAddr = 0x831C22A4u;
-    constexpr uint32_t kCachePtrAddr = 0x831C22A8u;
-    constexpr uint32_t kBufStoreAddr = 0x831C2414u;
-    constexpr uint32_t kPrimTableBase = 0x82B0B4F4u;
-
-    const uint32_t d3d_device = REX_LOAD_U32(kD3DDeviceAddr);
-
-    if (r11_state != 0) {
-      const uint32_t cached = REX_LOAD_U32(kCachePtrAddr);
-      if (r11_state != cached) {
-        ctx.r3.u64 = d3d_device;
-        ctx.r4.u64 = REX_LOAD_U32(r11_state + 0);
-        REX_STORE_U32(kCachePtrAddr, r11_state);
-        ctx.lr = 0x828BFC68;
-        sub_82A42930(ctx, base);
-      }
-    }
-
-    ctx.r3.u64 = d3d_device;
-    ctx.r4.u64 = REX_LOAD_U32(r27_desc + 12);
-    ctx.lr = 0x828BFC74;
-    sub_82A3B7B0(ctx, base);
-
-    ctx.r3.u64 = d3d_device;
-    ctx.r4.s64 = 0;
-    ctx.r5.u64 = REX_LOAD_U32(r30_buf + 28);
-    ctx.r6.s64 = 0;
-    ctx.r7.u64 = REX_LOAD_U32(r30_buf + 12);
-    ctx.r8.s64 = 1;
-    REX_STORE_U32(kBufStoreAddr, r30_buf);
-    ctx.lr = 0x828BFC94;
-    sub_82A3B690(ctx, base);
-
-    const uint32_t prim_type = REX_LOAD_U32(kPrimTableBase + (r26_geom_type << 2));
-    ctx.r3.u64 = d3d_device;
-    ctx.r4.u64 = prim_type;
-    ctx.r5.s64 = 0;
-    ctx.r6.s64 = 0;
-    ctx.r7.u64 = r28_count;
-    ctx.lr = 0x828BFCB8;
-    sub_82A3E348(ctx, base);
+  if (IsNativeMode()) [[likely]] {
+    FastGeometryDraw(base, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32,
+                     static_cast<uint32_t>(ctx.lr));
     return;
   }
-  FastGeometryDraw(base, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32,
-                   static_cast<uint32_t>(ctx.lr));
+
+  // Verified 3.54x fast path: zero stack allocation, hoisted D3DDevice, direct constant lookup
+  const uint32_t r26_geom_type = ctx.r3.u32;
+  const uint32_t r11_state = ctx.r4.u32;
+  const uint32_t r30_buf = ctx.r5.u32;
+  const uint32_t r27_desc = ctx.r6.u32;
+  uint32_t r28_count = ctx.r7.u32;
+
+  const uint32_t max_count = REX_LOAD_U32(r27_desc + 4);
+  if (r28_count == 0 || static_cast<int32_t>(r28_count) > static_cast<int32_t>(max_count)) {
+    r28_count = max_count;
+  }
+
+  constexpr uint32_t kD3DDeviceAddr = 0x831C22A4u;
+  constexpr uint32_t kCachePtrAddr = 0x831C22A8u;
+  constexpr uint32_t kBufStoreAddr = 0x831C2414u;
+  constexpr uint32_t kPrimTableBase = 0x82B0B4F4u;
+
+  const uint32_t d3d_device = REX_LOAD_U32(kD3DDeviceAddr);
+
+  if (r11_state != 0) {
+    const uint32_t cached = REX_LOAD_U32(kCachePtrAddr);
+    if (r11_state != cached) {
+      ctx.r3.u64 = d3d_device;
+      ctx.r4.u64 = REX_LOAD_U32(r11_state + 0);
+      REX_STORE_U32(kCachePtrAddr, r11_state);
+      ctx.lr = 0x828BFC68;
+      sub_82A42930(ctx, base);
+    }
+  }
+
+  ctx.r3.u64 = d3d_device;
+  ctx.r4.u64 = REX_LOAD_U32(r27_desc + 12);
+  ctx.lr = 0x828BFC74;
+  sub_82A3B7B0(ctx, base);
+
+  ctx.r3.u64 = d3d_device;
+  ctx.r4.s64 = 0;
+  ctx.r5.u64 = REX_LOAD_U32(r30_buf + 28);
+  ctx.r6.s64 = 0;
+  ctx.r7.u64 = REX_LOAD_U32(r30_buf + 12);
+  ctx.r8.s64 = 1;
+  REX_STORE_U32(kBufStoreAddr, r30_buf);
+  ctx.lr = 0x828BFC94;
+  sub_82A3B690(ctx, base);
+
+  const uint32_t prim_type = REX_LOAD_U32(kPrimTableBase + (r26_geom_type << 2));
+  ctx.r3.u64 = d3d_device;
+  ctx.r4.u64 = prim_type;
+  ctx.r5.s64 = 0;
+  ctx.r6.s64 = 0;
+  ctx.r7.u64 = r28_count;
+  ctx.lr = 0x828BFCB8;
+  sub_82A3E348(ctx, base);
 }
 
 namespace {
@@ -7635,7 +7635,7 @@ extern "C" void sub_822D1710(PPCContext& ctx, uint8_t* base) {
 
 extern "C" void sub_821BD0A0(PPCContext& ctx, uint8_t* base) {
   if (!IsNativeMode()) {
-    __imp__sub_821BD0A0(ctx, base);
+    OptSub821BD0A0(ctx, base);
     return;
   }
 
@@ -7645,7 +7645,7 @@ extern "C" void sub_821BD0A0(PPCContext& ctx, uint8_t* base) {
   ScopedNativeLightingExecution lighting_scope(
       base, 0x821BD0A0, RenderExecutionStage::kRadarMap, LightPassRole::kNone);
   ScopedRenderPhaseMarker phase_scope(device, RenderPhase::kRadarMap, radar_map_section, caller);
-  gta4::aspect::DrawRadarSection(ctx, base, __imp__sub_821BD0A0);
+  gta4::aspect::DrawRadarSection(ctx, base, OptSub821BD0A0);
 }
 
 extern "C" void sub_8267D528(PPCContext& ctx, uint8_t* base) {
@@ -7745,7 +7745,7 @@ extern "C" void sub_821671F8(PPCContext& ctx, uint8_t* base) {
       ctx.r22.u32, ctx.r23.u32, ctx.r24.u32, ctx.r25.u32, ctx.r26.u32,
       ctx.r27.u32, ctx.r28.u32, ctx.r29.u32, ctx.r30.u32, ctx.r31.u32,
   };
-  __imp__sub_821671F8(ctx, base);
+  OptSub821671F8(ctx, base);
   if (trace) {
     TraceNativeApartmentBulbConstruction(base, caller, destination, light_type, flags,
                                          position_pointer, direction_pointer, tangent_pointer,
@@ -7860,39 +7860,34 @@ extern "C" void sub_828BD310(PPCContext& ctx, uint8_t* base) {
   d1 = vfmaq_f32(d1, p_y, pl1_y);
   d1 = vfmaq_f32(d1, p_x, pl1_x);
 
-  if (r8_out_ptr != 0u) {
-    const float d0_first = vgetq_lane_f32(d0, 0) + radius;
-    StoreU32(base, r8_out_ptr, std::bit_cast<uint32_t>(d0_first));
-  }
-
-  const float32x4_t neg_r = vnegq_f32(p_r);
-  const float32x4_t zero  = vdupq_n_f32(0.0f);
-
-  // The two branches of the recompiled function (gta4_recomp.70.cpp:30588) test different
-  // things. r8 == 0 (loc_828BD3F4): d >= -r and d >= 0. r8 != 0: s = d + r, rounded,
-  // then s >= 0 and s >= r. For -ulp(r)/2 <= d < 0 the sum rounds to r: "fully inside" (2)
-  // there, "intersecting" (1) with d >= 0. Keep each branch's own form.
+  const float32x4_t zero = vdupq_n_f32(0.0f);
   uint32x4_t cmp_out0, cmp_out1, cmp_in0, cmp_in1;
+
   if (r8_out_ptr != 0u) {
     const float32x4_t s0 = vaddq_f32(d0, p_r);
     const float32x4_t s1 = vaddq_f32(d1, p_r);
+    StoreU32(base, r8_out_ptr, vgetq_lane_u32(vreinterpretq_u32_f32(s0), 0));
     cmp_out0 = vcgeq_f32(s0, zero);
     cmp_out1 = vcgeq_f32(s1, zero);
-    cmp_in0 = vcgeq_f32(s0, p_r);
-    cmp_in1 = vcgeq_f32(s1, p_r);
+    cmp_in0  = vcgeq_f32(s0, p_r);
+    cmp_in1  = vcgeq_f32(s1, p_r);
   } else {
+    const float32x4_t neg_r = vnegq_f32(p_r);
     cmp_out0 = vcgeq_f32(d0, neg_r);
     cmp_out1 = vcgeq_f32(d1, neg_r);
-    cmp_in0 = vcgeq_f32(d0, zero);
-    cmp_in1 = vcgeq_f32(d1, zero);
+    cmp_in0  = vcgeq_f32(d0, zero);
+    cmp_in1  = vcgeq_f32(d1, zero);
   }
-  const uint32x4_t all_out  = vandq_u32(cmp_out0, cmp_out1);
-  const uint32_t r11_val    = (vminvq_u32(all_out) == 0xFFFFFFFFu) ? 1u : 0u;
 
-  const uint32x4_t all_in   = vandq_u32(cmp_in0, cmp_in1);
-  const uint32_t r9_val     = (vminvq_u32(all_in) == 0xFFFFFFFFu) ? 1u : 0u;
+  const uint32x4_t all_out = vandq_u32(cmp_out0, cmp_out1);
+  const uint32x4_t all_in  = vandq_u32(cmp_in0, cmp_in1);
 
-  ctx.r3.u64 = r11_val + r9_val;
+  // Pairwise reduction: combines both 128-bit masks into a single 64-bit GPR move
+  const uint32x4_t p1 = vpminq_u32(all_out, all_in);
+  const uint32x4_t p2 = vpminq_u32(p1, p1);
+  const uint64_t combined = vgetq_lane_u64(vreinterpretq_u64_u32(p2), 0);
+
+  ctx.r3.u64 = (combined & 1u) + ((combined >> 32) & 1u);
 #else
   __imp__sub_828BD310(ctx, base);
 #endif
@@ -7975,7 +7970,7 @@ extern "C" void sub_824F6478(PPCContext& ctx, uint8_t* base) {
 
 extern "C" void sub_821BC690(PPCContext& ctx, uint8_t* base) {
   if (!IsNativeMode()) {
-    __imp__sub_821BC690(ctx, base);
+    OptSub821BC690(ctx, base);
     return;
   }
 
@@ -7997,12 +7992,12 @@ extern "C" void sub_821BC690(PPCContext& ctx, uint8_t* base) {
         LoadU32(base, light + 16), LoadU32(base, light + 32), LoadU32(base, light + 48),
         LoadU32(base, light + 64));
   }
-  __imp__sub_821BC690(ctx, base);
+  OptSub821BC690(ctx, base);
 }
 
 extern "C" void sub_821BC5B0(PPCContext& ctx, uint8_t* base) {
   if (!IsNativeMode()) {
-    __imp__sub_821BC5B0(ctx, base);
+    OptSub821BC5B0(ctx, base);
     return;
   }
 
@@ -8023,7 +8018,7 @@ extern "C" void sub_821BC5B0(PPCContext& ctx, uint8_t* base) {
         LoadU32(base, light + 28), LoadU32(base, light + 8), LoadU32(base, light + 12),
         LoadU32(base, light + 16), LoadU32(base, light + 20));
   }
-  __imp__sub_821BC5B0(ctx, base);
+  OptSub821BC5B0(ctx, base);
 }
 
 extern "C" void sub_82A3E910(PPCContext& ctx, uint8_t* base) {
@@ -8844,3 +8839,4 @@ extern "C" void sub_82A467D8(PPCContext& ctx, uint8_t* base) {
 #include "gta4_phone_trace_hooks.inc"
 // #include "gta4_neon_transform_hooks.inc"
 #include "gta4_main_and_drawable_hooks.inc"
+#include "gta4_batch2_hooks.inc"
